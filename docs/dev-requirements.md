@@ -56,11 +56,18 @@ without it. Install a PyTorch **XPU** wheel only on the XPU track
 
 ## 2. XPU track (B70 kernels and serving)
 
-Install on the machine that has the GPU. Version pins for oneAPI and
-PyTorch land in [#2](https://github.com/Performant-Labs/FreeToken-Intel/issues/2)
-and [#3](https://github.com/Performant-Labs/FreeToken-Intel/issues/3); until
-then use current Intel compute driver + oneAPI Base Toolkit + PyTorch’s
-XPU index.
+Install on the machine that has the GPU. The exact, **verified** Ubuntu
+26.04 install sequence (Level Zero ICD via apt → Intel APT → DPC++ 2026.1
+→ `.venv-xpu` with torch 2.13.0+xpu) is in
+[dev-setup.md](dev-setup.md) §3 and §6. Version pins for the in-tree
+kernels still land in [#2](https://github.com/Performant-Labs/FreeToken-Intel/issues/2)
+and [#3](https://github.com/Performant-Labs/FreeToken-Intel/issues/3).
+
+> **APT gotcha:** `apt.repos.intel.com` is S3-backed with no public
+> ListBucket, so *directory* URLs (`/oneapi/`, `/keyring/`, …) return
+> `403 AccessDenied` while the real objects underneath are `200`. Don’t
+> mistake that for a dead repo — and note the GPG key filename is
+> **uppercase** `GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB`.
 
 | Software | Why | Check |
 | --- | --- | --- |

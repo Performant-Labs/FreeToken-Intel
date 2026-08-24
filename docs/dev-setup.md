@@ -71,25 +71,73 @@ and run unit tests in `.venv`.
 
 These installs are **system-wide**. They will not fit in a venv.
 
-1. Install Intel’s **Arc compute driver** for Battlemage (B70) from
-   Intel’s current Linux graphics/compute guide for your distro.
-2. Confirm the card: `lspci | grep -i -E 'VGA|Display'` should mention
-   Arc / B70 / Battlemage.
-3. Install **oneAPI Base Toolkit** so `icpx` and Level Zero headers
-   exist. Typical layout: `/opt/intel/oneapi/`.
+1. Add the user to the `render` and `video` groups, then **re-login**:
+
+   ```bash
+   sudo usermod -aG render,video "$USER"   # then log out and back in
+   ```
+
+2. Install the **Level Zero loader + Intel Arc ICD** from Ubuntu (the
+   Battlemage ICD ships as `libze-intel-gpu*`):
+
+   ```bash
+   sudo apt update
+   sudo apt install -y libze1 libze-dev libze-intel-gpu1
+   ```
+
+   This puts `libze_loader.so.1` and `libze_intel_gpu.so` on the system.
+   The OpenCL `intel-opencl-icd` may also be present from the graphics
+   driver — that is fine and expected.
+
+3. Add **Intel’s APT repo** and install the **DPC++/C++ compiler**.
+   Verified on **Ubuntu 26.04 (resolute)**:
+
+   ```bash
+   # Intel GPG key. NOTE: the filename is UPPERCASE .PUB — the lowercase
+   # .pub 404/403s. The APT server is S3-backed with no public ListBucket,
+   # so *directory* paths (e.g. /oneapi/, /keyring/) return 403
+   # "AccessDenied" even though the real objects under them are 200.
+   # Don't read that 403 as "repo is down" — test real file paths.
+   wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+     | sudo gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+
+   echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+     | sudo tee /etc/apt/sources.list.d/oneAPI.list
+   sudo apt update
+
+   # The compiler only (what FreeToken-Intel needs to build SYCL).
+   sudo apt install -y intel-oneapi-compiler-dpcpp-cpp
+   ```
+
+   This lands the real binary at `/opt/intel/oneapi/compiler/2026.1/bin/icpx`
+   and the official env script at `/opt/intel/oneapi/setvars.sh`.
+   (If you also want the debugger, TBB, oneMKL, etc., install the
+   `intel-oneapi-base-toolkit` metapackage instead.)
+
+   The repo carries every version from 2023.2.2 through the current
+   2026.1.1; apt enforces the signed Release/Packages metadata, so there
+   is no separate artifact hash to record.
+
 4. Use **one** Level Zero ICD (the Arc client). Do not also load Intel
    Data Center GPU ICDs from containers — see [intel-b70.md](intel-b70.md).
 
 After install, in a **new** shell:
 
 ```bash
-source /opt/intel/oneapi/setvars.sh    # path may differ
+source /opt/intel/oneapi/setvars.sh --force
 which icpx && icpx --version
-sycl-ls                                # should list a Level Zero GPU
+sycl-ls                                  # should list a Level Zero GPU
 ```
 
 You will `source setvars.sh` in every shell that compiles SYCL or talks
 to the XPU. It does not replace activating a venv; do both.
+
+**Heads-up (this project):** the repo also ships
+[setvars-xpu.sh](../setvars-xpu.sh), which sets
+`ONEAPI_DEVICE_SELECTOR=level_zero:0` and then delegates to the official
+`setvars.sh`. Use that when working in `.venv-xpu` so the B70 is pinned
+if an AMD iGPU Level-Zero ICD ever shadows it (on the reference machine
+`torch.xpu.device_count` is 1, so the pin is currently a no-op guard).
 
 ## 4. Clone
 
@@ -141,25 +189,61 @@ on a machine that completed step 3.
 
 ```bash
 cd /path/to/FreeToken-Intel
-python3 -m venv .venv-xpu
+python3.11 -m venv .venv-xpu      # match the interpreter to the wheel tag
 source .venv-xpu/bin/activate
-source /opt/intel/oneapi/setvars.sh
 python -m pip install -U pip
 python -m pip install -e ".[dev]"
 ```
 
-Install **PyTorch XPU** into this venv only. Do not use the default
-PyPI CUDA wheel.
+Install **PyTorch XPU** into this venv only. Do **not** use the default
+PyPI CUDA wheel, and install it with `--no-deps` (see below). Verified on
+Ubuntu 26.04 with Python 3.11:
 
 ```bash
-# Index URL follows Intel/PyTorch's current XPU instructions.
-# Confirm on https://pytorch.org (XPU / Intel GPU) before pinning.
-python -m pip install torch --index-url https://download.pytorch.org/whl/xpu
+python -m pip install --no-deps torch==2.13.0 \
+  --index-url https://download.pytorch.org/whl/xpu
 ```
 
-If Triton does not come in with that wheel, install the Intel GPU
-Triton build into the **same** venv (not the CPU venv). IPEX, when you
-want it, is also `pip install` into `.venv-xpu` — never into `.venv`.
+**Why `--no-deps`, and the follow-ups.** The XPU wheel's metadata pulls
+`nvidia-*` CUDA packages on a plain resolve, which must not land on a B70
+box. Install the Intel-side deps explicitly instead:
+
+```bash
+# Intel runtimes/oneCCL/Triton-XPU come from the same XPU index.
+python -m pip install \
+  oneccl==2022.0.0 oneccl-devel==2022.0.0 tbb==2023.0.0 \
+  umf==1.1.0 pyzes==0.1.1 tcmlib==1.5.0 triton-xpu==3.7.2 \
+  --index-url https://download.pytorch.org/whl/xpu
+
+# torch also wants sympy>=1.13.3; the [dev] resolve may leave an older one.
+python -m pip install "sympy>=1.13.3"
+
+# oneMKL + a couple of torch deps resolve from PyPI.
+python -m pip install \
+  onemkl-license==2026.0.0 onemkl-sycl-blas==2026.0.0 \
+  onemkl-sycl-dft==2026.0.0 onemkl-sycl-lapack==2026.0.0 \
+  onemkl-sycl-rng==2026.0.0 onemkl-sycl-sparse==2026.0.0 \
+  jinja2 networkx
+
+# Pin the Intel runtimes back to the 2026.0.x set torch 2.13.0+xpu wants.
+# (The onemkl step above drags intel-*-rt up to 2026.1.x, which then makes
+#  `pip check` complain that torch requires the 2026.0.x pins.)
+python -m pip install --force-reinstall --no-deps \
+  intel-cmplr-lib-rt==2026.0.0 intel-cmplr-lib-ur==2026.0.0 \
+  intel-cmplr-lic-rt==2026.0.0 intel-sycl-rt==2026.0.0 \
+  intel-opencl-rt==2026.0.0 intel-openmp==2026.0.0 \
+  dpcpp-cpp-rt==2026.0.0 intel-pti==0.17.0
+```
+
+Confirm with `python -m pip check` (should report no broken requirements).
+IPEX, when you want it, is also `pip install` into `.venv-xpu` — never
+into `.venv`. (IPEX is out of scope for this project; skip unless needed.)
+
+**One subtlety:** `sycl-ls` only discovers the B70 once the `.venv-xpu`
+runtime packages are on `PATH`/`LD_LIBRARY_PATH`. That is expected — the
+pip-shipped `intel-*-rt` bundles the Level-Zero runtime the loader binds
+to. In a bare system shell (no venv) `sycl-ls` can report "No platforms
+found" even though the GPU is fine; always run it with `.venv-xpu` active.
 
 Check (venv activated **and** `setvars.sh` sourced):
 
