@@ -30,8 +30,9 @@ Use "ft --version" to print the version.""",
 def _run_serve(argv: list[str]) -> int:
     from freetoken.server import launch_server
 
-    launch_server(argv=argv, prog="ft serve")
-    return 0
+    # launch_server is the ft serve spine: it returns an exit code (0 = all
+    # layers live, 1 = blocked at a stub / misconfigured device, 2 = usage).
+    return launch_server(argv=argv, prog="ft serve")
 
 
 def _run_shell(argv: list[str]) -> int:

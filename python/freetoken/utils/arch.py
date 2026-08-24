@@ -59,6 +59,18 @@ def xpu_device_count() -> int:
         return 0
 
 
+def device_report_line() -> str:
+    """One-line device summary shared by ``ft device`` and the ``ft serve`` spine.
+
+    Single source of truth for the summary string so the two callers can never
+    drift apart (see issue ``serve-spine``).
+    """
+    if not is_xpu_available():
+        return "none (torch.xpu unavailable)"
+    name = xpu_device_name() or "(unknown)"
+    return f"{name}, {xpu_device_count()} device(s)"
+
+
 def print_device_report(argv: list[str] | None = None) -> int:
     del argv
     print("FreeToken-Intel device report")
@@ -66,6 +78,7 @@ def print_device_report(argv: list[str] | None = None) -> int:
     print(f"  device count:        {xpu_device_count()}")
     print(f"  device 0 name:       {xpu_device_name() or '(none)'}")
     print(f"  xe2/battlemage:      {is_xe2_family()}")
+    print(f"  device line:         {device_report_line()}")
     print(
         f"  B70 reference spec:  {B70_XE_CORES} Xe-cores, "
         f"{B70_MEMORY_BANDWIDTH_GBS} GB/s, 32 GB VRAM, {B70_TBP_WATTS} W"
