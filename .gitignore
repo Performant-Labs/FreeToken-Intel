@@ -1,0 +1,76 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions / SYCL fat binaries
+*.so
+*.spv
+*.a
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Environments
+.env
+.envrc
+.venv
+.venv-xpu
+.venv-cpu
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# UV lock (XPU/torch wheels go stale faster than it helps)
+uv.lock
+
+# mypy / ruff
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# local artifacts
+kernels_exp/
+refs/
+/results/
+.worktrees/
+*.log
