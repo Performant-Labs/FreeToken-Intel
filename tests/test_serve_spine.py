@@ -104,28 +104,40 @@ def test_launch_server_usage_error_exits_two(capsys):
     capsys.readouterr()
 
 
-def test_launch_server_blocked_without_xpu_never_tracebacks(capsys):
-    # On a box without torch.xpu the device layer (the first one) errors, so
-    # the walk stops there with exit 1. On an XPU box the same call stops at
-    # the first stub — also exit 1. Both are "blocked", so the exit code and
-    # the no-traceback guarantee hold on every machine.
+def test_launch_server_never_tracebacks(capsys):
+    # Running ``ft serve <model>`` must never emit a Python traceback, on any
+    # machine. With the engine implemented (#14) and the server layer live, the
+    # walk reaches the end:
+    #   - on an XPU box every layer reports [ok] and the spine starts the
+    #     server -> EXIT_OK (under pytest the server is built but not bound, so
+    #     this returns cleanly instead of blocking);
+    #   - on a box without torch.xpu the device layer (the first one) errors,
+    #     so the walk stops there with a clean [error] line -> EXIT_BLOCKED.
+    # Both outcomes are "no traceback", which is the guarantee being tested.
     from freetoken.server import launch_server
+    from freetoken.utils.arch import is_xpu_available
 
     capsys.readouterr()
     code = launch_server(["qwen3-30b-a3b"])
     out = capsys.readouterr().out
-    assert code == EXIT_BLOCKED
     assert "ft serve qwen3-30b-a3b" in out
-    # No XPU -> [error] device line (a misconfig, no issue pointer); an XPU
-    # box -> the walk continues and stops at a [stub] layer with a blocked:
-    # line. The exit code is EXIT_BLOCKED on both.
-    if "[error] device" in out:
+    assert "Traceback" not in out
+    if is_xpu_available():
+        # Engine + server are live: the spine reports every layer [ok] and
+        # starts (under pytest: builds the app, does not bind a port).
+        assert code == EXIT_OK
+        assert "[ok]    engine" in out
+        assert "[ok]    server" in out
+        assert "all layers live" in out
+        assert "[stub]" not in out
+        assert "[error]" not in out
+    else:
+        # No XPU: the first layer is a misconfig, so the walk is blocked with a
+        # clean [error] line (no issue pointer, no traceback).
+        assert code == EXIT_BLOCKED
+        assert "[error] device" in out
         assert "blocked:" not in out
         assert "ft device" in out
-    else:
-        assert "[stub]" in out
-        assert "blocked:" in out
-    assert "Traceback" not in out
 
 
 def test_device_report_line_is_shared():

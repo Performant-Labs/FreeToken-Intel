@@ -1,3 +1,3 @@
-from .base import BaseCacheHandle, BaseKVCachePool
+from .base import BaseCacheHandle, BaseKVCachePool, create_kv_pool
 
-__all__ = ["BaseCacheHandle", "BaseKVCachePool"]
+__all__ = ["BaseKVCachePool", "BaseCacheHandle", "create_kv_pool"]

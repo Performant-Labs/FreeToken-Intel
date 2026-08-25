@@ -14,7 +14,9 @@ def test_moe_backends():
 
 
 def test_attention_backends():
-    assert set(SUPPORTED_ATTENTION_BACKENDS.supported_names()) == {"triton", "sycl"}
+    # "torch" is the dependency-free default (pure-torch GQA, runs on CPU/XPU);
+    # "triton" and "sycl" are the optional accelerated paths.
+    assert set(SUPPORTED_ATTENTION_BACKENDS.supported_names()) == {"torch", "triton", "sycl"}
 
 
 def test_qwen35_registered():

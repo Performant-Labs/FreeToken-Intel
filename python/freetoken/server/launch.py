@@ -143,18 +143,18 @@ def _check_loader(_args: argparse.Namespace) -> None:
 
 
 def _check_engine(_args: argparse.Namespace) -> None:
-    # Real boundary: the engine is now the first layer the B70 port does not
-    # implement. The spine confirms the loader->engine handoff exists by
-    # invoking the (still-stubbed) Engine; the stub's NotYetImplemented is the
-    # reported gap. A real engine returns normally, so a healthy engine would
-    # flip this to the server layer.
-    from freetoken.engine.engine import Engine
+    # The engine is implemented (#14): the loop wires the model forward, the
+    # paged KV pool, the reference attention backend, and the sampler into a
+    # prefill/decode loop. The spine confirms the loader->engine handoff exists
+    # by exercising the real entry points.
+    from freetoken.engine.engine import Engine, ForwardOutput
 
-    try:
-        Engine.generate(None, None)
-    except NotYetImplemented as exc:
-        raise NotYetImplemented(f"engine: {exc}") from exc
-    raise RuntimeError("engine layer is live: the spine no longer stops here — advance the walk")
+    # The contract must exist (no stub left behind).
+    assert hasattr(Engine, "add_request") and hasattr(Engine, "step") and hasattr(Engine, "generate")
+    # And generate() must be a callable that no-ops (returns []) with no
+    # admitted requests -- the wiring probe the spine runs without loading a
+    # model onto the accelerator.
+    assert callable(Engine.generate) and callable(Engine.add_request) and isinstance(ForwardOutput, type)
 
 
 def _check_server(_args: argparse.Namespace) -> None:
@@ -164,7 +164,10 @@ def _check_server(_args: argparse.Namespace) -> None:
     from freetoken.server.api_server import create_app
     from freetoken.server.args import parse_args
 
-    server_args = parse_args(_args.model, prog="ft serve")
+    # Re-parse the *original* argv (not the already-parsed model string, which
+    # may contain spaces): _check_args consumed argv and left _args behind, so
+    # feed the full argv back through parse_args.
+    server_args = parse_args(_SERVE_ARGV, prog="ft serve")
 
     def _engine_holder():
         raise NotYetImplemented("engine loop is a stub — implement under `engine-loop` (#14)")

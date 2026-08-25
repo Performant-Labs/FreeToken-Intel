@@ -36,7 +36,11 @@ class Req:
 
     def __post_init__(self) -> None:
         self.device_len = len(self.input_ids) if hasattr(self.input_ids, "__len__") else 0
-        self.max_device_len = self.device_len + self.output_len
+        # ``output_len`` is the number of tokens to *generate*. The prefill step
+        # already emits the first one, so the history length at which the request
+        # is complete is prompt_len + output_len (device_len includes the prompt
+        # plus every generated token).
+        self.max_device_len = self.device_len + max(0, self.output_len)
 
     @property
     def remain_len(self) -> int:
@@ -59,6 +63,13 @@ class Batch:
     log_new_tokens: int = 0
     log_cached_tokens: int = 0
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list)
+    # Device tensors the model's forward() consumes (set by the engine each step):
+    # input_ids [num_tokens] (prefill: flattened prompts; decode: one per req),
+    # positions [num_tokens] (absolute token positions), out_loc [num_tokens]
+    # (KV-cache slot to write each token's key/value into).
+    input_ids: object | None = None
+    positions: object | None = None
+    out_loc: object | None = None
 
     @property
     def is_prefill(self) -> bool:
@@ -78,6 +89,13 @@ class Context:
     page_size: int
     moe_offload_cache: object | None = None
     linear_state_pool: object | None = None
+    # Runtime tensors the model's forward() reads (owned by the engine):
+    #   kv_cache    -- the paged K/V pool (see kvcache.create_kv_pool)
+    #   attn_backend-- the attention backend (prepare_metadata + forward)
+    #   page_table  -- [max_running_req+1, max_seq_len] int32 slot indices
+    kv_cache: object | None = None
+    attn_backend: object | None = None
+    page_table: object | None = None
     _batch: Batch | None = field(default=None, init=False)
 
     @property
@@ -99,11 +117,22 @@ _GLOBAL_CTX: Context | None = None
 
 
 def set_global_ctx(ctx: Context):
+    """Install ``ctx`` as the process-global context (replaces any existing one).
+
+    The reference engine (and the tests) may construct more than one engine in
+    a single process, each with its own context, so this is a plain
+    assignment rather than an assert-None guard.
+    """
     global _GLOBAL_CTX
-    assert _GLOBAL_CTX is None, "Global context is already set"
     _GLOBAL_CTX = ctx
 
 
 def get_global_ctx() -> Context:
     assert _GLOBAL_CTX is not None, "Global context is not set"
     return _GLOBAL_CTX
+
+
+def reset_global_ctx() -> None:
+    """Clear the process-global context (used by tests to restore a clean state)."""
+    global _GLOBAL_CTX
+    _GLOBAL_CTX = None

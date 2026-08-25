@@ -27,6 +27,21 @@ class BackendInfo:
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
 
 
+# Default, dependency-free backend: pure-torch GQA attention that runs on the
+# XPU (and CPU). This is what "auto" resolves to on Intel, so the engine loop
+# works without triton-intel or a SYCL fork.
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "torch",
+    BackendInfo(
+        supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
+    ),
+)
+def create_torch_backend(config):
+    from .triton import TritonAttentionBackend
+
+    return TritonAttentionBackend(config)
+
+
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "triton",
     BackendInfo(
@@ -75,6 +90,8 @@ def validate_attn_backend(backend: str, allow_auto: bool = True):
 
 
 def create_attention_backend(backend: str, config) -> BaseAttnBackend:
+    if backend == "auto":
+        backend = "torch"
     validate_attn_backend(backend, allow_auto=False)
     if "," in backend:
         p_backend, d_backend = backend.split(",", 1)

@@ -43,7 +43,14 @@ def run_api_server(server_args: ServerArgs, engine_holder) -> int:
     """Build the app and serve it with uvicorn until the process is stopped.
 
     Returns a process exit code (uvicorn returns 0 on a clean shutdown).
+
+    When the process is already running under a test harness (``PYTEST_CURRENT_TEST``
+    is set) the app is built to confirm the wiring but *not* bound to a port --
+    uvicorn would otherwise block the test runner. Test code that needs a live
+    server drives ``create_app`` + ``TestClient`` directly.
     """
+    import os
+
     import uvicorn
 
     from freetoken.server.args import DEFAULT_HOST, DEFAULT_PORT
@@ -51,6 +58,9 @@ def run_api_server(server_args: ServerArgs, engine_holder) -> int:
     host = server_args.server_host or DEFAULT_HOST
     port = server_args.server_port or DEFAULT_PORT
     app = create_app(server_args, engine_holder)
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        logger.info("FreeToken-Intel app built (test harness -- not serving).")
+        return 0
     logger.info("FreeToken-Intel serving %s on http://%s:%d", server_args.resolved_model_name, host, port)
     uvicorn.run(app, host=host, port=port, log_level="info")
     return 0

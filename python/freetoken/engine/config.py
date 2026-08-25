@@ -15,6 +15,7 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: object  # torch.dtype once the XPU runtime is wired
+    device: object = None  # torch.device | str; None -> XPU if available else CPU
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_backend: str = "auto"
@@ -65,7 +66,12 @@ class EngineConfig:
     def max_seq_len(self) -> int:
         if self.max_seq_len_override is not None:
             return self.max_seq_len_override
-        return self.model_config.rotary_config.max_position
+        # The parsed ModelConfig carries the context length directly; the
+        # optional RotaryConfig (when present) may override it.
+        rotary = getattr(self.model_config, "rotary_config", None)
+        if rotary is not None and getattr(rotary, "max_position", None):
+            return rotary.max_position
+        return self.model_config.max_position_embeddings
 
     @property
     def max_forward_len(self) -> int:

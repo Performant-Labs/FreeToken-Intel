@@ -51,10 +51,15 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
     return getattr(module, attr_name)
 
 
-def get_model_class(model_architecture: str, model_config):
+def get_model_class(model_architecture: str, model_config, **kwargs):
+    """Resolve the model class for ``model_architecture`` and instantiate it.
+
+    Extra ``kwargs`` (e.g. ``device``) are forwarded to the class constructor;
+    models that don't take them are built with defaults.
+    """
     spec = get_model_spec(model_architecture)
     model_cls = _load_attr(spec.module, spec.model_cls)
-    return model_cls(model_config)
+    return model_cls(model_config, **kwargs)
 
 
 __all__ = ["ModelSpec", "get_model_spec", "get_model_class"]

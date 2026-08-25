@@ -23,6 +23,13 @@ class BaseLLMModel:
     def named_buffers(self, prefix: str = ""):
         yield from ((f"{prefix}.{name}" if prefix else name, value) for name, value in self._buffers.items())
 
+    def __call__(self, *args, **kwargs):
+        # Invoke the model's own forward (not nn.Module.__call__) so a freshly
+        # built model is importable on a CPU-only box (no torch) and so subclasses
+        # can be run as ``model(...)`` with the engine's tensor args. Real
+        # architectures (e.g. Qwen3-MoE) override forward() with the actual pass.
+        return self.forward(*args, **kwargs)
+
     def forward(self, *args, **kwargs):
         unimplemented("BaseLLMModel.forward", "models-qwen35")
 
