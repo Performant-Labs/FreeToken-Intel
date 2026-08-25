@@ -9,11 +9,16 @@ progress map: each product issue that lands removes one stub line.
 
 Layer ownership (see docs/architecture.md):
   device  — real since the XPU software epic (#33)
-  args    — ``server-openai`` (#25)
-  resolve — ``models-qwen3-moe`` (#19) and friends; first registered MoE wins
-  loader  — ``models-loader`` (#17)
+  args    — real since ``server-openai`` (#25); parse_args returns a ServerArgs
+  resolve — real (registry + create_model are wired); the model *stubs* that
+            raise live in the engine layer, so this layer reports ok
+  loader  — ``models-loader`` (#17) — the first stub today
   engine  — ``engine-loop`` (#14)
-  server  — ``server-openai`` (#25)
+  server  — real since ``server-openai`` (#25); create_app builds the FastAPI app
+
+On today's tree the walk is: [ok] device, [ok] args, [ok] resolve, then
+[stub] loader -> blocked: models-loader (#17). When #17 lands the next line
+reports engine-loop (#14).
 """
 from __future__ import annotations
 
@@ -62,21 +67,49 @@ def _check_device(_args: argparse.Namespace) -> None:
         )
 
 
+# The sub-command argv the CLI handed to ``ft serve`` (everything after the
+# word ``serve``). The spine's real ``parse_args`` must succeed against this
+# exact list; a list (not the model string) is what argparse expects.
+_SERVE_ARGV: list[str] = []
+
+
+def set_serve_argv(argv: list[str]) -> None:
+    """Record the serve argv so the args layer can re-parse it faithfully."""
+    global _SERVE_ARGV
+    _SERVE_ARGV = list(argv)
+
+
 def _check_args(_args: argparse.Namespace) -> None:
+    # Real layer: parse_args now returns a ServerArgs (issue #25). It must
+    # succeed against the same argv the CLI parsed, or the layer is broken.
     from freetoken.server.args import parse_args
 
-    parse_args()
+    parse_args(_SERVE_ARGV, prog="ft serve")
+
+
+class _StubConfig:
+    """Minimal model config carrying just the architecture string.
+
+    ``ModelConfig`` is itself a stub (issue #18) with no attributes, so
+    ``create_model`` cannot run on it; the resolve layer only needs the
+    architecture to look up the class, which ``get_model_class`` does directly.
+    """
+
+    def __init__(self, architecture: str) -> None:
+        self.architectures = [architecture]
 
 
 def _check_resolve(_args: argparse.Namespace) -> None:
-    from freetoken.models import create_model
-    from freetoken.models.config import ModelConfig
+    # "Resolve" = map the first-class B70 architecture to a model class via
+    # the registry. The registry and the (stub) model class are real enough
+    # that this resolves today, so the layer reports ok; the model's actual
+    # forward/weight stubs live in the engine layer below. An architecture
+    # that is not registered is a genuine resolve failure (ValueError).
+    from freetoken.models.register import get_model_class
 
-    try:
-        create_model(ModelConfig())
-    except NotYetImplemented:
-        raise
-    raise RuntimeError("resolve layer changed: create_model no longer raises — update the spine")
+    model_cls = get_model_class(FIRST_CLASS_ARCH, _StubConfig(FIRST_CLASS_ARCH))
+    del model_cls
+    return None
 
 
 def _check_loader(_args: argparse.Namespace) -> None:
@@ -101,10 +134,19 @@ def _check_engine(_args: argparse.Namespace) -> None:
 
 
 def _check_server(_args: argparse.Namespace) -> None:
+    # Real layer: create_app now builds the FastAPI app (issue #25). The app
+    # is created without binding a port, so the spine can confirm the wiring
+    # exists without hijacking the requested port.
     from freetoken.server.api_server import create_app
+    from freetoken.server.args import parse_args
+
+    server_args = parse_args(_args.model, prog="ft serve")
+
+    def _engine_holder():
+        raise NotYetImplemented("engine loop is a stub — implement under `engine-loop` (#14)")
 
     try:
-        create_app()
+        create_app(server_args, _engine_holder)
     except NotYetImplemented as exc:
         raise NotYetImplemented(f"server: {exc}") from exc
 
@@ -163,10 +205,12 @@ def launch_server(argv: list[str] | None = None, prog: str = "ft serve", out: Te
     torch installed.
     """
     stream = out if out is not None else sys.stdout
+    argv = list(argv) if argv is not None else []
+    set_serve_argv(argv)
     # argparse prints to the real sys.stdout and raises SystemExit on both
     # --help (0) and usage errors (2); honor whatever it chose.
     try:
-        args = _parse_args(list(argv) if argv is not None else [], prog=prog)
+        args = _parse_args(argv, prog=prog)
     except SystemExit as exc:
         return int(exc.code if exc.code is not None else EXIT_OK)
 
@@ -176,4 +220,26 @@ def launch_server(argv: list[str] | None = None, prog: str = "ft serve", out: Te
         from freetoken.version import __version__
 
         stream.write(f"(freetoken-intel {__version__})\n")
-    return result
+        return result
+
+    # Every layer is live: hand over to the real server. This path is reached
+    # only once loader (#17) and engine (#14) are implemented, so it imports
+    # the torch-bound stack only now.
+    stream.write("all layers live — starting server\n")
+    from freetoken.server.args import parse_args
+    from freetoken.server.api_server import run_api_server
+
+    server_args = parse_args(_SERVE_ARGV, prog=prog)
+
+    def _engine_holder():
+        # Real wiring: load the model onto the XPU host banks and wrap it in
+        # the engine loop. Both land under #17/#14; until then the spine
+        # never reaches this line.
+        from freetoken.engine.engine import Engine
+        from freetoken.models import create_model
+        from freetoken.models.config import ModelConfig
+
+        create_model(ModelConfig())
+        Engine()
+
+    return run_api_server(server_args, _engine_holder)

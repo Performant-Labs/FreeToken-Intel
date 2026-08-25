@@ -1,13 +1,158 @@
-"""ft serve argparse.
+"""``ft serve`` arguments.
 
 Upstream NVIDIA path: python/freetoken/server/args.py
-Fill in: GitHub issue `server-openai` (see docs/architecture.md).
+
+This is the Intel port's serving-args surface. It deliberately carries only
+what ``ft serve`` needs to stand up an OpenAI-compatible HTTP endpoint on the
+B70; the full upstream argument set (MoE cache sizing, tokenizer process pool,
+KV capacity overrides, …) lands together with the engine and scheduler epics
+(#14, #13) that actually consume those knobs. Adding a knob later is a one-line
+argparse addition — the ``ServerArgs`` dataclass is the single source of
+defaults.
 """
 from __future__ import annotations
 
-from freetoken._stub import unimplemented
+import argparse
+import os
+from dataclasses import dataclass, fields
+
+# Upstream serves on 127.0.0.1:1919 so Codex and friends "just work".
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 1919
+
+DTYPE_CHOICES = ("auto", "float16", "bfloat16", "float32")
+TOOL_CALL_PARSER_CHOICES = (
+    "auto",
+    "llama3",
+    "qwen25",
+    "qwen3_coder",
+    "mistral",
+    "deepseekv32",
+    "gemma4",
+    "glm47",
+    "minimax",
+    "gpt_oss",
+)
+REASONING_PARSER_CHOICES = ("auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm", "minimax", "gemma4")
 
 
-def parse_args(*args, **kwargs):
-    unimplemented("parse_args", "server-openai")
+@dataclass(frozen=True)
+class ServerArgs:
+    """Serving configuration for ``ft serve``.
 
+    ``model_path`` accepts a Hugging Face repo id or a local path (the loader,
+    issue #17, resolves it). ``served_model_name`` is the id reported by
+    ``/v1/models`` and defaults to the model reference's basename.
+    """
+
+    model: str
+    server_host: str = DEFAULT_HOST
+    server_port: int = DEFAULT_PORT
+    dtype: str = "auto"
+    served_model_name: str | None = None
+    tool_call_parser: str = "auto"
+    reasoning_parser: str | None = "auto"
+    max_output_tokens: int | None = None
+    shell_mode: bool = False
+
+    def __post_init__(self) -> None:
+        if self.server_port < 0 or self.server_port > 65535:
+            raise ValueError(f"server_port must be in [0, 65535], got {self.server_port}")
+
+    @property
+    def model_path(self) -> str:
+        """Alias for :attr:`model` — the loader (#17) keys on ``model_path``."""
+        return self.model
+
+    @property
+    def resolved_model_name(self) -> str:
+        if self.served_model_name:
+            return self.served_model_name
+        return os.path.basename(os.path.normpath(self.model)) or self.model
+
+
+def _infer_tool_call_parser(args: "ServerArgs") -> str:
+    """Best-effort per-family parser selection (upstream parity, no HF round-trip).
+
+    The real parser implementations land with the generation path (#14/#25
+    streaming); until then this just records which grammar the serving layer
+    should parse, inferred from the model reference.
+    """
+    marker = os.path.basename(args.model).lower()
+    if "gpt" in marker and "oss" in marker:
+        return "gpt_oss"
+    if "qwen3" in marker and "coder" in marker:
+        return "qwen3_coder"
+    if "qwen" in marker:
+        return "qwen25"
+    if "deepseek" in marker:
+        return "deepseekv32"
+    if "gemma" in marker:
+        return "gemma4"
+    if "glm" in marker:
+        return "glm47"
+    if "minimax" in marker:
+        return "minimax"
+    if "mistral" in marker:
+        return "mistral"
+    return "llama3"
+
+
+def _infer_reasoning_parser(args: "ServerArgs") -> str | None:
+    marker = os.path.basename(args.model).lower()
+    if "gpt" in marker and "oss" in marker:
+        return "gpt_oss"
+    if "qwen3" in marker:
+        return "qwen3"
+    if "glm" in marker:
+        return "glm"
+    if "minimax" in marker:
+        return "minimax"
+    if "gemma" in marker:
+        return "gemma4"
+    return None
+
+
+def parse_args(args: list[str] | None = None, prog: str | None = None) -> ServerArgs:
+    """Parse ``ft serve`` arguments.
+
+    ``args`` is the sub-command argv *after* ``serve`` (i.e. what the CLI
+    dispatcher hands over); ``None`` falls back to ``sys.argv[1:]`` for direct
+    use. Unknown flags are a usage error (argparse exits 2).
+    """
+    if args is None:
+        import sys
+
+        args = sys.argv[1:]
+
+    parser = argparse.ArgumentParser(prog=prog or "ft serve", description="FreeToken-Intel server")
+    parser.add_argument(
+        "model",
+        help="Model reference: HF repo id or local path (resolved by the loader, issue #17).",
+    )
+    parser.add_argument("--host", dest="server_host", default=DEFAULT_HOST, help=f"Bind host (default: {DEFAULT_HOST})")
+    parser.add_argument("--port", dest="server_port", type=int, default=DEFAULT_PORT, help=f"Bind port (default: {DEFAULT_PORT})")
+    parser.add_argument("--dtype", default="auto", choices=DTYPE_CHOICES, help="Weight dtype; 'auto' follows the checkpoint.")
+    parser.add_argument("--served-model-name", dest="served_model_name", default=None, help="Model id reported by /v1/models (default: model basename).")
+    parser.add_argument("--tool-call-parser", dest="tool_call_parser", default="auto", choices=TOOL_CALL_PARSER_CHOICES, help="Tool-call grammar for OpenAI tool responses.")
+    parser.add_argument("--reasoning-parser", dest="reasoning_parser", default="auto", choices=REASONING_PARSER_CHOICES, help="Split chain-of-thought into reasoning_content. 'off' disables.")
+    parser.add_argument("--max-output-tokens", dest="max_output_tokens", type=int, default=None, help="Default max decode tokens for requests that omit one.")
+    parser.add_argument("--shell-mode", dest="shell_mode", action="store_true", help="Run the server attached to a terminal shell (ft shell).")
+
+    ns = parser.parse_args(args)
+    kwargs = {f.name: getattr(ns, f.name) for f in fields(ServerArgs)}
+    args_obj = ServerArgs(**kwargs)
+
+    if args_obj.tool_call_parser == "auto":
+        args_obj = _replace_parser(args_obj, tool_call_parser=_infer_tool_call_parser(args_obj))
+    if args_obj.reasoning_parser == "auto":
+        args_obj = _replace_parser(args_obj, reasoning_parser=_infer_reasoning_parser(args_obj))
+    elif args_obj.reasoning_parser == "off":
+        args_obj = _replace_parser(args_obj, reasoning_parser=None)
+    return args_obj
+
+
+def _replace_parser(args: ServerArgs, **changes) -> ServerArgs:
+    current = {f.name: getattr(args, f.name) for f in fields(ServerArgs)}
+    current.update(changes)
+    return ServerArgs(**current)
