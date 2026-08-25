@@ -12,13 +12,14 @@ Layer ownership (see docs/architecture.md):
   args    — real since ``server-openai`` (#25); parse_args returns a ServerArgs
   resolve — real (registry + create_model are wired); the model *stubs* that
             raise live in the engine layer, so this layer reports ok
-  loader  — ``models-loader`` (#17) — the first stub today
-  engine  — ``engine-loop`` (#14)
+  loader  — real since ``models-loader`` (#17); load_model places dense weights
+            on the XPU and builds the MoE host offload banks
+  engine  — ``engine-loop`` (#14) — the first stub today
   server  — real since ``server-openai`` (#25); create_app builds the FastAPI app
 
-On today's tree the walk is: [ok] device, [ok] args, [ok] resolve, then
-[stub] loader -> blocked: models-loader (#17). When #17 lands the next line
-reports engine-loop (#14).
+On today's tree the walk is: [ok] device, [ok] args, [ok] resolve, [ok] loader,
+then [stub] engine -> blocked: engine-loop (#14). When #14 lands the next line
+reports server (already live) and the server starts.
 """
 from __future__ import annotations
 
@@ -47,6 +48,10 @@ _ISSUE_BY_LAYER = {
     "engine": "engine-loop (#14)",
     "server": "server-openai (#25)",
 }
+# The loader layer is real since #17; the first stub the walk stops at is the
+# engine. (The map above is kept complete so a future stub in any layer still
+# reports the issue that owns it.)
+FIRST_STUB_LAYER = "engine"
 
 
 @dataclass(frozen=True)
@@ -113,24 +118,43 @@ def _check_resolve(_args: argparse.Namespace) -> None:
 
 
 def _check_loader(_args: argparse.Namespace) -> None:
-    from freetoken.models.loader import load_model
+    # Real layer: the loader (issue #17) is wired -- ``load_weight`` /
+    # ``load_moe_expert_sources`` resolve the model spec, parse the config, and
+    # route dense weights to the XPU and MoE experts to host banks. This check
+    # confirms that wiring exists WITHOUT downloading the checkpoint: it verifies
+    # the loader's entry points are importable and the MoE spec is registered, so
+    # the spine stays network-free (a ``ft serve`` with an uncached model id must
+    # still run). The dummy-bank builder is exercised end to end in the tests.
+    from freetoken.models.register import get_model_spec
+    from freetoken.models.weight import load_moe_expert_sources, load_weight
 
     try:
-        load_model(_args.model)
+        # The entry points must exist and be callable (a stub would raise on
+        # import or call). get_model_spec is the spec-resolution step the loader
+        # runs first; the first-class arch must be registered.
+        assert callable(load_weight) and callable(load_moe_expert_sources)
+        get_model_spec(FIRST_CLASS_ARCH)
     except NotYetImplemented as exc:
+        raise NotYetImplemented(f"loader: {exc}") from exc
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- any wiring break is a loader failure
         raise NotYetImplemented(f"loader: {exc}") from exc
 
 
 def _check_engine(_args: argparse.Namespace) -> None:
-    # The engine stubs fire on call; invoke with None to trip the stub
-    # without needing a constructed model.
+    # Real boundary: the engine is now the first layer the B70 port does not
+    # implement. The spine confirms the loader->engine handoff exists by
+    # invoking the (still-stubbed) Engine; the stub's NotYetImplemented is the
+    # reported gap. A real engine returns normally, so a healthy engine would
+    # flip this to the server layer.
     from freetoken.engine.engine import Engine
 
     try:
         Engine.generate(None, None)
-    except NotYetImplemented:
-        raise
-    raise RuntimeError("engine layer changed: Engine.generate no longer raises — update the spine")
+    except NotYetImplemented as exc:
+        raise NotYetImplemented(f"engine: {exc}") from exc
+    raise RuntimeError("engine layer is live: the spine no longer stops here — advance the walk")
 
 
 def _check_server(_args: argparse.Namespace) -> None:

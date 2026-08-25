@@ -9,8 +9,19 @@ from freetoken._stub import unimplemented
 
 
 class BaseLLMModel:
+    """The real model owns a parameter set; the stub exposes an empty one so
+    the loader's ``named_parameters`` contract works before the forward pass
+    (issue ``models-qwen3-5`` / ``engine-loop``) is implemented."""
+
     def __init__(self, *args, **kwargs) -> None:
-        pass
+        self._parameters: dict = {}
+        self._buffers: dict = {}
+
+    def named_parameters(self, prefix: str = ""):
+        yield from ((f"{prefix}.{name}" if prefix else name, value) for name, value in self._parameters.items())
+
+    def named_buffers(self, prefix: str = ""):
+        yield from ((f"{prefix}.{name}" if prefix else name, value) for name, value in self._buffers.items())
 
     def forward(self, *args, **kwargs):
         unimplemented("BaseLLMModel.forward", "models-qwen35")
