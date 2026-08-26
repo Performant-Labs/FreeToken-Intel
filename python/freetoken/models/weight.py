@@ -20,7 +20,7 @@ from __future__ import annotations
 import glob
 import json
 import os
-from typing import Iterator, Tuple
+from typing import Iterator, Optional, Tuple
 
 import torch
 from safetensors import safe_open
@@ -190,13 +190,23 @@ def stream_moe_expert_sources(
     dtype: torch.dtype,
     layer_sink=None,
 ) -> Tuple[list, list]:
-    """Stream packed per-layer MoE expert tensors into final offload banks.
+    """Stream per-layer MoE expert tensors into final offload banks.
 
-    The model's ``iter_weights`` normalizes expert weights to
-    ``...experts.gate_up_proj`` / ``...experts.down_proj`` with shape
-    ``[num_experts, ...]``. Each arrives whole-layer, so it is written straight
-    into its own ``[num_experts, ...]`` per-layer bank. Returns
-    ``(gate_up_banks, down_banks)`` (per-layer bank objects).
+    Two checkpoint layouts are accepted (ADR 0002):
+
+    * **packed** -- ``...experts.{gate_up_proj|down_proj}`` already stacked to
+      ``[num_experts, ...]`` (what the model adapter / FTW normalizes to). Each
+      arrives whole-layer and is written straight into its per-layer bank.
+    * **per-expert** -- the raw HF layout
+      ``...experts.{e}.{gate|up|down}_proj`` (one ``[I, H]`` / ``[H, I]`` tensor
+      per expert). A real HF checkpoint (e.g. Qwen3-30B-A3B) ships this form, so
+      the streamer stacks the per-expert rows into the packed
+      ``gate_up [E, 2I, H]`` (gate then up, concatenated on dim 1) and
+      ``down [E, H, I]`` banks -- the exact layout the ``dummy=True`` fabricator
+      and the offload slot cache expect.
+
+    Either form (or a mix) is fine per layer. Returns ``(gate_up_banks,
+    down_banks)`` (per-layer bank objects), each ``[num_experts, ...]``.
     """
     del layer_sink  # converter-facing sink not used on the B70 port
     banks: dict[str, list] = {
@@ -205,23 +215,38 @@ def stream_moe_expert_sources(
     }
     row_shape: dict[str, tuple[int, ...]] = {}
     seen: dict[str, set[int]] = {"gate_up": set(), "down": set()}
+    # Per-expert rows are buffered as {layer: {expert_id: row}} and fused into the
+    # packed bank at the end (see _finalize_per_expert_banks) rather than written
+    # in-place row-by-row: the in-place int+slice / narrow / scatter write paths of
+    # the torch XPU build are unreliable, whereas torch.cat is not.
+    per_expert: dict[str, list[dict[int, torch.Tensor]]] = {
+        "gate": [{} for _ in range(config.num_layers)],
+        "up": [{} for _ in range(config.num_layers)],
+        "down": [{} for _ in range(config.num_layers)],
+    }
 
     for name, tensor in tensors:
-        info = _packed_expert_source_info(name)
+        info = _expert_source_info(name)
         if info is None:
             raise ValueError(f"Unexpected expert weight key: {name}")
-        layer, packed_name = info
-        bank_name = "gate_up" if packed_name == "gate_up_proj" else "down"
-        _copy_expert_layer_into_bank(
-            banks,
-            row_shape,
-            seen,
-            bank_name=bank_name,
-            tensor=tensor.to(dtype=dtype),
-            layer=layer,
-            config=config,
-            dtype=dtype,
-        )
+        layer, packed_name, expert_id = info
+        bank_name = "gate_up" if packed_name in {"gate_up_proj", "gate_proj", "up_proj"} else "down"
+        if expert_id is None:
+            # Packed: the tensor is the whole [num_experts, ...] layer -> copy as-is.
+            _copy_expert_layer_into_bank(
+                banks,
+                row_shape,
+                seen,
+                bank_name=bank_name,
+                tensor=tensor.to(dtype=dtype),
+                layer=layer,
+                config=config,
+                dtype=dtype,
+            )
+        else:
+            # Per-expert: buffer this one row; the bank is fused at the end.
+            _buffer_expert_row(per_expert, row_shape, bank_name, packed_name, tensor.to(dtype=dtype), layer, expert_id, config)
+            seen[bank_name].add(layer)
 
     missing = {
         name: sorted(set(range(config.num_layers)) - seen)
@@ -230,28 +255,58 @@ def stream_moe_expert_sources(
     }
     if missing:
         raise ValueError(f"Missing MoE expert source layers: {missing}")
+    _finalize_per_expert_banks(banks, per_expert, config)
     return (
         [bank.tensor for bank in banks["gate_up"]],
         [bank.tensor for bank in banks["down"]],
     )
 
 
-def _packed_expert_source_info(key: str) -> Tuple[int, str] | None:
-    """Map a HF MoE expert key to ``(layer, packed_name)`` or None.
+def _expert_source_info(key: str) -> Tuple[int, str, Optional[int]] | None:
+    """Map a HF MoE expert key to ``(layer, name, expert_id)`` or None.
 
-    Accepts the Qwen-style ``model.layers.{L}.mlp.experts.{e}.{proj}`` (per-expert,
-    projected) keys and the packed ``...experts.{gate_up_proj|down_proj}`` (already
-    stacked to ``[num_experts, ...]``) keys the model adapter normalizes to.
+    ``name`` is the trailing projection token and ``expert_id`` is the row index for
+    per-expert keys (``None`` when the key is already the packed,
+    ``[num_experts, ...]`` tensor). Recognized forms (anchored on ``mlp`` -> ``experts``):
+
+    * packed -- ``model.layers.{L}.mlp.experts.{gate_up_proj|down_proj}`` (the
+      experts key is terminal, nothing follows it) -> ``(L, name, None)``
+    * per-expert -- ``model.layers.{L}.mlp.experts.{e}.{gate|up|down}_proj`` ->
+      ``(L, name, e)`` (``gate_proj``/``up_proj`` both feed the ``gate_up`` bank,
+      ``down_proj`` feeds ``down``). A non-projection trailing token (e.g. an
+      unknown ``...experts.{e}.{other}``) is not an expert source and yields ``None``.
     """
     parts = key.split(".")
-    if len(parts) < 5 or parts[0] != "model" or parts[1] != "layers":
-        return None
-    if parts[-2] != "experts" or parts[-1] not in {"gate_up_proj", "down_proj"}:
+    # A MoE expert key is anchored on the trailing ``.experts.`` group. The layer
+    # id is the integer token immediately before the ``mlp`` token that precedes
+    # ``experts`` (``...layers.{L}.mlp.experts...``), which is not a fixed offset
+    # from the end (the per-expert form appends ``.{e}.{proj}``), so locate ``mlp``
+    # first and take the integer that directly precedes it.
+    if "mlp" not in parts or "experts" not in parts:
         return None
     try:
-        return int(parts[2]), parts[-1]
-    except ValueError:
+        mlp_pos = parts.index("mlp")
+        layer = int(parts[mlp_pos - 1])
+    except (ValueError, IndexError):
         return None
+    if parts[mlp_pos + 1] != "experts":
+        return None
+    last = parts[-1]
+    # Packed form: the experts key is TERMINAL -- ``...experts.{gate_up_proj|
+    # down_proj}`` (the tensor is already stacked to [num_experts, ...]). A
+    # trailing ``.{e}.{proj}`` group would mean the per-expert form, so those
+    # tokens are only accepted when nothing follows ``experts``.
+    e_pos = parts.index("experts")
+    if last in {"gate_up_proj", "down_proj"} and len(parts) == e_pos + 2:
+        return layer, last, None
+    # Per-expert form: ``...experts.{e}.{proj}`` -- parts[-2] is the expert index.
+    if last in {"gate_proj", "up_proj", "down_proj"}:
+        try:
+            expert_id = int(parts[-2])
+        except ValueError:
+            return None
+        return layer, last, expert_id
+    return None
 
 
 def _copy_expert_layer_into_bank(
@@ -281,6 +336,95 @@ def _copy_expert_layer_into_bank(
         banks[bank_name][layer] = bank = _PlainBank(torch.empty((config.num_experts, *tensor.shape[1:]), dtype=dtype))
     bank.tensor.copy_(tensor)
     seen[bank_name].add(layer)
+
+
+def _buffer_expert_row(
+    per_expert: dict[str, list[dict[int, torch.Tensor]]],
+    row_shape: dict[str, tuple[int, ...]],
+    bank_name: str,
+    packed_name: str,
+    tensor: torch.Tensor,
+    layer: int,
+    expert_id: int,
+    config,
+) -> None:
+    """Buffer one per-expert row; the packed bank is fused at the end of the stream.
+
+    ``gate_proj`` / ``up_proj`` are keyed under the ``gate_up`` bank (as the ``gate``
+    and ``up`` halves respectively); ``down_proj`` under ``down``. Rows are not
+    written in-place -- see :func:`_finalize_per_expert_banks`.
+    """
+    bucket = "gate" if packed_name == "gate_proj" else ("up" if packed_name == "up_proj" else "down")
+    bucket_by_layer = per_expert[bucket]
+    if not (0 <= layer < config.num_layers):
+        raise ValueError(f"Unexpected MoE expert layer {layer}")
+    if not (0 <= expert_id < config.num_experts):
+        raise ValueError(f"Unexpected MoE expert id {expert_id} in layer {layer}")
+    expected_shape = row_shape.setdefault(bank_name, tuple(tensor.shape))
+    if tuple(tensor.shape) != expected_shape:
+        raise ValueError(
+            f"Inconsistent {bank_name} per-expert shape {tuple(tensor.shape)}; expected {expected_shape}"
+        )
+    if expert_id in bucket_by_layer[layer]:
+        raise ValueError(f"Duplicate per-expert source for layer {layer} expert {expert_id} ({packed_name})")
+    bucket_by_layer[layer][expert_id] = tensor
+
+
+def _finalize_per_expert_banks(banks: dict[str, list], per_expert, config) -> None:
+    """Fuse the buffered per-expert rows into the packed per-layer banks.
+
+    ``gate_up`` is ``[E, 2I, H]`` (gate then up, matching the ``dummy=True``
+    fabricator and the upstream ``_BANK_SCHEMAS``); ``down`` is ``[E, H, I]``.
+    A layer is only finalized once *all* of its experts are present (gate + up +
+    down), so a checkpoint that ships a bank packed and the rest per-expert (or
+    vice versa) still completes.
+
+    The per-expert rows (``[I, H]`` / ``[H, I]``) are stacked into the ``[E, ...]``
+    bank with ``cat`` on the *middle* dim + a ``permute`` (``_stack_expert_rows``),
+    and the gate/up fusion is a ``cat`` on dim 1. These 3-D ops are the only
+    reliable path in the torch XPU build: in-place row writes (``__setitem__`` with
+    an int + slice, ``narrow`` + ``copy_``, ``scatter``) and ``cat``/``reshape`` on
+    the 2-D per-expert rows are all mishandled by that build (they drop or
+    misplace the expert dimension), whereas ``cat(dim=1)`` + ``permute`` on 3-D
+    tensors are correct.
+    """
+    num_layers = config.num_layers
+    num_experts = config.num_experts
+    for layer in range(num_layers):
+        if banks["gate_up"][layer] is not None and banks["down"][layer] is not None:
+            continue  # already produced by a packed source; per-expert rows (if any) unused
+        gate = per_expert["gate"][layer]
+        up = per_expert["up"][layer]
+        down = per_expert["down"][layer]
+        # Only finalize a layer whose expert coverage is complete.
+        if len(gate) < num_experts or len(up) < num_experts or len(down) < num_experts:
+            continue
+        gate_bank = _stack_expert_rows([gate[e] for e in range(num_experts)])  # [E, I, H]
+        up_bank = _stack_expert_rows([up[e] for e in range(num_experts)])  # [E, I, H]
+        down_bank = _stack_expert_rows([down[e] for e in range(num_experts)])  # [E, H, I]
+        # Fuse gate + up on the inner (dim 1) axis -> [E, 2I, H].
+        banks["gate_up"][layer] = _PlainBank(torch.cat([gate_bank, up_bank], dim=1))
+        banks["down"][layer] = _PlainBank(down_bank)
+
+
+def _stack_expert_rows(rows: list) -> torch.Tensor:
+    """Stack ``[E]`` per-expert rows of shape ``[D0, D1]`` into one ``[E, D0, D1]``
+    tensor, using only ops the torch XPU build handles correctly (see
+    :func:`_finalize_per_expert_banks`).
+
+    Each 2-D row is promoted to ``[1, D0, D1]`` (``unsqueeze(0)``) and the results
+    are ``cat``-ed on dim 0 -> ``[E, D0, D1]``. A direct ``cat`` on the 2-D rows
+    (dim 0 or 1) drops/misplaces the expert dimension in this build, so the rows
+    are first made 3-D: ``cat`` on a 3-D tensor along dim 0 is reliable.
+    """
+    if not rows:
+        raise ValueError("Cannot stack an empty list of expert rows")
+    first = rows[0]
+    if first.dim() != 2:
+        raise ValueError(f"Expected 2-D per-expert rows; got {first.dim()}-D")
+    if any(r.dim() != 2 or r.shape != first.shape for r in rows[1:]):
+        raise ValueError("Per-expert rows must share a single shape")
+    return torch.cat([row.unsqueeze(0) for row in rows], dim=0)
 
 
 __all__ = [

@@ -161,6 +161,12 @@ def _place_expert_weights(model, gate_up_banks, down_banks) -> None:
     """
     import torch
 
+    # The gate_up bank is [num_experts, 2*intermediate, hidden]: for each expert
+    # row the *first* ``intermediate_size`` rows are the gate projection and the
+    # next ``intermediate_size`` are the up projection (gate then up, concatenated
+    # on dim 1 -- the layout the repacker / dummy fabricator both produce). The
+    # down bank is [num_experts, hidden, intermediate].
+    intermediate = int(getattr(model.config, "moe_intermediate_size", 0))
     for layer_id in _moe_layers(model.config):
         moe = getattr(getattr(model, "layers", [None] * (layer_id + 1))[layer_id], "mlp", None)
         experts = getattr(moe, "experts", None)
@@ -171,10 +177,9 @@ def _place_expert_weights(model, gate_up_banks, down_banks) -> None:
         gu = gate_up_banks[layer_id].tensor if hasattr(gate_up_banks[layer_id], "tensor") else gate_up_banks[layer_id]
         dn = down_banks[layer_id].tensor if hasattr(down_banks[layer_id], "tensor") else down_banks[layer_id]
         for e in range(len(experts)):
-            gate, up = gu[e, 0].clone(), gu[e, 1].clone()
             with torch.no_grad():
-                experts[e].gate_proj.weight.copy_(gate)
-                experts[e].up_proj.weight.copy_(up)
+                experts[e].gate_proj.weight.copy_(gu[e, 0:intermediate])
+                experts[e].up_proj.weight.copy_(gu[e, intermediate : 2 * intermediate])
                 experts[e].down_proj.weight.copy_(dn[e])
 
 
