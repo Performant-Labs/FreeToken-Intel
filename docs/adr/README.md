@@ -33,3 +33,4 @@ issues. Do not duplicate the stack page.
 | ADR | Title | Status |
 | --- | --- | --- |
 | [0001](0001-freetoken-on-intel-sycl-xpu.md) | Port FreeToken onto Intel SYCL / XPU for Arc Pro B70 | Accepted |
+| [0002](0002-moe-expert-host-offload.md) | MoE experts live in host RAM, streamed into an XPU LRU slot pool | Accepted |
