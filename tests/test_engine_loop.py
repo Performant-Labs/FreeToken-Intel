@@ -17,7 +17,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-pytestmark = pytest.mark.xpu
+# No ``xpu`` marker: the tests below build the model explicitly on the CPU
+# (DEVICE = "cpu" below), so they run in the CPU CI runner. The XPU/B70 path is
+# exercised separately by the xpu-marked suite (run with ``-m xpu`` on a B70 box).
 
 from freetoken.core import Req, SamplingParams, reset_global_ctx
 from freetoken.distributed import DistributedInfo
