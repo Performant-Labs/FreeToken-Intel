@@ -7,7 +7,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Opt this repo onto the self-hosted Uranus fleet via the org CI_RUNNER
+    # variable (value: self-hosted-linux). Until that variable is scoped to this
+    # repo, it falls back to the GitHub-hosted ubuntu-latest runner. See
+    # pl-ops-handbook > platform-ops > github-runners.md ("Repo opt-in").
+    # The fleet image bakes a CPU PyTorch (pl-runner >= 1.66.1), so the torch
+    # tests (test_engine_loop, test_moe_offload_*, test_models_loader) run here
+    # instead of being skipped on a torch-less runner.
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
