@@ -104,8 +104,9 @@ class OffloadMoeCache:
         # Per-layer active mask (diagnostics; mirrors upstream).
         self.active_mask = torch.zeros((num_experts,), dtype=torch.int32, device=self.device)
 
-        # Fixed-shape staging for the copy plan. A layer's routed set has at most
-        # batch*top_k positions, so size these for the larger of (E, cache_size).
+        # Fixed-shape staging for the copy plan. Both phases stage one row per
+        # (evicted) expert: materialize_layer stages up to num_experts (a whole
+        # layer) and ensure_experts stages one per miss, so size for the larger.
         plan_slots = max(num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
@@ -186,49 +187,82 @@ class OffloadMoeCache:
     # -- prefill: whole-layer materialize --------------------------------------
 
     def materialize_layer(self, layer_id: int) -> None:
-        """Place a whole layer into slots ``[0, E)`` (slot == expert, no LRU).
+        """Place a whole layer into the slot pool for a prefill forward.
 
-        Mirrors the upstream ``_materialize_layer`` kernel: a slot already
-        owned by *this* layer is just refreshed (usage = step); a slot owned by
-        *another* layer is released (its id's ``slot_for_id`` cleared) and then
-        reused. ``num_indices`` is set to ``num_experts`` so a following
-        :meth:`copy_missing` copies the entire layer's host rows into the slots.
+        This is a *batched timestamp-LRU* pass over the whole layer's experts,
+        not a fixed-slot double buffer: the pool is a single global LRU shared by
+        all layers (the only place 61 GB of experts physically fit), so a layer
+        that is being prefilled evicts the LRU-resident experts of *other* layers
+        and re-uses their slots. (Upstream, ``materialize_layer`` is a
+        double-buffer *prefetch* -- it writes into a separate prefill double
+        buffer and never evicts a resident decode slot the way a fixed [0, E)
+        remap would; this mirror folds that into the unified global LRU, which is
+        the correctness-preserving equivalent.)
+
+        Per expert: an already-resident expert is a **hit** (keeps its slot,
+        usage bumped, no re-copy); a **miss** takes a free slot or evicts the
+        global LRU victim. After the loop every expert of the layer is resident
+        (the forward may then gather the whole layer), and ``num_indices`` counts
+        the missed experts so a following :meth:`copy_missing` streams exactly
+        those host rows. Requires ``cache_size >= num_experts`` (the constructor
+        enforces this) -- below that the pool cannot hold a whole layer.
         """
         if not (0 <= layer_id < self.num_layers):
             raise ValueError(f"Invalid materialize layer id {layer_id}")
         E = self.num_experts
         S = self.cache_size
         base = layer_id * E
+        if S < E:
+            raise ValueError(
+                f"cache_size {S} < num_experts {E}: cannot materialize a whole layer"
+            )
         step = int(self.step.item()) + 1
         self.step.fill_(step)
-
-        # Slot -> old id (a python list so the loop below stays allocation-free
-        # relative to the tensor writes). Two cases release a slot:
-        #  * owned by a DIFFERENT layer -> released (that layer's expert is
-        #    evicted; it re-fetches on its next decode step), and
-        #  * owned by THIS layer in a DECODE slot (>= 2E) -> released too, since
-        #    prefill re-homes this layer's experts into the double buffer.
-        #     Without this, a decode slot a previous decode step placed an expert
-        #     in would leave the expert double-resident (slot_for_id says the
-        #     decode slot, id_of_slot still claims the double-buffer slot), so the
-        #     next decode step would mis-classify a hit as a miss (or vice versa).
-        slot_for_id = self.slot_for_id.view(-1)
-        old_ids = self.id_of_slot.tolist()
-        for slot in range(S):
-            old_id = old_ids[slot]
-            if old_id < 0:
-                continue
-            if not (base <= old_id < base + E) or slot >= E:
-                slot_for_id[old_id] = -1
-                self.id_of_slot[slot] = -1
-                self.usage[slot] = 0
+        self.active_mask.zero_()
         for expert in range(E):
-            self.id_of_slot[expert] = base + expert
-            slot_for_id[base + expert] = expert
-            self.usage[expert] = step
-            self.evict_slots[expert] = expert
-            self.src_indices[expert] = expert  # layer-local row == expert
-        self.num_indices.fill_(E)
+            self.active_mask[expert] = 1
+
+        layer_slots = self.slot_for_id[layer_id]
+        flat_slots = self.slot_for_id.view(-1)
+
+        # Phase 1: hits -- a resident expert keeps its slot and bumps usage (no
+        # re-copy), so re-prefilling an already-warm layer is cheap.
+        for expert in range(E):
+            slot = int(layer_slots[expert].item())
+            if slot != -1:
+                self.usage[slot] = step
+
+        # Phase 2: misses -- a non-resident expert takes a free slot (an expert
+        # whose id_of_slot was cleared when another layer evicted it) or, if the
+        # pool is full, the global LRU victim. Every evicted (slot, host-row)
+        # pair is scheduled for :meth:`copy_missing`.
+        missing = [e for e in range(E) if int(layer_slots[e].item()) == -1]
+        self.stat_missing += len(missing)
+        self.stat_calls += 1
+        num = 0
+        usage = self.usage.tolist()
+        for expert in missing:
+            if num >= self.evict_slots.shape[0]:
+                raise RuntimeError(
+                    f"layer {layer_id}: {len(missing)} misses exceed the staging buffer"
+                )
+            # A free slot: id_of_slot[slot] == -1 (the owner was evicted).
+            free = [s for s in range(S) if int(self.id_of_slot[s].item()) == -1]
+            if free:
+                victim = free[0]
+            else:
+                victim = min(range(S), key=lambda s: (usage[s], s))
+            old_id = int(self.id_of_slot[victim].item())
+            if old_id >= 0:
+                flat_slots[old_id] = -1
+            self.id_of_slot[victim] = base + expert
+            layer_slots[expert] = victim
+            self.usage[victim] = step
+            usage[victim] = step
+            self.evict_slots[num] = victim
+            self.src_indices[num] = expert  # layer-local host row
+            num += 1
+        self.num_indices.fill_(num)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
 
@@ -238,19 +272,25 @@ class OffloadMoeCache:
         """Make this layer's routed experts resident; rewrite ``expert_ids`` to
         slot ids in place (the downstream gather indexes the slot cache by it).
 
-        Hits (already resident, slot >= 2E) bump the slot's usage. Misses evict
-        the victim ``min(range(2E, S), key=(usage, slot))`` and schedule the
-        (slot, host-row) pair for :meth:`copy_missing`. The double buffer (slots
-        < 2E) is never evicted. Raises if a miss cannot be placed (pool exhausted
-        for the double buffer) -- the operator must size ``cache_size`` larger.
+        The pool is a single **global** timestamp LRU shared by every layer.
+        A routed expert that is already resident (in *any* slot, any layer) is a
+        **hit**: it keeps its slot and its usage is bumped. A **miss** evicts the
+        global LRU victim ``min(range(S), key=(usage, slot))`` -- including a
+        slot another layer holds, which is the whole point of offload (experts
+        are re-fetched on demand, never all resident at once) -- and schedules the
+        (slot, host-row) pair for :meth:`copy_missing`.
+
+        This mirrors upstream's decode kernel (``min(range(cache_size),
+        key=usage)``), which evicts across the *entire* slot space; a double
+        buffer is only a prefill optimization, not a protected region.
         """
         E = self.num_experts
         S = self.cache_size
         base = layer_id * E
-        if self.banks and S < E + 1:
+        if self.banks and S < 2:
             raise RuntimeError(
-                f"cache_size {S} cannot hold the double buffer (2E={2 * E}) plus a "
-                "decode slot; raise moe_cache_size"
+                f"cache_size {S} < 2: the pool cannot hold a routed expert plus "
+                "a victim to evict; raise moe_cache_size"
             )
 
         flat = expert_ids.reshape(-1)
@@ -269,22 +309,19 @@ class OffloadMoeCache:
         layer_slots = self.slot_for_id[layer_id]
         flat_slots = self.slot_for_id.view(-1)
 
-        # Phase 1: hits -- every resident routed expert (slot != -1, whether it
-        # lives in the double buffer [0, E) or a decode slot >= 2E) keeps its
-        # slot and is NOT re-copied; its slot's usage is stamped to this step.
-        # This mirrors upstream's ``tl.store(usage+slot, step, mask=is_hit)``
-        # (is_hit = active & slot >= 0) and, crucially, refreshes a double-buffer
-        # slot that another expert's decode-slot copy is about to reuse, so the
-        # eviction phase below never picks it as the LRU victim.
+        # Phase 1: hits -- every resident routed expert (any slot, any layer) keeps
+        # its slot and is NOT re-copied; its slot's usage is stamped to this step.
+        # Mirrors upstream's ``tl.store(usage+slot, step, mask=is_hit)``.
         for expert in seen:
             slot = int(layer_slots[expert].item())
             if slot != -1:
                 self.usage[slot] = step
 
-        # Phase 2: misses -- a routed expert that is NOT resident evicts the LRU
-        # decode slot (min (usage, slot) over slots >= 2E) and schedules the copy.
-        # A resident expert (even in the double buffer) is a hit and never lands
-        # here, so a decode step right after a prefill materialize is all hits.
+        # Phase 2: misses -- a routed expert that is NOT resident evicts the
+        # global LRU slot (min (usage, slot) over ALL slots) and schedules the copy.
+        # A resident expert is a hit and never lands here. (With a warm pool the
+        # misses are the experts another layer evicted; with a cold pool they are
+        # everything routed.)
         missing = [e for e in seen if int(layer_slots[e].item()) == -1]
         missing.sort()
         self.stat_missing += len(missing)
@@ -292,11 +329,11 @@ class OffloadMoeCache:
         num = 0
         usage = self.usage.tolist()
         for idx, expert in enumerate(missing):
-            if num >= self.num_indices.shape[0]:
+            if num >= self.evict_slots.shape[0]:
                 raise RuntimeError(
                     f"layer {layer_id}: {len(missing)} misses exceed the staging buffer"
                 )
-            victim = min(range(2 * E, S), key=lambda s: (usage[s], s))
+            victim = min(range(S), key=lambda s: (usage[s], s))
             old_id = int(self.id_of_slot[victim].item())
             if old_id >= 0:
                 flat_slots[old_id] = -1
@@ -347,7 +384,8 @@ class OffloadMoeCache:
 
     def resident_slots(self, layer_id: int) -> list[int]:
         """The slots currently holding this layer's experts (for the forward's
-        gather); empty if none resident."""
+        gather); empty if none are resident. (Under the global-LRU scheme this is
+        just the set of slots whose ``id_of_slot`` falls in this layer's id range.)"""
         E = self.num_experts
         S = self.cache_size
         base = layer_id * E
