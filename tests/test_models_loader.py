@@ -21,6 +21,15 @@ torch = pytest.importorskip("torch")
 # Populated by the ``moe_ckpt`` fixture with the exact expert tensor written to
 # the checkpoint, so the "real banks" test can assert the loader round-trips it.
 _EXPECTED_L0_GATE_UP = None
+# Populated by the ``moe_ckpt_perexpert`` fixture with the per-expert source tensors
+# (gate / up / down for layer 0) so the repack test can assert the stacked bank
+# equals the concatenation of the exact bytes that were written.
+_EXPECTED_L0_PEREXPERT = None
+# Populated by the ``moe_ckpt_distinguishable`` fixture: the exact per-expert
+# gate/up/down bytes for layer 0, written with *distinguishable* values so a test
+# can tell whether the loader routed each byte to the right expert + projection
+# (a shape-only check would miss a gate<->up swap or an expert row shift).
+_EXPECTED_L0_DISTINGUISHABLE = None
 
 from freetoken.models.loader import load_model
 from freetoken.models.weight import _PlainBank, load_moe_expert_sources
@@ -76,6 +85,59 @@ def _qwen3_moe_weights() -> dict:
     return w
 
 
+def _qwen3_moe_weights_per_expert() -> dict:
+    """A tiny Qwen3-MoE checkpoint in the *raw HF* per-expert layout: one
+    ``...experts.{e}.{gate,up,down}_proj`` tensor per expert (NOT the packed
+    ``gate_up_proj``/``down_proj`` form). This is what a real HF checkpoint such
+    as Qwen3-30B-A3B ships, so the loader must repack it to the packed banks."""
+    hidden, inter, experts, vocab = 128, 32, 4, 64
+    layers = 2
+    w = {
+        "model.embed_tokens.weight": torch.randn(vocab, hidden),
+        "lm_head.weight": torch.randn(vocab, hidden),
+        "model.layers.0.self_attn.q_proj.weight": torch.randn(hidden, hidden),
+    }
+    for layer in range(layers):
+        for e in range(experts):
+            prefix = f"model.layers.{layer}.mlp.experts.{e}"
+            w[f"{prefix}.gate_proj"] = torch.randn(inter, hidden)
+            w[f"{prefix}.up_proj"] = torch.randn(inter, hidden)
+            w[f"{prefix}.down_proj"] = torch.randn(hidden, inter)
+    return w
+
+
+def _qwen3_moe_weights_distinguishable() -> dict:
+    """A per-expert checkpoint whose values *identify* both the expert and the
+    projection, so a placement test can prove each byte landed in exactly the
+    right place (catches a gate<->up swap or an off-by-one expert row that a
+    shape check would miss).
+
+    Values (exact integers, lossless in bf16, all distinct per (expert,
+    projection) and distinct across the two halves of a fused gate_up row):
+
+    * gate_proj (expert e, row r, col c): 100*(e+1) + r   -> in [100, 431]
+    * up_proj   (expert e, row r, col c): 100*(e+1) + r + 1  -> in [101, 432]
+    * down_proj (expert e, row r, col c): 100*(e+1) + r + 2  -> in [102, 433]
+
+    (Columns are constant within a row; the row index alone distinguishes the
+    two I=32-row halves of the fused ``[E, 2I, H]`` gate_up bank.)
+    """
+    hidden, inter, experts, vocab = 128, 32, 4, 64
+    layers = 2
+    w = {
+        "model.embed_tokens.weight": torch.randn(vocab, hidden),
+        "lm_head.weight": torch.randn(vocab, hidden),
+    }
+    for layer in range(layers):
+        for e in range(experts):
+            prefix = f"model.layers.{layer}.mlp.experts.{e}"
+            base = 100 * (e + 1)
+            w[f"{prefix}.gate_proj"] = torch.arange(inter, dtype=torch.float32)[:, None].repeat(1, hidden) + base
+            w[f"{prefix}.up_proj"] = torch.arange(inter, dtype=torch.float32)[:, None].repeat(1, hidden) + base + 1
+            w[f"{prefix}.down_proj"] = torch.arange(hidden, dtype=torch.float32)[:, None].repeat(1, inter) + base + 2
+    return w
+
+
 @pytest.fixture(scope="module")
 def moe_ckpt(tmp_path_factory):
     weights = _qwen3_moe_weights()
@@ -85,6 +147,42 @@ def moe_ckpt(tmp_path_factory):
     # reproducible across calls).
     global _EXPECTED_L0_GATE_UP
     _EXPECTED_L0_GATE_UP = weights["model.layers.0.mlp.experts.gate_up_proj"].to(torch.bfloat16)
+    return path
+
+
+@pytest.fixture(scope="module")
+def moe_ckpt_perexpert(tmp_path_factory):
+    weights = _qwen3_moe_weights_per_expert()
+    path = _write_checkpoint(
+        tmp_path_factory.mktemp("qwen3moe-pe"), config=QWEN3_MOE_CONFIG, weights=weights
+    )
+    global _EXPECTED_L0_PEREXPERT
+    _EXPECTED_L0_PEREXPERT = {
+        name: weights[name].to(torch.bfloat16)
+        for name in (
+            "model.layers.0.mlp.experts.0.gate_proj",
+            "model.layers.0.mlp.experts.0.up_proj",
+            "model.layers.0.mlp.experts.0.down_proj",
+        )
+    }
+    return path
+
+
+@pytest.fixture(scope="module")
+def moe_ckpt_distinguishable(tmp_path_factory):
+    weights = _qwen3_moe_weights_distinguishable()
+    path = _write_checkpoint(
+        tmp_path_factory.mktemp("qwen3moe-dist"), config=QWEN3_MOE_CONFIG, weights=weights
+    )
+    global _EXPECTED_L0_DISTINGUISHABLE
+    _EXPECTED_L0_DISTINGUISHABLE = {
+        name: weights[name].to(torch.bfloat16)
+        for name in (
+            "model.layers.0.mlp.experts.0.gate_proj",
+            "model.layers.0.mlp.experts.0.up_proj",
+            "model.layers.0.mlp.experts.0.down_proj",
+        )
+    }
     return path
 
 
@@ -173,3 +271,85 @@ def test_load_model_real_moe_routes_experts_to_host(moe_ckpt):
     assert model is not None
     assert len(expert_sources[0]) == 2
     assert expert_sources[0][0].device.type == "cpu"
+
+
+# --- per-expert (raw HF) checkpoint -> repacked packed banks (#53) -----------
+
+
+def test_load_moe_expert_sources_real_banks_per_expert_layout(moe_ckpt_perexpert):
+    """A raw HF per-expert checkpoint is repacked to the same packed banks the
+    ``dummy=True`` path fabricates: gate_up [E, 2I, H] (gate then up) + down
+    [E, H, I]."""
+    gate_up, down = load_moe_expert_sources(moe_ckpt_perexpert, dtype=torch.bfloat16)
+    assert len(gate_up) == 2 and len(down) == 2
+    for gu, dn in zip(gate_up, down):
+        assert gu.shape == (4, 2 * 32, 128)
+        assert dn.shape == (4, 128, 32)
+        assert gu.device.type == "cpu" and dn.device.type == "cpu"
+    # Round-trip: layer 0's bank row 0 must equal the exact gate/up bytes that
+    # were written, fused on the inner (dim 1) axis: the first [I, H] block is the
+    # gate row, the second the up row. The expected bank is built by the same
+    # reliable 3-D route the loader uses (promote the rows to 3-D, then cat) --
+    # a bare 2-D ``torch.cat(..., dim=1)`` is mishandled by the torch XPU build
+    # (it flattens), so it must not be used to construct the reference.
+    exp = _EXPECTED_L0_PEREXPERT
+    gate0 = exp["model.layers.0.mlp.experts.0.gate_proj"]
+    up0 = exp["model.layers.0.mlp.experts.0.up_proj"]
+    down0 = exp["model.layers.0.mlp.experts.0.down_proj"]
+    from freetoken.models.weight import _stack_expert_rows
+
+    expected_gate_up = torch.cat([_stack_expert_rows([gate0]), _stack_expert_rows([up0])], dim=1)[0]
+    assert torch.equal(gate_up[0][0], expected_gate_up)
+    assert torch.equal(down[0][0], down0)
+
+
+def test_load_model_real_moe_per_expert_routes_to_host(moe_ckpt_perexpert):
+    """The top-level loader path (load_model) handles the per-expert layout and
+    routes the repacked banks to host memory, exactly like the packed path."""
+    model, expert_sources = load_model(moe_ckpt_perexpert, torch.device("cpu"))
+    assert model is not None
+    assert len(expert_sources[0]) == 2
+    assert expert_sources[0][0].shape == (4, 2 * 32, 128)
+    assert expert_sources[0][0].device.type == "cpu"
+
+
+def test_load_moe_expert_sources_rejects_unknown_expert_key(tmp_path):
+    """An expert-looking key that is neither packed nor a known per-expert
+    projection still raises (the loader must not silently mis-route weights)."""
+    cfg = dict(QWEN3_MOE_CONFIG)
+    weights = {
+        "model.embed_tokens.weight": torch.randn(64, 128),
+        "model.layers.0.mlp.experts.0.bogus_proj": torch.randn(32, 128),
+    }
+    path = _write_checkpoint(tmp_path, config=cfg, weights=weights)
+    with pytest.raises(ValueError, match="Unexpected expert weight key"):
+        load_moe_expert_sources(path, dtype=torch.bfloat16)
+
+
+def test_place_expert_weights_routes_each_byte_correctly(moe_ckpt_distinguishable):
+    """``load_model`` must place the repacked packed banks into the model's
+    per-expert modules with the *exact* byte-to-place routing: gate row ->
+    ``gate_proj``, the following up row -> ``up_proj``, down -> ``down_proj``,
+    one row per expert.
+
+    The checkpoint's values distinguish (expert, projection), so a routing
+    mistake -- e.g. the old code splitting a fused ``[E, 2I, H]`` row as
+    ``gu[e,0]``/``gu[e,1]`` (a 4-D ``[E,2,I,H]`` layout), which would swap or
+    truncate the gate/up halves -- makes an assertion below fail, whereas the
+    shape-only tests pass regardless. This is the regression guard for the
+    packed-bank contract (#53 / ADR 0002).
+    """
+    hidden, inter, experts = 128, 32, 4
+    model, _ = load_model(moe_ckpt_distinguishable, torch.device("cpu"))
+    for layer in range(2):
+        exp = _EXPECTED_L0_DISTINGUISHABLE  # layer-0 reference (values are layer-independent here)
+        for e in range(experts):
+            m = model.layers[layer].mlp.experts[e]
+            base = 100 * (e + 1)
+            exp_gate = torch.arange(inter, dtype=torch.float32)[:, None].repeat(1, hidden) + base
+            exp_up = torch.arange(inter, dtype=torch.float32)[:, None].repeat(1, hidden) + base + 1
+            exp_down = torch.arange(hidden, dtype=torch.float32)[:, None].repeat(1, inter) + base + 2
+            # The model params are bf16; the expected ints are exactly representable.
+            assert torch.equal(m.gate_proj.weight, exp_gate.to(torch.bfloat16)), (layer, e, "gate")
+            assert torch.equal(m.up_proj.weight, exp_up.to(torch.bfloat16)), (layer, e, "up")
+            assert torch.equal(m.down_proj.weight, exp_down.to(torch.bfloat16)), (layer, e, "down")
