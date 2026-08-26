@@ -31,6 +31,7 @@ def load_model(
     *,
     dtype: torch.dtype | None = None,
     dummy: bool = False,
+    moe_backend: str | None = None,
 ) -> tuple:
     """Load a checkpoint onto ``device`` (defaults to the XPU when available).
 
@@ -39,6 +40,11 @@ def load_model(
     the per-layer MoE bank tuple from :func:`load_moe_expert_sources` (empty for
     a dense model). With ``dummy=True`` the expert banks are fabricated from the
     config (offline / CPU-testable) and no checkpoint is read.
+
+    ``moe_backend`` (ADR 0002): when it names the host-offload backend the
+    MoE experts are never XPU-resident -- the model builds router-only MoE
+    blocks and the loader attaches the LRU slot pool (``OffloadMoeCache``) wired
+    to the host banks, so the forward streams the routed experts on demand.
     """
     if device is None:
         device = torch.device("xpu") if is_xpu_available() else torch.device("cpu")
@@ -49,7 +55,8 @@ def load_model(
 
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
-    model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
+    use_offload = moe_backend is not None and "offload" in moe_backend
+    model_config = _load_attr(spec.module, spec.parse_config)(hf_config, use_offload_moe=use_offload)
     # Build the model *on this device* (the loader already resolved it): an
     # explicit device wins, and only a None device lets the model default to
     # the XPU. Without this the model would re-default to the XPU and ignore
@@ -62,6 +69,7 @@ def load_model(
     model = get_model_class(hf_config.architectures[0], model_config, device=device)
 
     is_moe = bool(getattr(model_config, "is_moe", False))
+    offload = is_moe and use_offload
     if dummy:
         # Offline path: no checkpoint is read, so the model's MoE experts must
         # come from fabricated banks. To make this *reproducible* (the engine's
@@ -72,9 +80,22 @@ def load_model(
         # (The dense weights are not read in this path; the reference test
         # fabricates a tiny checkpoint but only the dummy experts are consumed.)
         if is_moe:
+            # Both backends need the dummy path reproducible: the in-VRAM model
+            # owns the expert modules (seeded here), while the offload model owns
+            # only the dense params (experts live in the host banks, seeded
+            # separately by load_moe_expert_sources). _seed_dummy_experts zeroes
+            # every non-expert param and re-seeds the RNG from the config hash,
+            # so the dense weights -- and hence the greedy output -- are a pure
+            # function of the config regardless of the process's prior RNG state.
+            # It is safe on the offload model too: it only iterates
+            # named_parameters (the dense set there; no expert params exist), so
+            # nothing offload-specific is touched.
             _seed_dummy_experts(model)
             gate_up_banks, down_banks = load_moe_expert_sources(model_path, dtype=dtype, dummy=True)
-            _place_expert_weights(model, gate_up_banks, down_banks)
+            if offload:
+                _attach_offload_cache(model, model_config, device, gate_up_banks, down_banks)
+            else:
+                _place_expert_weights(model, gate_up_banks, down_banks)
             expert_sources = (gate_up_banks, down_banks)
         else:
             expert_sources = ([], [])
@@ -82,11 +103,22 @@ def load_model(
         # Real path: stream the dense checkpoint weights onto ``device`` and, for
         # a MoE checkpoint, build the per-layer host offload banks for the experts
         # (which do not fit on the XPU and are served to the engine on demand).
+        #
+        # Both backends read the *same* checkpoint here, so the dense weights the
+        # reference and the offload model receive are byte-identical -- the
+        # offload forward then differs from the in-VRAM one only in how the expert
+        # weights are transported (host banks -> LRU slots), never in the values.
+        # (No dummy seeding: a real checkpoint is a stable source of the dense
+        # weights, so re-seeding the RNG here would be unnecessary and would make
+        # the model depend on process state instead of the checkpoint.)
         for name, tensor in load_weight(model_path, device, include_moe_experts=False):
-            _place(model, name, tensor)
+            _place_dense(model, name, tensor)
         if is_moe:
             gate_up_banks, down_banks = load_moe_expert_sources(model_path, dtype=dtype)
-            _place_expert_weights(model, gate_up_banks, down_banks)
+            if offload:
+                _attach_offload_cache(model, model_config, device, gate_up_banks, down_banks)
+            else:
+                _place_expert_weights(model, gate_up_banks, down_banks)
             expert_sources = (gate_up_banks, down_banks)
         else:
             expert_sources = ([], [])
@@ -181,6 +213,79 @@ def _place_expert_weights(model, gate_up_banks, down_banks) -> None:
                 experts[e].gate_proj.weight.copy_(gu[e, 0:intermediate])
                 experts[e].up_proj.weight.copy_(gu[e, intermediate : 2 * intermediate])
                 experts[e].down_proj.weight.copy_(dn[e])
+
+
+def _attach_offload_cache(
+    model,
+    model_config,
+    device: torch.device,
+    gate_up_banks,
+    down_banks,
+) -> None:
+    """Build the LRU slot pool and wire it into the offload model (ADR 0002).
+
+    The MoE experts are never XPU-resident on this path. The host expert banks
+    (``gate_up_banks`` / ``down_banks``, one ``[num_experts, ...]`` per MoE
+    layer, on host memory) are attached to an ``OffloadMoeCache`` that owns a
+    small device slot pool; the forward (``_Qwen3MoE._forward_offload``) routes
+    each layer's routed experts through it -- ``materialize_layer`` on prefill,
+    ``ensure_experts`` (timestamp LRU) + ``copy_missing`` on decode.
+
+    The cache is indexed by *MoE-layer index* (0-based among the MoE layers),
+    while the model's blocks are indexed by *absolute layer id*, so we also give
+    the model the ``moe_layer_id`` map (layer_id -> MoE index) the forward uses.
+    """
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    num_experts = int(getattr(model_config, "num_experts", 0) or 0)
+    moe_layers = _moe_layers(model_config)
+    num_moe = len(moe_layers)
+    if not num_moe:
+        return
+    # The pool is a single global LRU shared by all MoE layers (the only place
+    # the 61 GB of experts fits): it holds the *current* layer's whole expert set
+    # (num_experts slots) plus a small slack of decode slots so a decode miss can
+    # be placed without immediately evicting a just-routed expert of the same
+    # step. Sized off the layer count so the pool scales with the model (a real
+    # Qwen3-30B-A3B has 128 experts / 48 MoE layers). Operators that can afford
+    # more VRAM raise ``moe_cache_size`` to keep more layers warm at once.
+    cache_size = num_experts + max(2, num_moe)
+    cache = OffloadMoeCache(
+        num_layers=num_moe,
+        num_experts=num_experts,
+        cache_size=cache_size,
+        device=device,
+    )
+    # The banks are indexed by MoE-layer order (moe_layers), matching the cache's
+    # 0-based MoE-layer ids.
+    gu = [b.tensor if hasattr(b, "tensor") else b for b in gate_up_banks]
+    dn = [b.tensor if hasattr(b, "tensor") else b for b in down_banks]
+    cache.set_bank_sources({"gate_up": gu, "down": dn})
+
+    model.moe_cache = cache
+    model.moe_layer_id = [0] * len(model.layers)
+    for moe_idx, layer_id in enumerate(moe_layers):
+        model.moe_layer_id[layer_id] = moe_idx
+    model.ctx_moe_cache = cache  # the engine installs this on its Context
+
+
+def _place_dense(model, name: str, tensor: torch.Tensor) -> None:
+    """Place a dense checkpoint tensor into the model's corresponding parameter.
+
+    The checkpoint keys the ``model.`` prefix that the HF layout uses
+    (``model.embed_tokens.weight`` / ``model.layers.0.self_attn.q_proj.weight``),
+    but the model registers its params *without* that prefix
+    (``embed_tokens.weight`` / ``layers.0.self_attn.q_proj.weight``) -- see the
+    ``Qwen3MoeForCausalLM`` module layout. A bare exact-match ``_place`` therefore
+    silently no-ops on every dense weight (the param name differs by the prefix),
+    leaving the model at random init. ``lm_head.weight`` matches either way (no
+    prefix on either side), so it is the one dense weight a naive ``_place`` does
+    fill -- the asymmetry that masks the rest. This strips a single leading
+    ``model.`` segment so the checkpoint key resolves to the model param.
+    """
+    if name.startswith("model."):
+        name = name[len("model.") :]
+    _place(model, name, tensor)
 
 
 def _place(model, name: str, tensor: torch.Tensor) -> None:

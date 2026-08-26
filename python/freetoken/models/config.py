@@ -34,6 +34,11 @@ class ModelConfig:
     hidden_act: str = "silu"
     first_k_dense_replace: int = 0
     is_moe: bool = False
+    # ADR 0002: when True the MoE experts are never XPU-resident; the model
+    # builds only the router and reads the routed experts from the host-offload
+    # LRU slot pool (OffloadMoeCache) inside the forward pass. The loader sets
+    # this from the engine's moe_backend choice (it is NOT a checkpoint field).
+    use_offload_moe: bool = False
     dtype: Any = None
     max_position_embeddings: int | None = None
     tie_word_embeddings: bool = False

@@ -35,11 +35,16 @@ from freetoken.models.weight import iter_safetensors
 # --------------------------------------------------------------------------- #
 
 
-def parse_config(hf_config) -> ModelConfig:
+def parse_config(hf_config, use_offload_moe: bool = False) -> ModelConfig:
     """Build a :class:`ModelConfig` from a HF Qwen3-MoE config.
 
     ``hf_config`` is the lru-cached object shared across callers, so it is
     copied (``to_dict``) before the parsed fields are derived -- never mutated.
+
+    ``use_offload_moe`` (ADR 0002) is *not* a checkpoint field: the loader /
+    engine set it from the ``moe_backend`` choice. When True the MoE experts are
+    never XPU-resident and are streamed from host RAM through the LRU slot pool
+    during the forward pass.
     """
     src = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
     # transformers' Qwen3MoeConfig stores the expert count under
@@ -70,6 +75,8 @@ def parse_config(hf_config) -> ModelConfig:
     # FreeToken's MoE plumbing keys off config.is_moe; expose it. (num_moe_layers
     # is derived in ModelConfig.__post_init__.)
     cfg.is_moe = True
+    # ADR 0002: flag the host-offload MoE path (off by default = in-VRAM experts).
+    cfg.use_offload_moe = use_offload_moe
     return cfg
 
 
@@ -164,8 +171,36 @@ class _Qwen3Attention(nn.Module):
         return self.o_proj(out.transpose(1, 2).reshape(bsz, -1))
 
 
+def _expert_compute(gate_w: torch.Tensor, up_w: torch.Tensor, down_w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Run one expert on a [t, H] input using *detached* projection weights.
+
+    The expert weights live in the host-offload banks (ADR 0002) and are handed
+    in as plain tensors (views of the XPU slot pool), so this is a hand-rolled
+    SwiGLU -- not an ``nn.Linear`` -- over the gathered per-expert input:
+    ``down(silu(gate(x)) * up(x))``. The bank rows are stored in *weight*
+    orientation (``[out, in]``, matching ``nn.Linear.weight``): gate/up are
+    ``[I, H]`` and down is ``[H, I]``. The projection is therefore
+    ``x @ w.t()`` -- the same ``F.linear`` form the in-VRAM ``_Qwen3Expert``
+    uses -- so the math is identical to the resident path, which the reference
+    test compares against.
+    """
+    # gate_w [I, H], up_w [I, H], down_w [H, I]; x [t, H].
+    # Every projection is ``x @ w.t()`` (F.linear form). The down step is
+    # ``h @ down_w.t()`` (NOT ``down_w.t() @ h``): in this torch XPU build the
+    # ``@`` operator requires ``left.cols == right.rows``, so the leading
+    # ``[t, *]`` operand must be on the left. ``h @ down_w.t()`` is exactly
+    # ``F.linear(h, down_w)`` -- the in-VRAM expert's down projection.
+    inter = gate_w.shape[0]
+    return (F.silu(x @ gate_w.t()) * (x @ up_w.t())) @ down_w.t()
+
+
 class _Qwen3Expert(nn.Module):
-    """A single MoE expert: gate/up/down projections (SwiGLU)."""
+    """A single MoE expert: gate/up/down projections (SwiGLU).
+
+    Used by the in-VRAM path only (``use_offload_moe=False``). The offload path
+    (ADR 0002) does not build these at all -- the experts live in host RAM and
+    are read through the LRU slot pool instead.
+    """
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -180,19 +215,35 @@ class _Qwen3Expert(nn.Module):
 class _Qwen3MoE(nn.Module):
     """Mixture-of-experts block: router + N experts.
 
-    Weights live on host (loader-routed). For each token the router picks the
-    top-k experts; this reference implementation gathers each token's expert
-    inputs and runs the selected experts, accumulating the weighted output.
+    Two paths (ADR 0002):
+
+    * ``use_offload_moe=False`` (default): the N experts are XPU-resident
+      ``_Qwen3Expert`` modules; the forward gathers each token's routed experts
+      from them.
+    * ``use_offload_moe=True``: the experts are *never* XPU-resident. Only the
+      router is built; at each step the routed expert ids are routed through the
+      engine's ``OffloadMoeCache`` (host banks -> small XPU LRU slot pool), the
+      missed experts are streamed from host, and each routed token runs the
+      selected expert through the slot weights.
     """
 
     def __init__(self, config, device, dtype) -> None:
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
+        self.use_offload = bool(getattr(config, "use_offload_moe", False))
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
-        self.experts = nn.ModuleList(_Qwen3Expert(config).to(device, dtype) for _ in range(self.num_experts))
+        if self.use_offload:
+            # ADR 0002: no XPU-resident expert params. The routed experts are
+            # read from the LRU slot pool the loader attaches to the model
+            # (``model.moe_cache`` + ``model.moe_layer_id``); the host banks are
+            # the source of truth. (``self.experts`` is left unset -- the loader
+            # never copies into expert modules on this path.)
+            self.experts = None
+        else:
+            self.experts = nn.ModuleList(_Qwen3Expert(config).to(device, dtype) for _ in range(self.num_experts))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, model=None, batch=None) -> torch.Tensor:
         # The engine feeds a *token-major* 2-D slice [num_tokens, hidden]
         # (one request at a time), so we must not assume a [bsz, seq, hidden]
         # batch dim. Flatten to [T, hidden] and restore the same shape on the way out.
@@ -202,6 +253,9 @@ class _Qwen3MoE(nn.Module):
         gate_log = F.softmax(routing, dim=-1)
         top_w, top_idx = torch.topk(gate_log, self.top_k, dim=-1)  # [T, k]
         top_w = (top_w / top_w.sum(dim=-1, keepdim=True)).to(flat.dtype)
+
+        if self.use_offload:
+            return self._forward_offload(flat, top_idx, top_w, model, batch).view(in_shape)
 
         out = torch.zeros_like(flat)
         # Per-expert gather: route each expert's tokens in one matmul each.
@@ -213,6 +267,57 @@ class _Qwen3MoE(nn.Module):
                 out[sel] += top_w[sel, slot, None] * self.experts[e](flat[sel])
         return out.view(in_shape)
 
+    def _forward_offload(self, flat, top_idx, top_w, model, batch) -> torch.Tensor:
+        """Serve the routed experts through the host-offload LRU slot pool.
+
+        The pool is a single global timestamp LRU shared by every MoE layer
+        (ADR 0002): a prefill materializes the *whole* layer into the pool
+        (evicting the LRU-resident experts of other layers), and a decode step
+        streams in only the *missed* routed experts, each into an evicted slot.
+        After :meth:`ensure_experts` / :meth:`materialize_layer` the ``top_idx``
+        tensor holds *slot* ids, so each routed token runs the expert the slot
+        currently holds -- which, after ``copy_missing``, is exactly the routed
+        expert (the forward indexes the slot cache, not the layer bank).
+        """
+        layer_id = model.moe_layer_id[self.layer_id]
+        cache = model.moe_cache
+        # A prefill must materialize the *whole* MoE layer into the LRU pool
+        # (evicting other layers' resident experts); a decode streams in only the
+        # missed routed experts, one at a time. The engine tags the prompt step
+        # ``phase="prefill"`` and later steps ``phase="decode"`` (engine.step),
+        # so ``batch.is_prefill`` is the phase signal; the ``flat.shape[0] > 1``
+        # check is a phase-independent fallback (prefill >1 token, decode == 1).
+        is_prefill = (batch is not None and batch.is_prefill) or flat.shape[0] > 1
+        if is_prefill:
+            cache.materialize_layer(layer_id)
+        else:
+            cache.ensure_experts(layer_id, top_idx)
+        cache.copy_missing()
+
+        # bank_views() returns a tuple indexed by bank registration order
+        # ("gate_up" first, "down" second); index the pool (S slots) and pick
+        # the per-slot row by slot id.
+        gu, dn = cache.bank_views()  # ([S, 2I, H], [S, H, I])
+        intermediate = int(model.config.moe_intermediate_size)
+
+        out = torch.zeros_like(flat)
+        k = top_idx.shape[1]
+        for slot_pos in range(k):
+            routed = top_idx[:, slot_pos]  # [B] slot ids (after ensure_experts)
+            valid = routed >= 0
+            if not valid.any():
+                continue
+            s = routed[valid]  # the slot each token's expert landed in
+            for s_i in torch.unique(s).tolist():
+                sub = valid & (routed == s_i)
+                out[sub] += top_w[sub, slot_pos, None] * _expert_compute(
+                    gu[s_i, 0:intermediate],
+                    gu[s_i, intermediate : 2 * intermediate],
+                    dn[s_i],
+                    flat[sub],
+                )
+        return out
+
 
 class _Qwen3DecoderLayer(nn.Module):
     def __init__(self, config, device, dtype, layer_id: int) -> None:
@@ -222,13 +327,19 @@ class _Qwen3DecoderLayer(nn.Module):
         self.self_attn = _Qwen3Attention(config, device, dtype, layer_id)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size)
         self.mlp = _Qwen3MoE(config, device, dtype)
+        # The offload path must know *which* MoE layer this block serves (the
+        # slot pool is indexed by layer id, and the loader maps layer id ->
+        # MoE-layer index). Dense layers have no mlp cache to index.
+        self.mlp.layer_id = layer_id
 
     def forward(self, hidden_states, positions, table_idx, ctx, batch):
         residual = hidden_states
         hidden_states = self.self_attn(self.input_layernorm(hidden_states), positions, table_idx, ctx, batch)
         hidden_states = residual + hidden_states
         residual = hidden_states
-        hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states = residual + self.mlp(
+            self.post_attention_layernorm(hidden_states), model=ctx.model, batch=batch
+        )
         return hidden_states
 
 
@@ -268,6 +379,18 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.norm = nn.RMSNorm(hidden_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
+        # ADR 0002: when the engine picks the host-offload MoE backend the
+        # experts are never XPU-resident. The MoE blocks then hold *only* the
+        # router (no expert ``nn.Linear`` params); the routed experts are read
+        # from the LRU slot pool the loader attaches to ``self`` before the
+        # engine runs (self.moe_cache / self.moe_layer_id / self.ctx).
+        if bool(getattr(config, "use_offload_moe", False)) and bool(getattr(config, "is_moe", False)):
+            self.moe_offload = True
+        else:
+            self.moe_offload = False
+        self.moe_cache = None
+        self.moe_layer_id = None
+
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, out_loc: torch.Tensor) -> torch.Tensor:
         """Run one engine step; return the **last-position** logits ``[bs, V]``.
 
@@ -281,13 +404,21 @@ class Qwen3MoeForCausalLM(nn.Module):
         ctx = get_global_ctx()
         batch = ctx.batch
         reqs = batch.reqs
+        num_tokens = input_ids.shape[0]
 
         hidden = self.embed_tokens(input_ids)  # [num_tokens, hidden]
         out = torch.empty((batch.size, self.config.hidden_size), device=hidden.device, dtype=hidden.dtype)
 
         offset = 0
+        # The engine tags the prompt step ``phase="prefill"`` and every later
+        # step ``phase="decode"`` (see engine.step). ``batch.is_prefill`` is the
+        # authoritative phase signal; the ``num_tokens > batch.size`` check is a
+        # phase-independent fallback (a prefill step carries >1 token per request,
+        # a decode step exactly one) so the forward is correct even if a caller
+        # hands a decode-tagged prompt.
+        prefill = batch.is_prefill or (num_tokens > batch.size)
         for i, req in enumerate(reqs):
-            ext = req.extend_len if batch.is_prefill else 1
+            ext = req.extend_len if prefill else 1
             token_slice = slice(offset, offset + ext)
             h = hidden[token_slice]
             for layer in self.layers:

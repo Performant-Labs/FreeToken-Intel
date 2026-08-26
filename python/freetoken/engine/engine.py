@@ -82,6 +82,7 @@ class Engine:
             device,
             dtype=dtype,
             dummy=bool(getattr(config, "use_dummy_weight", False)),
+            moe_backend=getattr(config, "moe_backend", None),
         )
 
         # Size the paged KV pool. The pool is indexed by token slot
@@ -117,11 +118,18 @@ class Engine:
         # can still opt out via ignore_eos.
         self.sampler = self._build_sampler(model_config, device)
 
-        # Global context the model's forward reads.
+        # Global context the model's forward reads. The model also resolves its
+        # own reference (ctx.model) so the MoE blocks can reach the offload
+        # cache / layer map without the engine reaching into the model.
         self.ctx = Context(page_size=self.page_size)
+        self.ctx.model = self.model
         self.ctx.kv_cache = self.kv_cache
         self.ctx.attn_backend = self.attn_backend
         self.ctx.page_table = self.page_table
+        # ADR 0002: when the MoE experts are host-offloaded, the model's forward
+        # serves them through the LRU slot pool the loader attached.
+        if getattr(self.model, "moe_offload", False) and getattr(self.model, "moe_cache", None) is not None:
+            self.ctx.moe_offload_cache = self.model.moe_cache
         set_global_ctx(self.ctx)
 
         # Request bookkeeping.
@@ -151,18 +159,32 @@ class Engine:
     # -- the loop -------------------------------------------------------------
 
     def step(self) -> ForwardOutput:
-        """Run one engine step (one model forward + one sample) over all reqs."""
+        """Run one engine step (one model forward + one sample) over all reqs.
+
+        The first step for a request is its *prefill*: every prompt token must be
+        run through the model and written into the KV pool (one row per position),
+        so the backend can attend over the full history. A request is in prefill
+        while ``device_len == len(input_ids)`` -- i.e. no token has been generated
+        yet (``device_len`` grows by one after each step, so this is true exactly
+        once, on the first step). Every later step is a decode: one new token.
+        """
         reqs = self._reqs
         if not reqs:
             return ForwardOutput(next_token_ids=torch.empty((0,), device=self.device), finished=[])
-        phase = "decode"
+        # A single step mixes prefill (prompt not yet processed) and decode
+        # (already processed) requests; batch the phase per request. The
+        # reference model slices per-request by ``extend_len`` (prefill) or 1
+        # (decode), so the batch just carries the request list.
+        phase = "prefill" if any(r.device_len == len(r.input_ids) for r in reqs) else "decode"
         batch = Batch(reqs=reqs, phase=phase)
 
         input_ids: List[int] = []
         positions: List[int] = []
         out_locs: List[int] = []
         for req in reqs:
-            if phase == "prefill":
+            # Per-request phase: prefill while no token has been generated yet
+            # (the whole prompt is new), decode afterwards (one new token).
+            if req.device_len == len(req.input_ids):
                 ext = req.extend_len
                 start = req.cached_len
                 ids = req.input_ids
