@@ -11,13 +11,27 @@ jobs:
     # variable (value: self-hosted-linux). Until that variable is scoped to this
     # repo, it falls back to the GitHub-hosted ubuntu-latest runner. See
     # pl-ops-handbook > platform-ops > github-runners.md ("Repo opt-in").
-    # The fleet image bakes a CPU PyTorch (pl-runner >= 1.66.1), so the torch
-    # tests (test_engine_loop, test_moe_offload_*, test_models_loader) run here
-    # instead of being skipped on a torch-less runner.
+    # The fleet image bakes a CPU PyTorch (pl-runner >= 1.66.1) into the
+    # runner's SYSTEM Python (/usr/bin/python3), so the torch tests
+    # (test_engine_loop, test_moe_offload_*, test_models_loader) can run here
+    # instead of being skipped on a torch-less runner -- but only if the job
+    # actually uses that system interpreter. actions/setup-python always
+    # downloads and uses its own separate CPython build under
+    # /opt/hostedtoolcache (verified via a run log: "Version 3.12 was not
+    # found in the local cache" -> downloads python-3.12.14-linux-24.04-x64.tar.gz
+    # every time, since these runners are ephemeral), which has no relationship
+    # to the image's baked torch at all. Running it on self-hosted silently
+    # defeated the whole point of baking torch in: every torch-marked test file
+    # skipped with "could not import torch", 4 skips standing in for ~22 actual
+    # tests never collected. So: skip setup-python entirely on the self-hosted
+    # fleet (Noble already ships python3.12 + pip on PATH, and the image has
+    # torch); keep it for the ubuntu-latest fallback, which has no baked torch
+    # and needs setup-python to get any Python at all.
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        if: ${{ vars.CI_RUNNER == '' }}
         with:
           python-version: "3.12"
       - name: Install
