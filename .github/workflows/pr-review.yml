@@ -1,0 +1,49 @@
+# Thin caller — copy this to .github/workflows/pr-review.yml in the consuming repo.
+#
+# Post-centralization (#120), all review LOGIC lives in the reusable workflow:
+#   Performant-Labs/playbook/.github/workflows/pr-review-reusable.yml
+# This caller only owns the two things a caller MUST own: the event triggers and
+# the concurrency group. All behaviour is driven by .agents/pr-review.yml in the
+# calling repo. Do not inline the reusable's logic here.
+#
+# NOTE: `cancel-in-progress` is event-scoped on purpose — see the concurrency
+# block below and the pr-reviewer README §"Issue comment trigger fires on all
+# slash commands". A comment must never cancel a running review.
+
+name: PR-Agent Spec Review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
+  # Event-scoped cancellation. A push (`synchronize`) SHOULD cancel a superseded
+  # in-flight review — the new commit makes it stale. But a PR comment must NEVER
+  # cancel a running review: GitHub evaluates workflow-level `concurrency` at run
+  # CREATION, before any job-level `if`, so a comment-triggered run (ordinary reply,
+  # Tugboat "preview ready", or a `/review` buried mid-body) would abort an active
+  # review if this were an unconditional `true`, freezing the PR-Agent score.
+  cancel-in-progress: ${{ github.event_name != 'issue_comment' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  pr-review:
+    # Local vendored copy of playbook's pr-review-reusable.yml. A PUBLIC repo
+    # cannot call a reusable workflow in a PRIVATE one ("workflow was not
+    # found" at run time, even with playbook's reusable-workflow access set to
+    # "organization") -- same fix as performantlabs.com. See the header of
+    # ./pr-review-reusable.yml.
+    uses: ./.github/workflows/pr-review-reusable.yml
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+    secrets:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

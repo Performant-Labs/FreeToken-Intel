@@ -1,0 +1,52 @@
+# .agents/pr-review.yml
+# Generated for FreeToken-Intel — 2026-08-27.
+# Re-run .agents/scripts/setup-pr-review.sh --update to change settings.
+#
+# Only the CI PR-Agent path (DeepSeek V4 Pro) was requested for this repo.
+# Local review, dual review, DCO enforcement, and the PR template are left
+# off — enable any of them later with the wizard.
+
+project:
+  name: "FreeToken-Intel"
+  timezone: "America/Boise"
+  # Matches the org-wide DISPLAY_TZ repo/org variable, which overrides this
+  # for the CI score banner anyway.
+
+pr_agent:
+  model: "deepseek/deepseek-v4-pro"
+  max_tokens: 131072
+  output_tokens: 64000
+  high_stakes_label: "high-stakes"
+  skip_docs_only: false
+  skip_paths: []
+  score_labels: true
+  score_banner: true
+  status_check: true
+  # `enabled` and `cancel_in_flight` are removed keys (nothing reads them --
+  # see pipelines/pr-reviewer/README.md §1 "Keys that no longer exist"). The
+  # on-switch is the presence of .github/workflows/pr-review.yml; cancellation
+  # is hardcoded event-scoped in the workflow's concurrency block instead.
+
+local_review:
+  enabled: false
+  default_model: "claude-sonnet-4-6"
+  shell_alias: ""
+
+dual_review:
+  enabled: false
+  model: "gpt-5.5"
+  reasoning_effort: "auto"
+  on_brief: true
+  on_impl: true
+
+dco:
+  enabled: false
+
+pr_template:
+  enabled: false
+
+test_tiers:
+  t1_headless: true
+  t2_aria: false
+  t2_5_authenticated: false
+  t3_visual: false

@@ -1,0 +1,713 @@
+name: PR-Agent Spec Review (reusable)
+# VENDORED COPY — this repo is public. A public repo cannot call a reusable
+# workflow hosted in a private one (`uses: Performant-Labs/playbook/...@main`
+# fails at run time with "workflow was not found", even though playbook's
+# reusable-workflow access is set to "organization" -- that setting does not
+# extend to public callers). Same fix as performantlabs.com. Keep this file in
+# sync with playbook/.github/workflows/pr-review-reusable.yml by hand; it is
+# not auto-synced.
+#
+# Called by this repo's .github/workflows/pr-review.yml via:
+#   uses: ./.github/workflows/pr-review-reusable.yml
+#   secrets:
+#     DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+#     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+# GITHUB_TOKEN is automatically available — do not pass it via secrets.
+#
+# All behaviour is driven by .agents/pr-review.yml in the CALLING repo.
+# Concurrency and triggers live in the thin caller; this file is pure logic.
+
+on:
+  workflow_call:
+    secrets:
+      DEEPSEEK_API_KEY:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  pr-agent:
+    # Filter bots and non-slash-command issue comments here — these are fixed
+    # and not configurable. Draft filtering and skip_paths are handled inside
+    # the gate step so they can read project config first.
+    if: |
+      github.event.sender.type != 'Bot' &&
+      (github.event_name != 'issue_comment' ||
+       startsWith(github.event.comment.body, '/review') ||
+       startsWith(github.event.comment.body, '/describe') ||
+       startsWith(github.event.comment.body, '/improve') ||
+       startsWith(github.event.comment.body, '/ask'))
+    runs-on: ${{ vars.CI_RUNNER }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Ensure pyyaml is available
+        # Self-hosted runners (vars.CI_RUNNER) may ship a PEP-668
+        # externally-managed system Python (Python 3.12+), which makes a plain
+        # `pip install` hard-fail with "This environment is externally managed"
+        # and kills the job before PR-Agent ever runs. Try a normal install
+        # first; if it's blocked, retry with --break-system-packages. CI runners
+        # are disposable, so mutating the system site-packages is safe here.
+        run: |
+          python3 -m pip install pyyaml --quiet --disable-pip-version-check \
+            || python3 -m pip install pyyaml --quiet --disable-pip-version-check --break-system-packages
+
+      # ── Read project config ──────────────────────────────────────────────────
+      # Parses .agents/pr-review.yml with PyYAML.
+      # Falls back to safe defaults when the file is absent.
+      - name: Read pr-review config
+        id: cfg
+        run: |
+          python3 << 'PYEOF'
+          import yaml, json, os, sys
+
+          cfg = {}
+          try:
+              with open('.agents/pr-review.yml') as f:
+                  cfg = yaml.safe_load(f) or {}
+          except FileNotFoundError:
+              pass
+
+          pa   = cfg.get('pr_agent', {})
+          proj = cfg.get('project', {})
+
+          # ── Warn on keys nothing reads (#490) ────────────────────────────────
+          # `.agents/pr-review.yml` is ONE file with FOUR consumers: this
+          # workflow (pr_agent.* + project.timezone), pr-review.sh
+          # (local_review.*), dual-review.sh (dual_review.reasoning_effort) and
+          # check-pr-review-readiness.sh (dual_review.enabled). Until #490 this
+          # parser read its own subtree and DISCARDED the rest in silence, so a
+          # key that did nothing was indistinguishable from a key that worked —
+          # 24 of 27 repos carried `skip_docs_only` believing docs-only diffs
+          # skipped review, because playbook's own wizard emitted it.
+          #
+          # The check is deliberately SCOPED to the subtrees this workflow owns.
+          # A flat unknown-key check would warn on local_review/dual_review/dco/
+          # pr_template/test_tiers/spec — real keys belonging to the other three
+          # consumers — in every repo on every PR, and would be tuned out within
+          # a week. Top-level sections are checked against the union of all four
+          # consumers, which is what catches a mistyped SECTION name (the most
+          # expensive typo available here: it silently disables everything under
+          # it). Warnings never fail the parse.
+          KNOWN_SECTIONS = {
+              'project', 'pr_agent',       # this workflow
+              'local_review',              # pipelines/pr-reviewer/scripts/pr-review.sh
+              'dual_review',               # workflow/dual-review.sh + check-pr-review-readiness.sh
+              'dco', 'pr_template', 'test_tiers', 'spec',
+          }
+          KNOWN_PR_AGENT = {
+              'model', 'high_stakes_model', 'fallback_model', 'high_stakes_label',
+              'max_tokens', 'output_tokens', 'auto_improve', 'review_drafts',
+              'score_labels', 'score_banner', 'status_check', 'skip_paths',
+              'skip_docs_only',
+          }
+          KNOWN_PROJECT = {'name', 'timezone'}
+
+          def warn(scope, keys, known):
+              unknown = sorted(k for k in keys if k not in known)
+              if unknown:
+                  print(f'::warning file=.agents/pr-review.yml::Unrecognised '
+                        f'{scope}: {", ".join(unknown)} — nothing reads '
+                        f'{"it" if len(unknown) == 1 else "them"}. See '
+                        f'pipelines/pr-reviewer/README.md for the keys each '
+                        f'consumer actually reads.')
+
+          if isinstance(cfg, dict):
+              warn('top-level section(s) in .agents/pr-review.yml',
+                   cfg.keys(), KNOWN_SECTIONS)
+          if isinstance(pa, dict):
+              warn('pr_agent key(s)', pa.keys(), KNOWN_PR_AGENT)
+          if isinstance(proj, dict):
+              warn('project key(s)', proj.keys(), KNOWN_PROJECT)
+
+          model    = pa.get('model', 'deepseek/deepseek-v4-pro')
+          hs_model = pa.get('high_stakes_model', model)
+          fb       = pa.get('fallback_model', '')
+          # Only emit a fallback if it's set and differs from the primary.
+          fallback_models = json.dumps([fb]) if fb and fb != model else json.dumps([model])
+
+          out = open(os.environ['GITHUB_OUTPUT'], 'a')
+          def w(k, v): out.write(f'{k}={v}\n')
+
+          w('model',           model)
+          w('hs_model',        hs_model)
+          w('hs_label',        pa.get('high_stakes_label', 'high-stakes'))
+          w('fallback_models', fallback_models)
+          w('max_tokens',      str(pa.get('max_tokens', 131072)))
+          w('output_tokens',   str(pa.get('output_tokens', 64000)))
+          w('auto_improve',    'true' if pa.get('auto_improve', False) else 'false')
+          w('review_drafts',   'true' if pa.get('review_drafts', False) else 'false')
+          w('score_labels',    'true' if pa.get('score_labels', True) else 'false')
+          w('score_banner',    'true' if pa.get('score_banner', True) else 'false')
+          w('status_check',    'true' if pa.get('status_check', True) else 'false')
+          w('skip_paths',      json.dumps(pa.get('skip_paths', [])))
+          w('skip_docs_only',  'true' if pa.get('skip_docs_only', False) else 'false')
+          w('timezone',        proj.get('timezone', ''))
+          out.close()
+          PYEOF
+
+      # ── Sync high-stakes label from a linked issue ───────────────────────────
+      # GitHub does NOT copy an issue's labels onto the PR that closes it. Without
+      # this, a PR closing a high-stakes-labeled issue would silently get the
+      # default review unless someone remembered to label the PR by hand — and
+      # "Resolve PR labels" below only ever looks at the PR's OWN live labels.
+      # Parses the PR body for closing keywords (close/fix/resolve #N, GitHub's
+      # own recognized syntax); if any linked issue carries the configured
+      # high_stakes_label, copies it onto the PR. One-way sync (adds, never
+      # removes) so it can't fight a manually-applied or manually-removed label.
+      - name: Sync high-stakes label from linked issue
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          HS_LABEL: ${{ steps.cfg.outputs.hs_label }}
+        run: |
+          if [[ -z "$HS_LABEL" ]]; then
+            echo "high_stakes_label not configured — nothing to sync."
+            exit 0
+          fi
+
+          BODY=$(gh pr view "$PR_NUM" --repo "$REPO" --json body --jq '.body // ""')
+          ISSUES=$(printf '%s' "$BODY" | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+            | grep -oE '[0-9]+' | sort -u)
+
+          if [[ -z "$ISSUES" ]]; then
+            echo "No linked issues found in PR body — nothing to sync."
+            exit 0
+          fi
+
+          for ISSUE_NUM in $ISSUES; do
+            HAS_LABEL=$(gh issue view "$ISSUE_NUM" --repo "$REPO" --json labels \
+              --jq --arg l "$HS_LABEL" '[.labels[].name] | index($l) != null' 2>/dev/null || echo "false")
+            if [[ "$HAS_LABEL" == "true" ]]; then
+              echo "Issue #$ISSUE_NUM carries '$HS_LABEL' — applying to PR #$PR_NUM"
+              gh label create "$HS_LABEL" --color '5319e7' \
+                --description 'High-stakes review-rigor (see project pr-review config)' \
+                --repo "$REPO" 2>/dev/null || true
+              gh pr edit "$PR_NUM" --repo "$REPO" --add-label "$HS_LABEL"
+              exit 0
+            fi
+          done
+          echo "No linked issue carries '$HS_LABEL' — leaving PR labels as-is."
+
+      # ── Resolve high-stakes label ────────────────────────────────────────────
+      # github.event.pull_request.labels is null for issue_comment events;
+      # fetch live labels so the high-stakes path works for /review too.
+      - name: Resolve PR labels
+        id: labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HS_LABEL: ${{ steps.cfg.outputs.hs_label }}
+        run: |
+          PR_NUM="${{ github.event.pull_request.number || github.event.issue.number }}"
+          if [[ -z "$PR_NUM" || "$PR_NUM" == "null" ]]; then
+            echo "high_stakes=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          LABELS=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" \
+            --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo "")
+          if echo "$LABELS" | grep -qF "$HS_LABEL"; then
+            echo "high_stakes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "high_stakes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Gate: draft check + skip_paths + skip_docs_only ─────────────────────
+      # Slash commands (/review etc.) always bypass both skip mechanisms — the
+      # user is explicitly requesting a review regardless of what changed.
+      - name: Gate — draft and skip_paths check
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_DRAFTS: ${{ steps.cfg.outputs.review_drafts }}
+          SKIP_PATHS_JSON: ${{ steps.cfg.outputs.skip_paths }}
+          SKIP_DOCS_ONLY: ${{ steps.cfg.outputs.skip_docs_only }}
+        run: |
+          # Bash prepares inputs; Python does the PurePath glob matching.
+          # python3 << 'PYEOF' must be at the run: block's base indent so that
+          # PYEOF lands at column 0 in the generated bash script (heredoc rule).
+          # Scratch files live under RUNNER_TEMP (set by Actions) so the gate's
+          # Python is hermetic and can be exercised directly by
+          # evals/harness/pr-review-skip-docs.test.mjs.
+          TMP="${RUNNER_TEMP:-/tmp}"
+          DRAFT_SKIP="false"
+          DO_CHECK="false"
+
+          if [[ "${{ github.event.pull_request.draft }}" == "true" && "$REVIEW_DRAFTS" != "true" ]]; then
+            echo "Draft PR with review_drafts=false — skipping"
+            DRAFT_SKIP="true"
+          fi
+
+          PR_NUM="${{ github.event.pull_request.number }}"
+          if [[ "$DRAFT_SKIP" == "false" \
+             && "${{ github.event_name }}" != "issue_comment" \
+             && ( "$SKIP_PATHS_JSON" != "[]" || "$SKIP_DOCS_ONLY" == "true" ) \
+             && -n "$PR_NUM" && "$PR_NUM" != "null" ]]; then
+            CHANGED=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" \
+              --json files --jq '[.files[].path]' 2>/dev/null || echo '[]')
+            printf '%s' "$CHANGED"         > "$TMP/changed.json"
+            printf '%s' "$SKIP_PATHS_JSON" > "$TMP/skip_paths.json"
+            DO_CHECK="true"
+          fi
+
+          printf '%s' "$DRAFT_SKIP" > "$TMP/draft_skip.txt"
+          printf '%s' "$DO_CHECK"   > "$TMP/do_check.txt"
+
+          python3 << 'PYEOF'
+          import json, os
+          from pathlib import PurePath
+
+          tmp = os.environ.get('RUNNER_TEMP') or '/tmp'
+          def _read(name):
+              with open(os.path.join(tmp, name)) as f:
+                  return f.read().strip()
+
+          draft_skip = _read('draft_skip.txt')
+          do_check   = _read('do_check.txt')
+          skip       = draft_skip
+
+          # ── skip_docs_only (#490) ────────────────────────────────────────────
+          # Implemented in the parser rather than expressed as skip_paths on
+          # purpose. skip_paths matches with PurePath.match(), which is anchored
+          # at the RIGHT and treats "**" as a single "*": "docs/**" matches
+          # docs/foo.md but NOT docs/handoffs/x/foo.md, so every directory depth
+          # has to be spelled out by hand. Making 24 repos each maintain their
+          # own depth ladder would hand every one of them the same trap. This
+          # predicate is depth-independent by construction.
+          #
+          # A file is documentation if it carries a prose extension at any depth,
+          # sits anywhere under a documentation directory (so images and other
+          # assets in docs/ count), or is one of the conventional root files.
+          DOC_SUFFIXES = {'.md', '.mdx', '.markdown', '.rst', '.adoc', '.txt'}
+          DOC_DIRS     = ('docs', 'doc', 'planning')
+          DOC_NAMES    = {'LICENSE', 'NOTICE', 'AUTHORS', 'CHANGELOG'}
+
+          def is_doc(fp):
+              p = PurePath(fp)
+              if p.suffix.lower() in DOC_SUFFIXES:
+                  return True
+              if p.name in DOC_NAMES:
+                  return True
+              return any(part in DOC_DIRS for part in p.parts[:-1])
+
+          if skip == 'false' and do_check == 'true':
+              files    = json.loads(_read('changed.json'))
+              patterns = json.loads(_read('skip_paths.json'))
+              docs_only = os.environ.get('SKIP_DOCS_ONLY') == 'true'
+              if files and (patterns or docs_only):
+                  # Either mechanism can excuse a file; the review is skipped
+                  # only when EVERY changed file is excused by one of them.
+                  def skippable(fp):
+                      if any(PurePath(fp).match(p) for p in patterns):
+                          return True
+                      return docs_only and is_doc(fp)
+
+                  if all(skippable(fp) for fp in files):
+                      skip = 'true'
+                      print('All changed files are skippable '
+                            '(skip_paths / skip_docs_only) — skipping review')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'should_skip={skip}\n')
+          PYEOF
+
+      # ── Run-start anchor (#433) ──────────────────────────────────────────────
+      # Every score consumer below (label, banner, status check) used to read
+      # "the last bot comment containing 'Reviewer Guide'" with NO recency
+      # bound. When a review CRASHES, `continue-on-error: true` lets the job
+      # proceed, the lookup finds the PREVIOUS run's still-present Reviewer
+      # Guide comment, and that stale score is reported as this run's result —
+      # a green `pr-agent/review` for a review that produced nothing (#433:
+      # "pass — Reviewed — score 95" sitting beside the bot's own no-score
+      # comment). It reproduced under `/review` on #429 and did NOT reproduce
+      # on #437 because #437 was a fresh PR with no earlier comment to go
+      # stale. That is the entirety of the "intermittent" behaviour: it
+      # misfires exactly on PRs that already have a successful review.
+      #
+      # Prefer GITHUB'S clock over the runner's, so the anchor and the comment
+      # timestamps it is compared against come from one source and a self-hosted
+      # runner's unsynced clock (vars.CI_RUNNER may be older hardware) cannot
+      # shift the comparison.
+      #
+      # Read it from the `Date` RESPONSE HEADER of an ordinary API call. Two
+      # earlier attempts failed and are recorded so neither is tried again:
+      #
+      #   1. `gh api repos/…/actions/runs/${{ github.run_id }}` (#444) needs the
+      #      `actions: read` permission. The thin callers grant only
+      #      contents/pull-requests/issues/statuses, so it was DENIED in every
+      #      consumer repo — the anchor exited 1 and, because the consumers run
+      #      under always(), each failed the job.
+      #   2. `${{ github.run_started_at }}` (#448) is not a populated github
+      #      context property. It expanded to the empty string, producing the
+      #      same hard failure by a different route.
+      #
+      # The Date header comes back on ANY authenticated request, so it needs no
+      # permission beyond what the callers already grant.
+      #
+      # Fallback order is deliberate. The property that actually matters for
+      # #433 is that the lookup is BOUNDED AT ALL; whose clock supplies the
+      # bound is a refinement. So an unavailable header degrades to the runner
+      # clock — still bounded, still excludes prior runs — rather than failing
+      # the job. Only a total failure of both is fatal, and that cannot happen
+      # while `date` exists. Two consecutive outages here were caused by
+      # fail-closed behaviour on a NON-ESSENTIAL input; this keeps fail-closed
+      # for the thing that matters and stops treating clock provenance as
+      # load-bearing.
+      - name: Record run-start anchor
+        id: runstart
+        if: always() && steps.gate.outputs.should_skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          START=""
+          HDR=$(gh api "repos/${{ github.repository }}" -i --silent 2>/dev/null \
+                | grep -i '^date:' | head -1 | sed 's/^[Dd]ate:[[:space:]]*//' | tr -d '\r' || true)
+          if [[ -n "$HDR" ]]; then
+            START=$(date -u -d "$HDR" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+          fi
+          if [[ -n "$START" ]]; then
+            echo "Run-start anchor: $START (GitHub clock, Date header)"
+          else
+            START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            echo "::warning::could not read GitHub's clock; falling back to the runner clock. The lookup stays bounded (#433); only skew resistance is reduced."
+            echo "Run-start anchor: $START (runner clock, fallback)"
+          fi
+          # Only unreachable if `date` itself failed. Fail closed here: with no
+          # anchor at all the lookup would be unbounded, which is exactly #433.
+          if [[ -z "$START" ]]; then
+            echo "::error::no clock available — refusing an unbounded comment lookup (#433)"
+            exit 1
+          fi
+          echo "run_start=$START" >> "$GITHUB_OUTPUT"
+
+      # ── PR-Agent review (default) ────────────────────────────────────────────
+      # Pinned by SHA to qodo-ai/pr-agent v0.41.0. Resolve a tag with:
+      #   gh api repos/qodo-ai/pr-agent/commits/<tag> -q '.sha'
+      #
+      # Do NOT hand-edit the version here as routine maintenance. Dependabot owns
+      # forward drift on this pin under ⛔ D4 (#421: weekly, patch and minor
+      # accepted, majors never) — 0.39.0 -> 0.41.0 arrived that way in #383.
+      #
+      # This comment named v0.39.0 for a while after the pin itself moved, which
+      # is the specific hazard of restating a version in prose beside the thing
+      # that states it: the `uses:` line is the source of truth, and Dependabot
+      # updates that line but not the sentence above it. If they disagree, the
+      # `uses:` line is right.
+      #
+      # ⛔ D3 (#421) — the MODEL pin is a separate decision and is NOT Dependabot's
+      # to move: stay on deepseek-v4-pro. Rolling the action forward must not roll
+      # the model forward with it.
+      - name: PR-Agent review (default)
+        id: review-default
+        if: |
+          steps.gate.outputs.should_skip != 'true' &&
+          steps.labels.outputs.high_stakes != 'true'
+        continue-on-error: true
+        uses: qodo-ai/pr-agent@743f52d80f3513193dfc7626f778c73478df6d0a  # v0.41.1
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG.MODEL: ${{ steps.cfg.outputs.model }}
+          CONFIG.CUSTOM_MODEL_MAX_TOKENS: ${{ steps.cfg.outputs.max_tokens }}
+          CONFIG.MAX_MODEL_TOKENS: ${{ steps.cfg.outputs.output_tokens }}
+          CONFIG.FALLBACK_MODELS: ${{ steps.cfg.outputs.fallback_models }}
+          GITHUB_ACTION_CONFIG.PR_ACTIONS: '["opened","reopened","ready_for_review","review_requested","synchronize"]'
+          GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
+          GITHUB_ACTION_CONFIG.AUTO_IMPROVE: ${{ steps.cfg.outputs.auto_improve }}
+          PR_REVIEWER.REQUIRE_TICKET_ANALYSIS_REVIEW: "false"
+          PR_REVIEWER.REQUIRE_SCORE_REVIEW: "true"
+
+      # ── PR-Agent review (high-stakes) ────────────────────────────────────────
+      # Uses high_stakes_model from config — set to a more capable model for
+      # critical changes. Apply the high_stakes_label to a PR to activate.
+      - name: PR-Agent review (high-stakes)
+        id: review-highstakes
+        if: |
+          steps.gate.outputs.should_skip != 'true' &&
+          steps.labels.outputs.high_stakes == 'true'
+        continue-on-error: true
+        uses: qodo-ai/pr-agent@743f52d80f3513193dfc7626f778c73478df6d0a  # v0.41.1
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG.MODEL: ${{ steps.cfg.outputs.hs_model }}
+          CONFIG.CUSTOM_MODEL_MAX_TOKENS: ${{ steps.cfg.outputs.max_tokens }}
+          CONFIG.MAX_MODEL_TOKENS: ${{ steps.cfg.outputs.output_tokens }}
+          GITHUB_ACTION_CONFIG.PR_ACTIONS: '["opened","reopened","ready_for_review","review_requested","synchronize"]'
+          GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
+          GITHUB_ACTION_CONFIG.AUTO_IMPROVE: ${{ steps.cfg.outputs.auto_improve }}
+          PR_REVIEWER.REQUIRE_TICKET_ANALYSIS_REVIEW: "false"
+          PR_REVIEWER.REQUIRE_SCORE_REVIEW: "true"
+
+      # ── Score-bracket label ──────────────────────────────────────────────────
+      - name: Apply score-bracket label
+        if: |
+          always() &&
+          steps.gate.outputs.should_skip != 'true' &&
+          steps.cfg.outputs.score_labels == 'true' &&
+          (steps.review-default.outcome == 'success' || steps.review-highstakes.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ github.event.pull_request.number || github.event.issue.number }}"
+          [[ -z "$PR_NUM" || "$PR_NUM" == "null" ]] && { echo "No PR — skip"; exit 0; }
+
+          gh label create 'score-90+'      --color '0e8a16' --description 'PR-Agent score 90-100 (ship)'                --repo "${{ github.repository }}" 2>/dev/null || true
+          gh label create 'score-80-89'    --color 'fbca04' --description 'PR-Agent score 80-89 (review carefully)'     --repo "${{ github.repository }}" 2>/dev/null || true
+          gh label create 'score-70-79'    --color 'e99695' --description 'PR-Agent score 70-79 (address suggestions)'  --repo "${{ github.repository }}" 2>/dev/null || true
+          gh label create 'score-below-70' --color 'b60205' --description 'PR-Agent score <70 (probable blocking issues)'--repo "${{ github.repository }}" 2>/dev/null || true
+
+          # #433: bound by this run's anchor, and require the comment to be an
+          # actual review ("Reviewer Guide") rather than any bot comment — the
+          # old filter would happily match this workflow's OWN "produced no
+          # score" failure comment from an earlier run and label off it.
+          # --paginate: without it the API returns only the first 30 comments
+          # (oldest first), so `last` was the 30th-oldest, not the newest.
+          RUN_START="${{ steps.runstart.outputs.run_start }}"
+          [[ -z "$RUN_START" ]] && { echo "::error::missing run-start anchor (#433)"; exit 1; }
+          gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUM/comments" --jq '.[]' \
+            | jq -s '.' > /tmp/pr-comments-label.json
+          LATEST=$(jq -r --arg since "$RUN_START" \
+            '[.[] | select(.user.login=="github-actions[bot]")
+                  | select(.updated_at >= $since)
+                  | select(.body | contains("Reviewer Guide"))] | last.body // ""' \
+            /tmp/pr-comments-label.json)
+          SCORE=$(echo "$LATEST" | grep -oE '[Ss]core[^0-9]{0,30}[0-9]+' | grep -oE '[0-9]+' | head -1)
+          [[ -z "$SCORE" ]] && { echo "No score from THIS run — skip label"; exit 0; }
+
+          for L in 'score-90+' 'score-80-89' 'score-70-79' 'score-below-70'; do
+            gh issue edit "$PR_NUM" --remove-label "$L" --repo "${{ github.repository }}" 2>/dev/null || true
+          done
+
+          if   (( SCORE >= 90 )); then BRACKET='score-90+'
+          elif (( SCORE >= 80 )); then BRACKET='score-80-89'
+          elif (( SCORE >= 70 )); then BRACKET='score-70-79'
+          else                         BRACKET='score-below-70'
+          fi
+          gh issue edit "$PR_NUM" --add-label "$BRACKET" --repo "${{ github.repository }}"
+          echo "Applied: $BRACKET"
+
+      # ── Score banner ─────────────────────────────────────────────────────────
+      - name: Inject score banner into PR description
+        if: |
+          always() &&
+          steps.gate.outputs.should_skip != 'true' &&
+          steps.cfg.outputs.score_banner == 'true' &&
+          (steps.review-default.outcome == 'success' || steps.review-highstakes.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          DISPLAY_TZ: ${{ vars.DISPLAY_TZ }}
+          MODEL: ${{ steps.cfg.outputs.model }}
+          HS_MODEL: ${{ steps.cfg.outputs.hs_model }}
+          HIGH_STAKES: ${{ steps.labels.outputs.high_stakes }}
+          TIMEZONE: ${{ steps.cfg.outputs.timezone }}
+        run: |
+          PR_NUM="${{ github.event.pull_request.number || github.event.issue.number }}"
+          [[ -z "$PR_NUM" || "$PR_NUM" == "null" ]] && { echo "No PR — skip"; exit 0; }
+
+          # #433: recency-bounded to this run (see "Record run-start anchor").
+          # A banner is the most visible artefact here — rendering a previous
+          # run's score into the PR description after a crash is the single
+          # most misleading thing this workflow can do.
+          RUN_START="${{ steps.runstart.outputs.run_start }}"
+          [[ -z "$RUN_START" ]] && { echo "::error::missing run-start anchor (#433)"; exit 1; }
+          gh api --paginate "repos/${REPO}/issues/$PR_NUM/comments" --jq '.[]' \
+            | jq -s '.' > /tmp/pr-comments.json
+          THIS_RUN='[.[] | select(.user.login=="github-actions[bot]")
+                         | select(.updated_at >= $since)
+                         | select(.body | contains("Reviewer Guide"))]'
+          REVIEW_BODY=$(jq -r --arg since "$RUN_START" "${THIS_RUN} | last.body // \"\"" /tmp/pr-comments.json)
+          REVIEW_URL=$(jq  -r --arg since "$RUN_START" "${THIS_RUN} | last.html_url // \"\"" /tmp/pr-comments.json)
+          SCORE=$(printf '%s' "$REVIEW_BODY" | grep -oE '[Ss]core[^0-9]{0,30}[0-9]+' | grep -oE '[0-9]+' | head -1)
+          [[ -z "$SCORE" ]] && { echo "No score from THIS run — skip banner"; exit 0; }
+
+          if   (( SCORE >= 90 )); then BRACKET='score-90+';     EMOJI='🟢'
+          elif (( SCORE >= 80 )); then BRACKET='score-80-89';   EMOJI='🟡'
+          elif (( SCORE >= 70 )); then BRACKET='score-70-79';   EMOJI='🟠'
+          else                         BRACKET='score-below-70'; EMOJI='🔴'
+          fi
+
+          YES="⚠️ [yes](${REVIEW_URL})"
+          printf '%s' "$REVIEW_BODY" | grep -qi  'No security concerns' && SEC="none ✅"   || SEC="$YES"
+          printf '%s' "$REVIEW_BODY" | grep -qi  'No major issues'      && MAJOR="none ✅" || MAJOR="$YES"
+          printf '%s' "$REVIEW_BODY" | grep -qiE 'Key issues to review' && MINOR="$YES"    || MINOR="none ✅"
+
+          case "$EVENT_NAME" in
+            issue_comment)
+              CMD=$(printf '%s' "$COMMENT_BODY" | grep -oE '^/[a-zA-Z]+' | head -1)
+              [[ -z "$CMD" ]] && CMD='comment'
+              TRIGGER_DESC="\`${CMD}\` by @${COMMENT_USER}"
+              SPECIFIC=" · [comment](${COMMENT_URL})" ;;
+            pull_request|pull_request_target)
+              TRIGGER_DESC="\`pull_request.${EVENT_ACTION}\`"
+              [[ -n "$HEAD_SHA" && "$HEAD_SHA" != "null" ]] \
+                && SPECIFIC=" · [commit ${HEAD_SHA:0:7}](https://github.com/${REPO}/commit/${HEAD_SHA})" \
+                || SPECIFIC="" ;;
+            *) TRIGGER_DESC="\`${EVENT_NAME}\`"; SPECIFIC="" ;;
+          esac
+
+          # Use high_stakes_model label when applicable
+          [[ "$HIGH_STAKES" == "true" ]] && ACTIVE_MODEL="$HS_MODEL" || ACTIVE_MODEL="$MODEL"
+          MODEL_SHORT="${ACTIVE_MODEL##*/}"
+
+          RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+          NOW_UTC=$(date -u '+%Y-%m-%d %H:%M UTC')
+          _tz="${DISPLAY_TZ:-}"
+          # Fall back to project.timezone from config if DISPLAY_TZ repo var is unset
+          [[ -z "$_tz" ]] && _tz="${TIMEZONE:-}"
+          if [[ -n "$_tz" ]]; then
+            NOW_LOCAL=$(TZ="$_tz" date '+%Y-%m-%d %H:%M %Z')
+            NOW_DISPLAY="${NOW_LOCAL} / ${NOW_UTC}"
+          else
+            NOW_DISPLAY="$NOW_UTC"
+          fi
+
+          gh pr view "$PR_NUM" --json body --jq .body --repo "${REPO}" > /tmp/pr-body-current.md
+          sed -i.bak '/<!-- argos-status:start -->/,/<!-- argos-status:end -->/d' /tmp/pr-body-current.md
+          rm -f /tmp/pr-body-current.md.bak
+
+          {
+            echo '<!-- argos-status:start -->'
+            echo "> ${EMOJI} **PR-Agent Score: ${SCORE}** \`${BRACKET}\` · model: \`${MODEL_SHORT}\`"
+            echo "> 🔒 **Security:** ${SEC} · ⚡ **Major:** ${MAJOR} · 🔍 **Minor:** ${MINOR}"
+            echo "> **Triggered by** ${TRIGGER_DESC}${SPECIFIC} · run [#${RUN_ID}](${RUN_URL}) · ${NOW_DISPLAY}"
+            echo '<!-- argos-status:end -->'
+            echo
+          } > /tmp/pr-body-banner.md
+
+          cat /tmp/pr-body-banner.md /tmp/pr-body-current.md > /tmp/pr-body-new.md
+          gh pr edit "$PR_NUM" --body-file /tmp/pr-body-new.md --repo "${REPO}"
+          echo "Banner injected (score $SCORE)"
+
+      # ── Commit status check ──────────────────────────────────────────────────
+      # Green = PR-Agent ran and returned a score, OR the PR diff is entirely
+      #         covered by the repo's .pr_agent.toml [ignore] globs/regex — then
+      #         pr-agent logs "Empty diff for PR", reviews nothing, and no score
+      #         is expected (e.g. a docs-only PR /review'd by hand; slash
+      #         commands bypass the skip_paths gate on purpose).
+      # Red   = no score with a reviewable diff — crashed or returned empty,
+      #         not a clean pass.
+      #
+      # "Returned a score" means A SCORE FROM THIS RUN (#433). Every lookup
+      # below is bounded by steps.runstart.outputs.run_start; a Reviewer Guide
+      # comment left by an earlier run is invisible here. Without that bound a
+      # crash inherited the last green score and reported it as its own.
+      - name: PR-Agent review status check
+        if: always() && steps.gate.outputs.should_skip != 'true' && steps.cfg.outputs.status_check == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ github.event.pull_request.number || github.event.issue.number }}"
+          [[ -z "$PR_NUM" || "$PR_NUM" == "null" ]] && { echo "No PR — skip"; exit 0; }
+
+          SHA="${{ github.event.pull_request.head.sha }}"
+          if [[ -z "$SHA" || "$SHA" == "null" ]]; then
+            SHA=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid)
+          fi
+
+          # #433: the score MUST come from a review comment this run produced.
+          # Unbounded, a crashed run read the previous run's Reviewer Guide
+          # comment and reported its score as a pass.
+          RUN_START="${{ steps.runstart.outputs.run_start }}"
+          [[ -z "$RUN_START" ]] && { echo "::error::missing run-start anchor (#433)"; exit 1; }
+          gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUM/comments" --jq '.[]' \
+            | jq -s '.' > /tmp/pr-comments-status.json
+          BODY=$(jq -r --arg since "$RUN_START" \
+            '[.[] | select(.user.login=="github-actions[bot]")
+                  | select(.updated_at >= $since)
+                  | select(.body | contains("Reviewer Guide"))] | last.body // ""' \
+            /tmp/pr-comments-status.json)
+          SCORE=$(printf '%s' "$BODY" | grep -oiE 'score[^0-9]{0,20}[0-9]{1,3}' | grep -oE '[0-9]{1,3}' | head -1)
+
+          if [[ -n "$SCORE" ]]; then
+            gh api -X POST "repos/${{ github.repository }}/statuses/$SHA" \
+              -f state=success -f context="pr-agent/review" \
+              -f description="Reviewed — score $SCORE" >/dev/null
+            exit 0
+          fi
+
+          # No score. Distinguish "nothing reviewable" from a genuine crash:
+          # pr-agent drops [ignore]-matched files before reviewing (see its
+          # algo/file_filter.py: fnmatch.translate + re.match for glob, plain
+          # re.match for regex) — mirror that filter over the PR's changed
+          # files. Any matcher error falls through to the failure path, so a
+          # bug here can only reproduce today's behaviour, never mask a crash.
+          gh pr view "$PR_NUM" --repo "${{ github.repository }}" \
+            --json files --jq '[.files[].path]' > /tmp/pr-files.json
+
+          python3 << 'PYEOF'
+          import fnmatch, json, re
+
+          def read_ignore_section(path):
+              # tomllib is 3.11+; self-hosted runners (vars.CI_RUNNER) may be older,
+              # so fall back to extracting the [ignore] glob/regex string arrays.
+              try:
+                  import tomllib
+                  with open(path, 'rb') as f:
+                      return tomllib.load(f).get('ignore', {})
+              except ImportError:
+                  text = open(path).read()
+                  m = re.search(r'^\[ignore\]\s*$(.*?)(?=^\[|\Z)', text, re.M | re.S)
+                  section = m.group(1) if m else ''
+                  out = {}
+                  for key in ('glob', 'regex'):
+                      arr = re.search(rf'^{key}\s*=\s*\[(.*?)\]', section, re.M | re.S)
+                      if arr:
+                          out[key] = [a or b for a, b in
+                                      re.findall(r"'([^']*)'|\"([^\"]*)\"", arr.group(1))]
+                  return out
+
+          all_ignored = False
+          try:
+              ignore = read_ignore_section('.pr_agent.toml')
+              pats  = [re.compile(fnmatch.translate(g)) for g in ignore.get('glob', [])]
+              pats += [re.compile(r) for r in ignore.get('regex', [])]
+              with open('/tmp/pr-files.json') as f:
+                  files = json.load(f)
+              if files and pats:
+                  all_ignored = all(any(p.match(fp) for p in pats) for fp in files)
+          except Exception as e:  # no .pr_agent.toml / bad pattern
+              print(f'ignore-glob check unavailable ({e}) — treating diff as reviewable')
+
+          with open('/tmp/all_ignored.txt', 'w') as out:
+              out.write('true' if all_ignored else 'false')
+          PYEOF
+
+          if [[ "$(cat /tmp/all_ignored.txt)" == "true" ]]; then
+            gh api -X POST "repos/${{ github.repository }}/statuses/$SHA" \
+              -f state=success -f context="pr-agent/review" \
+              -f description="Nothing reviewable — all changed files match .pr_agent.toml ignore globs" >/dev/null
+            gh pr comment "$PR_NUM" --repo "${{ github.repository }}" \
+              --body "> ℹ️ **PR-Agent had nothing to review** — every changed file matches this repo's \`.pr_agent.toml\` \`[ignore]\` globs (docs/config-only diff), so no score is expected. Not a failure."
+            echo "Empty-after-ignore diff — status set to success"
+            exit 0
+          fi
+
+          gh api -X POST "repos/${{ github.repository }}/statuses/$SHA" \
+            -f state=failure -f context="pr-agent/review" \
+            -f description="No score parsed — review failed or empty (not a clean pass)" >/dev/null
+          gh pr comment "$PR_NUM" --repo "${{ github.repository }}" \
+            --body "> ❌ **PR-Agent produced no score** — it likely crashed or returned an empty review. Re-run with \`/review\`."
+          exit 1

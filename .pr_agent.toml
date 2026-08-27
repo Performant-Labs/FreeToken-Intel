@@ -1,0 +1,112 @@
+# .pr_agent.toml — PR-Agent configuration for FreeToken-Intel
+# Part of playbook/pipelines/pr-reviewer/ (Universal Configurable PR Reviewer)
+#
+# Docs: https://qodo-merge-docs.qodo.ai/usage-guide/configuration_options/
+
+[config]
+model = "deepseek/deepseek-v4-pro"
+fallback_models = ["deepseek/deepseek-v4-pro"]
+verbosity_level = 1
+max_description_tokens = 1500
+max_commits_tokens = 1500
+custom_model_max_tokens = 131072
+max_model_tokens = 64000
+
+[pr_reviewer]
+require_score_review = true
+require_tests_review = true
+require_security_review = true
+require_focused_review = false
+require_ticket_analysis_review = false
+num_code_suggestions = 4
+inline_code_comments = true
+automatic_review = true
+persistent_comment = true
+final_update_message = false
+extra_instructions = """
+You are reviewing PRs for FreeToken-Intel: edge-native MoE serving on Intel Arc Pro B70
+(SYCL / XPU) with OpenAI- and Anthropic-compatible APIs. This repo has no CLAUDE.md or
+skills/ directory yet — ground your review in what actually exists in the repo instead:
+
+MANDATORY CONTEXT — read before scoring:
+1. pyproject.toml's [tool.pytest.ini_options] markers: `xpu` (needs real Intel GPU
+   hardware, never runs in CI), `slow` (long kernel sweeps / real-checkpoint reads),
+   `needs_weights` (needs FREETOKEN_TEST_MODEL pointing at a local checkpoint).
+2. tests/README.md — which test selection runs where.
+3. .github/workflows/ci.yml — CI runs `pytest -m "not xpu and not slow"` on the
+   self-hosted Uranus fleet's SYSTEM Python (baked CPU PyTorch), NOT via
+   actions/setup-python. A PR must not reintroduce actions/setup-python on the
+   self-hosted path -- that silently defeats the baked torch and reduces the whole
+   torch-dependent test suite (test_engine_loop, test_models_loader,
+   test_moe_offload_*) to import-time skips. = BLOCKING if reintroduced.
+
+PRIMARY JOB — correctness and drift detection:
+1. Do new/changed tests correctly declare `xpu`, `slow`, or `needs_weights` markers
+   when they need real GPU hardware, long sweeps, or a real checkpoint? A test that
+   silently needs hardware/weights without the marker will pass locally on a
+   GPU-equipped dev box and then hang or fail unpredictably in CI. = BLOCKING.
+2. Are secrets committed (credentials, API keys, tokens)? = BLOCKING.
+3. Are there missing tests for new routes, public functions, or new model/backend
+   registrations (see tests/test_registries.py's pattern)? = BLOCKING.
+4. Does new code path assume XPU/oneAPI availability without a CPU fallback or a
+   clear `xpu`-marked test boundary? Flag as BLOCKING unless clearly CPU-only by
+   design (mirrors test_serve_spine.py's "device_report_line_is_shared" pattern).
+
+SECONDARY JOB — quality:
+- Security issues (auth bypass, injection, rate-limiting, CSRF) in server/ code.
+- Runtime regressions (race conditions, leaks, unbounded queries) in the MoE
+  offload/cache paths (test_moe_offload_cache.py, test_moe_offload_forward.py).
+
+REVIEW STYLE:
+- Distinguish BLOCKING (correctness, missing/misdeclared test markers, security,
+  missing required tests, CI-defeating changes) from NIT (style, preference).
+  Every BLOCKING finding must cite the file/line it's grounded in.
+- Do not suggest rewrites or alternative architectures unrelated to the diff.
+- When in doubt between blocking and nit, prefer nit — false positives erode trust.
+
+OUTPUT SHAPE:
+- Lead with a one-line verdict: BLOCKING / NITS / CLEAN.
+- Then the standard PR-Agent sections.
+- Inline comments focus on exact lines violating a cited rule.
+"""
+
+[pr_code_suggestions]
+num_code_suggestions = 4
+summarize = true
+extra_instructions = """
+Only suggest changes that fix a correctness/security/test-marker issue described above.
+Every suggestion must cite its source (file/line or pytest marker convention).
+Do not suggest refactors or alternative patterns not required by the above.
+"""
+
+[pr_description]
+publish_description_as_comment = false
+add_original_user_description = true
+keep_original_user_title = true
+
+[github]
+publish_inline_comments = true
+publish_output = true
+publish_output_progress = false
+
+[github_action_config]
+auto_review = true
+auto_improve = false
+pr_actions = ["opened", "reopened", "ready_for_review", "review_requested", "synchronize"]
+
+[litellm]
+drop_params = true
+max_model_len = 131072
+
+[ignore]
+glob = [
+  'package-lock.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+  'dist/**',
+  'coverage/**',
+  '*.min.js',
+  '*.min.css',
+  '.venv/**',
+  '.venv-xpu/**',
+]
