@@ -13,7 +13,6 @@ project:
   # for the CI score banner anyway.
 
 pr_agent:
-  enabled: true
   model: "deepseek/deepseek-v4-pro"
   max_tokens: 131072
   output_tokens: 64000
@@ -23,7 +22,10 @@ pr_agent:
   score_labels: true
   score_banner: true
   status_check: true
-  cancel_in_flight: true
+  # `enabled` and `cancel_in_flight` are removed keys (nothing reads them --
+  # see pipelines/pr-reviewer/README.md §1 "Keys that no longer exist"). The
+  # on-switch is the presence of .github/workflows/pr-review.yml; cancellation
+  # is hardcoded event-scoped in the workflow's concurrency block instead.
 
 local_review:
   enabled: false
