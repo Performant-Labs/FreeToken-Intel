@@ -33,7 +33,12 @@ env:
 
 jobs:
   pr-review:
-    uses: Performant-Labs/playbook/.github/workflows/pr-review-reusable.yml@main
+    # Local vendored copy of playbook's pr-review-reusable.yml. A PUBLIC repo
+    # cannot call a reusable workflow in a PRIVATE one ("workflow was not
+    # found" at run time, even with playbook's reusable-workflow access set to
+    # "organization") -- same fix as performantlabs.com. See the header of
+    # ./pr-review-reusable.yml.
+    uses: ./.github/workflows/pr-review-reusable.yml
     permissions:
       contents: read
       pull-requests: write
