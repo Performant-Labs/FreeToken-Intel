@@ -4,8 +4,50 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual re-run without a new commit (e.g. re-run a flaky pre-flight, or the
+  # red-team validation of a gate on a fixed tree). The pre-flight job reads
+  # the workflow files out of the checked-out tree, so a dispatch exercises the
+  # exact same path as a push/PR.
+  workflow_dispatch:
+
+# Cancel a stale in-flight run when a newer commit lands on the same ref, so a
+# force-push or a rapid follow-up push doesn't leave two full runs racing to
+# completion. `github.repository` is included (not just `github.workflow`) so
+# the group is unique per (repo, ref) and can't collide with another repo that
+# shares this workflow name. Parity with the playbook's ci-reusable.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  pre-flight:
+    name: Pre-flight (actionlint)
+    # Repo is public: this gate runs on GitHub-hosted, NEVER on the self-hosted
+    # fleet. A fork PR must never execute on owned hardware, and the org
+    # CI_RUNNER variable is a private-org mechanism that does not apply to a
+    # public repo. (The test job below is the exception that opts onto the
+    # fleet for the baked torch -- it only ever runs on our own runners, never
+    # for untrusted fork content, so that's safe.)
+    #
+    # actionlint is a HARD FAIL: a workflow file that fails lint is the same
+    # failure class as the playbook's "drift announces itself" rule. The job
+    # has NO `needs:` and is the first job, so a broken workflow file fails
+    # fast and cheap before any install/compile/test step runs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint workflow files (actionlint, pinned)
+        run: |
+          # Pin BOTH the download script (v1.7.12 tag, not a floating `main`)
+          # and the tool version it fetches (1.7.12) so the gate is
+          # reproducible and never silently picks up a newer actionlint with a
+          # different rule set. The script's own default is 1.7.12, but we pass
+          # it explicitly -- the pin must live in the workflow file, not be
+          # inherited from the upstream script's `version="..."` default, which
+          # someone upstream could bump.
+          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint .github/workflows/*.yml
+
   test:
     # Opt this repo onto the self-hosted Uranus fleet via the org CI_RUNNER
     # variable (value: self-hosted-linux). Until that variable is scoped to this
