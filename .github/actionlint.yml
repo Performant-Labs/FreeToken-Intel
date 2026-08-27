@@ -1,0 +1,33 @@
+# actionlint configuration for the pre-flight job (see ci.yml).
+#
+# actionlint runs shellcheck and pyflakes on every `run:` script it finds. On
+# this repo's runners those tools are installed, so a bare `actionlint`
+# invocation lints the bash in every workflow -- but shellcheck does not
+# understand GitHub Actions' `${{ }}` expression syntax and reports it as
+# SC2016 ("expressions don't expand in single quotes") whenever a `${{ ... }}`
+# expression sits inside a single-quoted string.
+#
+# That is a FALSE POSITIVE, and suppressing it is correct, not a workaround:
+# the single quotes are load-bearing. In the vendored playbook pr-review
+# workflow, `${{ }}` expressions wrap `--jq '...'` filter arguments, which MUST
+# be single-quoted -- double-quoting them would let the shell expand the
+# expression before `gh` ever saw the jq filter, breaking the jq. (The playbook
+# ships no actionlint config and tolerates the noise because its pre-flight is
+# not a required check; here pre-flight is a real gate, so we silence the false
+# positives explicitly instead of letting a required check fail on a lint
+# artifact.)
+#
+# The `ignore` list holds message REGEXES (matched with Go regexp, like the
+# `-ignore` flag). SC2016 is the ONLY shellcheck code the vendored file
+# triggers, and it fires only on those two load-bearing `${{ }}`-in-single-
+# quotes sites, so this stays narrow: every other check -- YAML/syntax errors,
+# unknown actions, undefined `needs:` targets, invalid `runs-on`, and genuine
+# shellcheck findings (unquoted expansions, etc.) -- still fails pre-flight.
+#
+# pr-review-reusable.yml is a vendored COPY of the playbook's file, changed
+# only by a deliberate re-vendoring; a new genuine shellcheck finding there
+# would stand out against this narrow ignore and be reviewed at that point.
+paths:
+  .github/workflows/pr-review-reusable.yml:
+    ignore:
+      - 'shellcheck reported issue in this script: SC2016:.*'
