@@ -48,6 +48,183 @@ jobs:
           bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
           ./actionlint .github/workflows/*.yml
 
+  secret-scan:
+    name: Secret scan (gitleaks)
+    # Ported VERBATIM from the playbook's secret-scan job in ci-reusable.yml --
+    # the comments in each step are load-bearing and travel with the code.
+    #
+    # TWO deliberate differences from the playbook:
+    #
+    #   1. runs-on is ubuntu-latest (here), not the org CI_RUNNER variable
+    #      (playbook). Same reason as pre-flight above: this repo is public, so
+    #      a fork PR must never execute on the self-hosted fleet, and the org
+    #      variable is a private-org mechanism. (The test job is the one
+    #      exception that opts onto the fleet -- see its comment.)
+    #
+    #   2. HARD-FAIL on findings, from day 1. The playbook runs warn-only
+    #      because 21 repos have untriaged historical baselines. THIS repo has
+    #      zero historical commits containing secrets and is public, so a
+    #      warn-only period would be a standard nobody reads -- the exact
+    #      failure mode the playbook's own doc warns about. So: gitleaks exit
+    #      code 2 (leaks found) uploads the redacted JSON report AND fails the
+    #      step, instead of the playbook's ::warning::. Any other non-zero exit
+    #      is a scanner/infra failure and also fails.
+    #
+    # The op.env sub-check the playbook appends to this job is DROPPED -- this
+    # repo has no op.env.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # pull_request's default ref is the synthetic merge commit -- fetch
+          # the real head ref too so "Determine scan range" can use the PR's
+          # actual head SHA (github.sha here is the merge commit, NOT the PR
+          # head, a common GitHub Actions gotcha). The playbook documents this
+          # as empirically proven across every PR shape its fleet has.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # This job never pushes or authenticates as anything -- no reason
+          # for git to hold a credential in its local config afterward,
+          # especially one running over untrusted PR content.
+          persist-credentials: false
+
+      # Downloaded into $RUNNER_TEMP and left there (not /usr/local/bin) --
+      # self-hosted runners are long-lived and shared across jobs; a global
+      # `sudo mv` mutates every future job on that machine, not just this
+      # one. $GITHUB_PATH makes the temp copy resolve as `gitleaks` for the
+      # rest of THIS job only. --fail (a 4xx/5xx response is a real error,
+      # not a 200 body containing an HTML error page) + --retry for
+      # transient network blips. gitleaks is pinned to 8.30.1 (the org
+      # developer-setup baseline) and sha256-verified against the release's
+      # own checksums.txt -- the pin lives in this file, not a floating tag.
+      - name: Install gitleaks
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSL --fail --retry 3 --retry-all-errors -O https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          curl -sSL --fail --retry 3 --retry-all-errors -O https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
+          grep " gitleaks_8.30.1_linux_x64.tar.gz\$" gitleaks_8.30.1_checksums.txt | sha256sum -c -
+          tar -xz gitleaks -f gitleaks_8.30.1_linux_x64.tar.gz
+          chmod +x gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      # HEAD is the PR's real head SHA, not `github.sha` (see the checkout
+      # step above). BASE resolves per event, used ONLY if it's actually
+      # resolvable in this checkout.
+      #
+      # An unreachable base (a force-push whose old tip no longer exists, or a
+      # genuinely new ref) degrades to the best range this job CAN compute --
+      # first the push payload's own commit list, then the tip commit alone
+      # (`HEAD^!`, never a bare `HEAD`, which would walk full history) -- with
+      # a visible ::warning::. It never silently under-scans and never fails
+      # the step: a routine rebase is common, not an edge case, and failing CI
+      # over an ordinary git operation would be noise. (The playbook's
+      # warn-only framing of this is adapted below: the coverage-gap warning
+      # text is kept, since it's accurate regardless of the fail policy.)
+      #
+      # Deletion pushes and tag pushes are skipped entirely: a deletion has no
+      # tree to scan, and a tag doesn't introduce new commits -- whatever it
+      # points at was already scanned when THOSE commits were pushed as branch
+      # commits.
+      #
+      # Only `pull_request` and `push` are handled -- any other trigger
+      # (`workflow_dispatch`, `schedule`, `merge_group`, ...) FAILS rather than
+      # silently reusing push-shaped logic for an event this job was never
+      # designed to compute a range for.
+      - name: Determine scan range
+        id: range
+        run: |
+          ZERO_SHA="0000000000000000000000000000000000000000"
+
+          if [ "${{ github.event_name }}" = "push" ] && \
+             { [ "${{ github.event.deleted }}" = "true" ] || \
+               [ "${{ startsWith(github.event.ref, 'refs/tags/') }}" = "true" ]; }; then
+            echo "range=" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::secret-scan: deletion or tag push -- nothing new to scan, skipping."
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+          else
+            echo "::error::secret-scan: unsupported trigger event '${{ github.event_name }}' -- this job only knows how to compute a range for pull_request and push. Failing rather than guessing a range for an event shape it wasn't designed for."
+            exit 1
+          fi
+
+          resolves() { git cat-file -e "${1}^{commit}" 2>/dev/null; }
+
+          if [ -n "$BASE" ] && [ "$BASE" != "$ZERO_SHA" ] && resolves "$BASE"; then
+            RANGE="${BASE}..${HEAD}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            FIRST="${{ github.event.commits[0].id }}"
+            if [ -n "$FIRST" ] && resolves "$FIRST" && git rev-parse -q --verify "${FIRST}^" >/dev/null 2>&1; then
+              RANGE="${FIRST}^..${HEAD}"
+              echo "::notice::secret-scan: base unavailable -- recovered a range from the push payload's own commit list ($RANGE)."
+            else
+              RANGE="${HEAD}^!"
+              echo "::warning::secret-scan: could not compute a complete scan range (new ref with no resolvable parent, or the push payload's commit list is empty/truncated) -- scanning only the tip commit $HEAD."
+            fi
+          else
+            RANGE="${HEAD}^!"
+            echo "::warning::secret-scan: PR base commit unavailable in this checkout -- scanning only the tip commit $HEAD."
+          fi
+          echo "range=$RANGE" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      # --exit-code 2 for findings (default is 1): gitleaks' OWN docs say
+      # exit 1 means "leaks are found OR an error occurred during scanning" --
+      # the two are NOT distinguishable by exit code alone at the default.
+      # Requesting a distinct code for findings makes the 0/2/anything-else
+      # branching below actually sound: 1 now unambiguously means a real
+      # scanner error.
+      #
+      # DELIBERATE DIFF FROM THE PLAYBOOK (see the job comment): exit 2
+      # (leaks found) sets leaks=true AND FAILS THE STEP. The playbook emits a
+      # ::warning:: and lets the run stay green during its baseline period;
+      # this repo has zero historical secret commits and is public, so a
+      # finding is a finding and the gate must be red. The redacted JSON report
+      # is uploaded in the next step either way.
+      - name: gitleaks (secrets introduced by this push/PR)
+        id: gitleaks
+        if: steps.range.outputs.skip != 'true'
+        run: |
+          set +e
+          gitleaks git --log-opts="${{ steps.range.outputs.range }}" \
+            --redact --no-banner --exit-code 2 \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks-report.json"
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "leaks=false" >> "$GITHUB_OUTPUT"
+          elif [ "$code" -eq 2 ]; then
+            echo "leaks=true" >> "$GITHUB_OUTPUT"
+            echo "::error::secret-scan: gitleaks found leaks in this push/PR's commit range -- see the uploaded redacted report. This is a HARD FAIL (unlike the playbook's warn-only baseline): this repo has no untriaged historical secrets, so a finding blocks the PR."
+            exit 2
+          else
+            echo "::error::secret-scan: gitleaks exited $code (not 0=clean or 2=leaks-found) -- this indicates a scanner or config problem, not a benign finding. Failing the step rather than treating an infra failure as a pass."
+            exit "$code"
+          fi
+
+      # continue-on-error here is legitimate (unlike the gitleaks step above,
+      # which deliberately avoids it so a finding FAILS the job): an upload
+      # failure (network blip, name collision) must not turn a red
+      # hard-fail into a confusing third state. Name includes run ID + attempt
+      # so a rerun can't collide with the artifact from the prior attempt.
+      # Report written to $RUNNER_TEMP (not the checked-out workspace) so it
+      # never lands in the tree gitleaks itself scans.
+      - name: Upload gitleaks report
+        if: always() && steps.gitleaks.outputs.leaks == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gitleaks-report.json
+          retention-days: 14
+
   test:
     # Opt this repo onto the self-hosted Uranus fleet via the org CI_RUNNER
     # variable (value: self-hosted-linux). Until that variable is scoped to this
