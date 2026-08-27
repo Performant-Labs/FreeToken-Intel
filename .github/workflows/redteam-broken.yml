@@ -1,0 +1,8 @@
+name: redteam-broken
+on: [push]
+jobs:
+  broken:
+    runs-on: ubuntu-latest
+    needs: [a-job-that-does-not-exist]
+    steps:
+      - name: orphan step (no uses, no run)
