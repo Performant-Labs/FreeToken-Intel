@@ -92,6 +92,20 @@ same command only when the file exists (path may differ; search
 24. `.venv-xpu/bin/ft device` — PASS if it reports XPU available and
     does not claim `(none)` for device 0.
 
+## CI parity
+
+The local pre-flight is the developer-side mirror of the `ci` job in
+`.github/workflows/ci.yml` — if one changes, the other must follow.
+The one deliberate marker difference: the local pytest (check 13)
+runs `-m "not xpu and not slow"`, while the CI `ci` job additionally
+excludes `needs_weights` (its full marker expression is
+`-m "not xpu and not slow and not needs_weights"`), because CI has no
+`FREETOKEN_TEST_MODEL` checkpoint to satisfy those tests. Everything
+else — the torch-free CPU venv guard and the `ft device` /
+`xpu available: False` CLI smoke — is the same check on both sides.
+See [docs/ci.md](../docs/ci.md) for the full job map and the WHY
+behind each deviation.
+
 ## Report format
 
 End with this table, then a one-paragraph verdict (`CPU ready` /
