@@ -1,5 +1,13 @@
 # actionlint configuration for the pre-flight job (see ci.yml).
 #
+# FILENAME MATTERS: actionlint's default config filename is `actionlint.yaml`
+# (NOT `.yml`). This file was originally `.github/actionlint.yml`, which
+# actionlint silently ignored -- the SC2016 suppression below never loaded.
+# The pre-flight job now passes `-config-file .github/actionlint.yaml`
+# explicitly (see ci.yml), so the load no longer depends on the default; but
+# if you rename this file, update that flag in the same PR or the config
+# quietly stops applying.
+#
 # actionlint runs shellcheck and pyflakes on every `run:` script it finds. On
 # this repo's runners those tools are installed, so a bare `actionlint`
 # invocation lints the bash in every workflow -- but shellcheck does not
