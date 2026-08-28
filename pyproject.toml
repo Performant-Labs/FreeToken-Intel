@@ -30,6 +30,12 @@ dependencies = [
     "huggingface_hub>=0.26,<3",
     "msgpack>=1.1,<2",
     "numpy>=2.0,<2.5",
+    # RED-TEAM (do not merge): torch must NOT be a [project] dependency. The
+    # dual-venv contract keeps torch OUT of the CPU venv (it lives only in
+    # .venv-xpu). Adding it here makes `import torch` succeed in the CPU CI
+    # venv, which the venv-contract guard in .github/workflows/ci.yml is
+    # designed to catch and hard-fail on.
+    "torch",
     "openai>=1.0,<3",
     "partial-json-parser>=0.2,<1",
     "prompt_toolkit>=3.0,<4",
