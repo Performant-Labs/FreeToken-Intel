@@ -88,17 +88,45 @@ jobs:
     runs-on: ${{ vars.CI_RUNNER }}
     timeout-minutes: 60
     steps:
-      # HARD XPU-presence guard, run FIRST (before checkout): The whole point
-      # of this nightly is torch-on-B70; if the runner we landed on has no
-      # XPU (fleet drift, a new runner image without the ICD, CI_RUNNER
-      # re-pointed at a wrong label) the venv contract below would fail
-      # opaquely and the CTRF artifact would be a wall of collection errors.
-      # Fail loudly and EARLY, in the step whose name says what happened, with
-      # a diagnostic that tells the on-call exactly which of the four causes it
-      # is. (sycl-ls is on PATH once oneAPI's setvars.sh is sourced; the fleet
-      # runner sources it at image build. If it is NOT on PATH here, that is
-      # itself fleet drift -- oneAPI is missing or un-sourced -- and fails the
-      # same way.)
+      # Prime the oneAPI/XPU environment BEFORE anything else -- including the
+      # XPU-presence guard below, which calls `sycl-ls` and therefore needs the
+      # oneAPI PATH to be set first. This is the robustness fix the red-team
+      # surfaced: the guard used to rely on oneAPI being baked into the runner
+      # image's base shell. A runner (like Jupiter) that only puts oneAPI on
+      # PATH via its runner .env does NOT expose it to a GitHub Actions step's
+      # non-interactive shell, so `command -v sycl-ls` there is a FALSE
+      # NEGATIVE -- the guard would report "oneAPI missing" and fail on a
+      # perfectly good B70 (exactly what the red-team probe hit). Sourcing
+      # setvars-xpu.sh here, on-demand, and persisting ONLY the runtime vars to
+      # GITHUB_ENV fixes that: the guard and every later step now get oneAPI on
+      # PATH regardless of how (or whether) the image baked it, and a box that
+      # genuinely lacks oneAPI still fails loudly at the same guard.
+      #
+      # The GITHUB_ENV export is deliberately filtered (not a blanket `env >>`):
+      # oneAPI's setvars.sh leaves shell FUNCTION definitions (ps4, printenv4,
+      # ...) in the environment, and a blanket dump would write malformed
+      # `name() {...}` fragments into the env file, which the runner re-sources
+      # as `export` lines and chokes on -- corrupting every subsequent step.
+      # GITHUB_ENV is a special variable, so it is excluded by the same prefix.
+      - name: "Prime oneAPI/XPU environment (so the guard sees sycl-ls)"
+        run: |
+          set -a
+          . ./setvars-xpu.sh
+          set +a
+          env | grep -E '^(ONEAPI|LD_LIBRARY_PATH|PATH)=' >> "$GITHUB_ENV"
+
+      # HARD XPU-presence guard, run right after the prime above (before
+      # checkout): The whole point of this nightly is torch-on-B70; if the
+      # runner we landed on has no XPU (fleet drift, a new runner image without
+      # the ICD, CI_RUNNER re-pointed at a wrong label) the venv contract below
+      # would fail opaquely and the CTRF artifact would be a wall of collection
+      # errors. Fail loudly and EARLY, in the step whose name says what
+      # happened, with a diagnostic that tells the on-call exactly which of the
+      # four causes it is. (sycl-ls is on PATH because the prime step above
+      # sourced setvars-xpu.sh and exported the oneAPI PATH to GITHUB_ENV, so
+      # this no longer depends on the image having baked oneAPI in. If it is
+      # STILL not on PATH here, oneAPI is genuinely absent from this box --
+      # real fleet drift -- and the step fails the same way.)
       - name: "Guard: this runner must have a real XPU"
         id: sycl-ls-result
         run: |
@@ -114,22 +142,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Source the B70 pin (ONEAPI_DEVICE_SELECTOR=level_zero:0) + the oneAPI
-      # environment, exactly as a developer would (docs/dev-setup.md). This is
-      # what puts sycl-ls/icpx on PATH and pins the device index if an AMD iGPU
-      # shadows the Battlemage. It MUST come before the venv is activated so the
-      # venv's python resolves the XPU runtime.
-      #
-      # Persist the oneAPI/XPU environment across steps (each step is a fresh
-      # shell, so the sourced values are lost unless exported to the runner's
-      # per-step env file). CRITICAL: persist only the specific variables the
-      # XPU runtime needs (ONEAPI_*, LD_LIBRARY_PATH, PATH), NOT a blanket
-      # `env >> $GITHUB_ENV`. The oneAPI setvars.sh leaves shell FUNCTION
-      # definitions (ps4, printenv4, etc.) in the environment, and a blanket
-      # dump would write malformed `name() {...}` fragments into the env file --
-      # which the runner re-sources as `export` lines and chokes on, corrupting
-      # every subsequent step. (GITHUB_ENV is a special variable, so it is
-      # excluded by the same prefix filter.)
+      # Re-source the B70 device pin (ONEAPI_DEVICE_SELECTOR=level_zero:0) + the
+      # oneAPI environment, exactly as a developer would (docs/dev-setup.md). The
+      # environment was ALREADY primed at the top of the job and exported to
+      # GITHUB_ENV (so the guard and every step already have oneAPI on PATH).
+      # This step is a defensive re-source -- redundant today, but it keeps the
+      # venv step self-contained in case the prime step's GITHUB_ENV export is
+      # ever narrowed, and it documents that the venv's python must resolve the
+      # XPU runtime with oneAPI sourced. The filtered export (NOT a blanket
+      # `env >> $GITHUB_ENV`) is repeated here for the same reason: oneAPI's
+      # setvars.sh leaves shell FUNCTION definitions (ps4, printenv4, ...) in the
+      # environment, and a blanket dump would corrupt the env file for every
+      # subsequent step. (GITHUB_ENV is a special variable, so it is excluded by
+      # the same prefix filter.)
       - name: Source oneAPI / XPU environment
         run: |
           set -a
