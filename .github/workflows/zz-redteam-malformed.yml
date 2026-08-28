@@ -1,0 +1,12 @@
+name: redteam-malformed
+on: [push]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: not-a-real-action@v999
+        run: echo this step has both uses and run which is invalid
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # malformed: a value with an unescaped colon in a block that breaks YAML
+          ref: : broken
