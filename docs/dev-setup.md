@@ -296,7 +296,33 @@ fti-xpu() {
 }
 ```
 
-## 8. Recreate a venv
+## 8. Local validation
+
+Before you push, run the local mirror of the CI gates:
+
+```bash
+cd /path/to/FreeToken-Intel
+bash tools/validate.sh            # or: bash tools/validate.sh origin/main
+```
+
+It runs the same commands the CI jobs run (workflow lint, secret scan, the CPU
+venv contract, the CLI smoke test, the CPU test suite) and prints one
+`PASS`/`FAIL`/`SKIP` line per gate, then a verdict. It exits non-zero if any
+gate `FAIL`s, so it is a useful pre-push gate.
+
+- A `SKIP` is **not** a failure: a gate that cannot run on this box (no local
+  `actionlint`, or a check that needs the XPU fleet) skips rather than failing
+  and still runs in CI.
+- The `ci:*` gates run inside `.venv`, so create it (section 5) first; without
+  it those gates `SKIP`. `gitleaks` and `actionlint` are optional local
+  installs — install either to un-skip its gate.
+- Optional `base-ref` argument sets the secret-scan range (default: the PR base
+  when on a PR branch, else the tip commit).
+
+`ci.md` (the CI walkthrough) documents each gate in detail; this command is the
+local stand-in.
+
+## 9. Recreate a venv
 
 If a wheel is wrong or the venv is stale:
 
@@ -308,7 +334,7 @@ rm -rf .venv          # or .venv-xpu
 
 Faster than trying to uninstall a CUDA `torch` and replace it in place.
 
-## 9. What not to do
+## 10. What not to do
 
 - `sudo pip install …` or `pip install --user` for this project
 - One venv with both CUDA and XPU PyTorch
