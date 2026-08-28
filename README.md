@@ -53,6 +53,15 @@ ft --version
 Machine setup (two venvs, driver, oneAPI): [docs/dev-setup.md](docs/dev-setup.md).
 Software list: [docs/dev-requirements.md](docs/dev-requirements.md).
 
+## CI
+
+Four checks gate this repo: `pre-flight` (workflow lint), `secret-scan`
+(gitleaks, hard-fail), `ci` (CPU tests + CLI smoke, torch-free venv),
+and a nightly `xpu-nightly` that runs the torch/XPU suite on the B70
+fleet. An optional bot review runs in parallel and is advisory. Run the local
+mirror before pushing with `tools/validate.sh`.
+See [docs/ci.md](docs/ci.md) for what each check guards and why.
+
 ## CLI
 
 ```

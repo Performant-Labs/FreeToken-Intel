@@ -319,7 +319,7 @@ gate `FAIL`s, so it is a useful pre-push gate.
 - Optional `base-ref` argument sets the secret-scan range (default: the PR base
   when on a PR branch, else the tip commit).
 
-`ci.md` (the CI walkthrough) documents each gate in detail; this command is the
+[ci.md](ci.md) (the CI walkthrough) documents each gate in detail; this command is the
 local stand-in.
 
 ## 9. Recreate a venv
