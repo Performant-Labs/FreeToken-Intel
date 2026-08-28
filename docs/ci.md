@@ -216,11 +216,12 @@ better, so we borrowed them:
 
 ## Rules
 
-* **Pin actions deliberately.** Every `uses:` in `ci.yml` and
-  `xpu.yml` is pinned to a full commit SHA (not a floating tag) with a
-  trailing `# vN` comment naming the release the SHA is. Bump pins
-  **deliberately, one PR per action, never implicitly** — an unpinned
-  tag is the same failure class as the playbook's retired
+* **Pin actions deliberately.** Every `uses:` in `ci.yml`, `xpu.yml`,
+  and the vendored `pr-review-reusable.yml` (invoked by ci.yml's
+  PR-agent job) is pinned to a full commit SHA (not a floating tag)
+  with a trailing `# vN` comment naming the release the SHA is. Bump
+  pins **deliberately, one PR per action, never implicitly** — an
+  unpinned tag is the same failure class as the playbook's retired
   `CI_RUNNER || 'ubuntu-latest'` bug: a silent, invisible behavior
   change (a new action release could change checkout or upload
   semantics under a green-looking run).
