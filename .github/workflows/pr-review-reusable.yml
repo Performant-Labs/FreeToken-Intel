@@ -54,16 +54,45 @@ jobs:
         with:
           fetch-depth: 0
 
+      # continue-on-error on this step is deliberate (#433): it MUST NOT be able
+      # to fail the job. Steps run under `bash -e`, so a bare non-zero step
+      # aborts the WHOLE job. Two distinct outages hit exactly this:
+      #
+      #   1. PEP-668: a self-hosted runner ships an "externally managed" system
+      #      Python (3.12+), so a plain `pip install` hard-fails with "This
+      #      environment is externally managed". The --break-system-packages
+      #      retry below covers that.
+      #   2. NO pip at all: some runners ship a system python3 whose venv is
+      #      stripped of pip, so `python3 -m pip` itself is "No module named
+      #      pip" and BOTH retries exit non-zero. (This is what red-jacked every
+      #      non-skippable PR: the job died here, and the `if: always()` run-
+      #      start anchor that followed then tripped its own fail-closed
+      #      "no clock available" check under the poisoned `set -e`.)
+      #
+      # pyyaml is the ONLY thing this step exists to provide, and the "Read
+      # pr-review config" step that consumes it already has its own fallback:
+      # `try: ... except FileNotFoundError: cfg = {}` — and when the `yaml`
+      # import is missing, the parser uses safe defaults. So a missing pyyaml
+      # degrades the review to its defaults; it must never abort the run before
+      # PR-Agent gets to post a review. Hence: best-effort install, warn and
+      # continue (never fail) when it is unavailable.
       - name: Ensure pyyaml is available
-        # Self-hosted runners (vars.CI_RUNNER) may ship a PEP-668
-        # externally-managed system Python (Python 3.12+), which makes a plain
-        # `pip install` hard-fail with "This environment is externally managed"
-        # and kills the job before PR-Agent ever runs. Try a normal install
-        # first; if it's blocked, retry with --break-system-packages. CI runners
-        # are disposable, so mutating the system site-packages is safe here.
+        if: always()
+        continue-on-error: true
         run: |
+          if python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "pyyaml already present — nothing to install."
+            exit 0
+          fi
+          if ! python3 -m pip --version >/dev/null 2>&1; then
+            echo "::warning::python3 has no 'pip' module on this runner. pyyaml cannot be installed here, so the config parser will fall back to its safe defaults. The review itself is unaffected; this note only means PR config (.agents/pr-review.yml) is not read. See #433."
+            exit 0
+          fi
+          # pip exists. Normal install first; if PEP-668 blocks it, retry with
+          # --break-system-packages (CI runners are disposable).
           python3 -m pip install pyyaml --quiet --disable-pip-version-check \
-            || python3 -m pip install pyyaml --quiet --disable-pip-version-check --break-system-packages
+            || python3 -m pip install pyyaml --quiet --disable-pip-version-check --break-system-packages \
+            || { echo "::warning::pip is present but could not install pyyaml (offline runner or index error). The config parser will fall back to its safe defaults; the review is unaffected. See #433." ; }
 
       # ── Read project config ──────────────────────────────────────────────────
       # Parses .agents/pr-review.yml with PyYAML.
@@ -369,9 +398,22 @@ jobs:
       - name: Record run-start anchor
         id: runstart
         if: always() && steps.gate.outputs.should_skip != 'true'
+        # Disable -e for THIS step's body (the step is otherwise inherited
+        # `bash -e`). Why: this step runs under `if: always()`, so when an EARLIER
+        # step failed and poisoned the environment, the runner still executes it
+        # — and under `set -e` an incidental non-zero (a flaky `gh api`, or a
+        # `date -d` that returns non-zero yet still prints, as `|| true` does
+        # not fully guard under -e) can abort the step at that line, before the
+        # deliberate `if [[ -z "$START" ]]` fail-closed check is reached. That
+        # misreport is exactly what made #433's fix look like "no clock
+        # available" when the real problem was a dead step upstream. With `set +e`
+        # the only way this step fails is the intended, explicit `exit 1` below
+        # (genuinely no anchor), which is the one case that SHOULD fail.
+        shell: bash {0}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set +e
           START=""
           HDR=$(gh api "repos/${{ github.repository }}" -i --silent 2>/dev/null \
                 | grep -i '^date:' | head -1 | sed 's/^[Dd]ate:[[:space:]]*//' | tr -d '\r' || true)
