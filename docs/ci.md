@@ -1,6 +1,6 @@
 # CI
 
-FreeToken-Intel has four checks. Three gate every PR to `main`
+FreeToken-Intel has five checks. Four gate every PR to `main`
 (`ci.yml`); one runs nightly on the B70 fleet (`xpu.yml`). An optional
 bot review (`pr-review.yml`) runs in parallel and is advisory — it
 never gates.
@@ -18,6 +18,7 @@ flowchart TD
     subgraph "ci.yml (every PR + push to main)"
         PF["pre-flight<br/>(actionlint)"] --> SS["secret-scan<br/>(gitleaks)"]
         PF --> CI["ci<br/>(tests + CLI smoke)"]
+        PF --> CF["conformance<br/>(CUDA→SYCL + version)"]
     end
     subgraph "xpu.yml (nightly 02:30 UTC + dispatch)"
         CHK["check<br/>(hosted, cheap)"] -->|build=true| BLD["build<br/>(B70 fleet)"]
@@ -30,6 +31,7 @@ flowchart TD
 | **pre-flight** | hosted | Workflow files parse and lint. Fails first, before any expensive job. |
 | **secret-scan** | hosted | No secret enters the tree. **Hard-fails** on a finding. |
 | **ci** | hosted | The CPU contract: torch-free venv, full CPU suite, live CLI smoke. |
+| **conformance** | hosted | The port's invariants: SYCL uses `sycl_ext::`, no CUDA backdoors, one version source. |
 | **xpu-nightly** | B70 fleet | The XPU half of the contract: torch present, `torch.xpu` alive, xpu-marked tests pass. |
 | **PR-Agent review** | fleet | Advisory bot score + label. Not a gate. |
 
@@ -42,7 +44,7 @@ fails fast and cheap instead of being discovered three jobs deep.
 **Public repo ⇒ `ubuntu-latest` hardcoded.** A fork PR must never
 execute on owned hardware. The org `CI_RUNNER` variable is a
 private-org mechanism and does not apply to a public repo, so the
-three `ci.yml` jobs pin `ubuntu-latest` directly. Consequently they
+four `ci.yml` jobs pin `ubuntu-latest` directly. Consequently they
 deliberately carry **no** `github.repository == ...` identity guard —
 all their jobs run hosted, so there is nothing to guard. `xpu.yml` is
 the opposite: its `build` job runs on the self-hosted B70 fleet, so
@@ -105,26 +107,60 @@ of either is a **contract breach, not a flake**:
   half — the venv where torch **is** required and `torch.xpu.is_available()`
   must be True.
 
-## The SYCL conformance rule
+## The conformance gate
 
-(Tracked in [#46]; the job is not yet in `ci.yml` — see the
-"pending" note below.) Every file under `kernel/csrc/` that
-`#include <sycl/sycl.hpp>` must also use the `sycl_ext::` extension
-namespace (e.g. `sycl_ext::make_kernel`), per the "never compile
-against a fake SYCL" rule. A file that legitimately uses only the
-standard SYCL API is listed in an explicit allowlist; a new file that
-includes the SYCL header, uses no `sycl_ext::`, and is not
-allowlisted **fails** the check and names the file. This is the drift
-the rule exists to prevent: a "portable SYCL" kernel that silently
-stops binding the XPU extensions. To add a legitimately-standard-SYCL
-file: add it to the allowlist (`.github/ci-conformance-allowlist` or
-the job-local named section — the implementation will document which) and the
-check greps for `#include <sycl/sycl.hpp>` vs a `sycl_ext::`
-reference in the same file.
+`ci.yml` → `conformance` job. The cheapest, most declarative gate in
+the repo: pure `bash` + `git` + `grep`, no `pip install`, no Node, no
+toolchain. It exists to make the port's non-negotiable invariants
+*drift-announcing* — a violation fails the PR the moment it lands, in
+a step whose name says what it is, instead of surfacing as a flaky
+build or a wrong wheel a release later. Three checks, three
+invariants (tracked in [#46]):
 
-> **Pending:** the `conformance` job is not yet wired into `ci.yml`
-> (see issue #46). Until it lands, the no-CUDA and version-singularity
-> invariants described in #46 are not yet enforced in CI.
+* **SYCL extension rule** — every file under
+  `python/freetoken/kernel/csrc/` that `#include`s
+  `<sycl/sycl.hpp>` must also reference the `sycl_ext::` extension
+  namespace (e.g. `sycl_ext::make_kernel`). The "never compile against
+  a fake SYCL" rule: a kernel written against the plain `sycl::` API
+  binds none of the XPU extensions, so it would *look* portable and
+  silently stop being GPU work. A file that legitimately uses only the
+  standard SYCL API is listed in `.github/ci-conformance-allowlist`
+  (one path per line, `#` comments); a new file that includes the
+  header, uses no `sycl_ext::`, and is not allowlisted **fails** the
+  job and names the file.
+* **No CUDA backdoors** — a `#include <cuda*>`, `cublas`, `cub/`, or
+  `nvcc` reference in any source file is a premise violation, not a
+  style issue: the whole point of the port is CUDA→SYCL. The check is
+  scoped to code extensions (`.c .cc .cpp .cxx .h .hpp .hxx .cu .cuh
+  .py .toml .cfg`); docs may *reference* CUDA by name (the
+  CUDA→Intel map in `docs/architecture.md`) without tripping the gate.
+* **Version-source singularity** — `python/freetoken/version.py` is
+  the *only* place a `__version__` literal for the freetoken package
+  is declared; `pyproject.toml` keeps `dynamic = ["version"]` pointing
+  at it. A second `__version__` anywhere in the tracked tree is
+  two-sources-of-truth drift, exactly what the playbook's
+  release-conformance gate exists to stop. Two exemptions: the
+  separate `freetoken-kernel-cache` distributable owns its own
+  independent version (allowlisted in the job), and the root
+  `pyproject.toml`'s `version = {attr = ...}` is the *mechanism* that
+  points at the source, not a literal.
+
+**Why greps and not a compiler.** A full `icpx -fsycl` compile of the
+kernel sources is the *strongest* form of this check but needs the
+oneAPI toolchain, which lives on the B70 fleet (and is not a public
+hosted image) — that belongs to the nightly, not to a fork-safe per-PR
+gate. The greps are the part that must run on every PR *now*; they
+catch the invariant at the text level where it can be checked for free,
+and the nightly's real compile is the backstop that catches what a
+grep can't. (See "XPU nightly operations" below.)
+
+**To add a legitimately-standard-SYCL file:** add its path to
+`.github/ci-conformance-allowlist` in the same PR, with a comment
+saying why it needs no `sycl_ext::`. If the file later starts using
+`kernel-sycl`'s extension API, remove it from the list in that PR.
+Allowlisting a file *so it can dodge the check* is exactly the drift
+the rule exists to catch — treat an allowlist addition as a decision
+the conformance gate is there to police.
 
 ## CTRF artifacts
 

@@ -1,0 +1,13 @@
+2026-08-28T21:06:23.116Z | qwen38 | TTFT 2.8s | TPS 60.5 tok/s | Latency 8.5s | ↑28.4k ↓345 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:06:28.982Z | qwen38 | TTFT 2.0s | TPS 56.6 tok/s | Latency 5.9s | ↑29.1k ↓216 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:06:39.503Z | qwen38 | TTFT N/A | TPS 21.7 tok/s | Latency 10.5s | ↑29.4k ↓228 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:06:48.890Z | qwen38 | TTFT 2.4s | TPS 49.8 tok/s | Latency 9.4s | ↑29.7k ↓346 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:06:58.803Z | qwen38 | TTFT 2.9s | TPS 45.6 tok/s | Latency 9.9s | ↑30.1k ↓319 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:07:16.336Z | qwen38 | TTFT 1.9s | TPS 38.7 tok/s | Latency 17.5s | ↑30.4k ↓607 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:08:54.163Z | qwen38 | TTFT 2.4s | TPS 2.9 tok/s | Latency 1.6m | ↑31.1k ↓274 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:10:20.470Z | qwen38 | TTFT 3.4s | TPS 3.4 tok/s | Latency 1.4m | ↑32.1k ↓282 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:10:24.975Z | qwen38 | TTFT 2.2s | TPS 51.8 tok/s | Latency 4.5s | ↑32.5k ↓120 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:10:29.178Z | qwen38 | TTFT N/A | TPS 17.2 tok/s | Latency 4.2s | ↑33.6k ↓72.0 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:10:55.309Z | qwen38 | TTFT 3.7s | TPS 11.0 tok/s | Latency 26.1s | ↑35.7k ↓247 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:11:00.906Z | qwen38 | TTFT N/A | TPS 35.1 tok/s | Latency 5.6s | ↑36.0k ↓196 ↓r0.0 | Cost $0.0000 | tool-calls
+2026-08-28T21:11:07.824Z | qwen38 | TTFT 3.0s | TPS 59.9 tok/s | Latency 6.9s | ↑36.5k ↓234 ↓r0.0 | Cost $0.0000 | tool-calls
