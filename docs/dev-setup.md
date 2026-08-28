@@ -90,7 +90,7 @@ These installs are **system-wide**. They will not fit in a venv.
    driver — that is fine and expected.
 
 3. Add **Intel’s APT repo** and install the **DPC++/C++ compiler**.
-   Verified on **Ubuntu 26.04 (resolute)**:
+   Verified on **Jupiter** (Ubuntu 26.04):
 
    ```bash
    # Intel GPG key. NOTE: the filename is UPPERCASE .PUB — the lowercase
