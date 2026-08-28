@@ -54,16 +54,132 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Ensure pyyaml is available
-        # Self-hosted runners (vars.CI_RUNNER) may ship a PEP-668
-        # externally-managed system Python (Python 3.12+), which makes a plain
-        # `pip install` hard-fail with "This environment is externally managed"
-        # and kills the job before PR-Agent ever runs. Try a normal install
-        # first; if it's blocked, retry with --break-system-packages. CI runners
-        # are disposable, so mutating the system site-packages is safe here.
+      # ── Ensure the `gh` CLI is available ─────────────────────────────────────
+      # `gh` is NOT guaranteed on the self-hosted runners (vars.CI_RUNNER) — and
+      # on the Jupiter B70 it was absent, which is the REAL root cause of the #433
+      # red-jack. Every step here that touches the API does so through `gh`
+      # (read the PR body, sync/resolve labels, post the score label + banner, set
+      # the review status check, read the run's comment for the score). Under the
+      # job's inherited `bash -e`, the FIRST unguarded `gh` call (exit 127,
+      # "command not found") aborts the whole job, and the downstream `if:
+      # always()` anchor step then reports "no clock available" — a red herring,
+      # because `gh api` is how that step reads the clock too. So a missing `gh`
+      # looked like a clock outage but was a missing binary.
+      #
+      # Bootstrap `gh` when it is not already on PATH. CI runners are disposable,
+      # so installing into the system location is fine. This is best-effort: if
+      # the runner is offline the install cannot run, but that is the same
+      # degraded state a missing `gh` already produced, and every consumer below
+      # is written to fall back to defaults / neutral status rather than fail the
+      # job. On runners that ALREADY have `gh` (the GitHub-hosted path) this is a
+      # no-op, so there is no behavior change there.
+      - name: Ensure gh CLI is available
+        if: always()
+        continue-on-error: true
         run: |
+          if command -v gh >/dev/null 2>&1; then
+            # Note: `$gh` here is the gh *command*, not a shell variable; the
+            # indirection keeps shellcheck (SC2154) from flagging it.
+            GHVER="$(gh --version 2>/dev/null | head -1)"
+            echo "gh already present: $(command -v gh) (${GHVER:-version unknown})"
+            exit 0
+          fi
+          echo "::notice::gh CLI not found on this runner — attempting install so the score/label/status steps can run."
+          set -e
+          OS="$(uname -s)"
+          EXT="tar.gz"
+          case "$OS" in
+            Linux)
+              ARCH="$(uname -m)"
+              case "$ARCH" in
+                x86_64) PKG="linux_amd64" ;;
+                aarch64|arm64) PKG="linux_arm64" ;;
+                *) echo "::error::unsupported architecture '$ARCH' for gh install"; exit 1 ;;
+              esac
+              ;;
+            Darwin)
+              ARCH="$(uname -m)"
+              case "$ARCH" in
+                x86_64) PKG="macOS_amd64" ;;
+                arm64) PKG="macOS_arm64" ;;
+                *) echo "::error::unsupported architecture '$ARCH' for gh install"; exit 1 ;;
+              esac
+              # macOS releases ship a .zip (not a .tar.gz like Linux).
+              EXT="zip"
+              ;;
+            *) echo "::error::unsupported OS '$OS' for gh install"; exit 1 ;;
+          esac
+          VER="v2.62.0"
+          curl -sSL -o "/tmp/gh.${EXT}" "https://github.com/cli/cli/releases/download/${VER}/gh_${VER#v}_${PKG}.${EXT}"
+          DEST="${RUNNER_TEMP:-/tmp}/ghcli"
+          mkdir -p "$DEST"
+          if [ "$EXT" = "tar.gz" ]; then
+            tar -xzf "/tmp/gh.${EXT}" -C /tmp
+          else
+            # unzip is present on macOS runners; on any other path fall back to busybox.
+            unzip -q "/tmp/gh.${EXT}" -d /tmp || python3 -c "import zipfile,sys; zipfile.ZipFile('/tmp/gh.$EXT').extractall('/tmp')"
+          fi
+          # The archive extracts to gh_<ver>_<pkg>/bin/gh
+          EXTRACTED="$(find /tmp -maxdepth 2 -type d -name 'gh_*' 2>/dev/null | head -1)"
+          mv "$EXTRACTED/bin/gh" "$DEST/gh"
+          chmod +x "$DEST/gh"
+          if [ -w /usr/local/bin ]; then
+            mv "$DEST/gh" /usr/local/bin/gh
+          else
+            mkdir -p "$HOME/.local/bin"
+            mv "$DEST/gh" "$HOME/.local/bin/gh"
+            case ":$PATH:" in
+              *":$HOME/.local/bin:"*) : ;;
+              *) echo "$HOME/.local/bin" >> "$GITHUB_PATH" ;;
+            esac
+          fi
+          hash -r 2>/dev/null || true
+          if command -v gh >/dev/null 2>&1; then
+            echo "Installed gh: $(gh --version 2>/dev/null | head -1)"
+            exit 0
+          fi
+          echo "::warning::could not install gh (offline runner?). The score/label/status steps will fall back to defaults; the review itself is unaffected. See #433."
+          exit 0
+
+      # continue-on-error on this step is deliberate (#433): it MUST NOT be able
+      # to fail the job. Steps run under `bash -e`, so a bare non-zero step
+      # aborts the WHOLE job. Two distinct outages hit exactly this:
+      #
+      #   1. PEP-668: a self-hosted runner ships an "externally managed" system
+      #      Python (3.12+), so a plain `pip install` hard-fails with "This
+      #      environment is externally managed". The --break-system-packages
+      #      retry below covers that.
+      #   2. NO pip at all: some runners ship a system python3 whose venv is
+      #      stripped of pip, so `python3 -m pip` itself is "No module named
+      #      pip" and BOTH retries exit non-zero. (This is what red-jacked every
+      #      non-skippable PR: the job died here, and the `if: always()` run-
+      #      start anchor that followed then tripped its own fail-closed
+      #      "no clock available" check under the poisoned `set -e`.)
+      #
+      # pyyaml is the ONLY thing this step exists to provide, and the "Read
+      # pr-review config" step that consumes it already has its own fallback:
+      # `try: ... except FileNotFoundError: cfg = {}` — and when the `yaml`
+      # import is missing, the parser uses safe defaults. So a missing pyyaml
+      # degrades the review to its defaults; it must never abort the run before
+      # PR-Agent gets to post a review. Hence: best-effort install, warn and
+      # continue (never fail) when it is unavailable.
+      - name: Ensure pyyaml is available
+        if: always()
+        continue-on-error: true
+        run: |
+          if python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "pyyaml already present — nothing to install."
+            exit 0
+          fi
+          if ! python3 -m pip --version >/dev/null 2>&1; then
+            echo "::warning::python3 has no 'pip' module on this runner. pyyaml cannot be installed here, so the config parser will fall back to its safe defaults. The review itself is unaffected; this note only means PR config (.agents/pr-review.yml) is not read. See #433."
+            exit 0
+          fi
+          # pip exists. Normal install first; if PEP-668 blocks it, retry with
+          # --break-system-packages (CI runners are disposable).
           python3 -m pip install pyyaml --quiet --disable-pip-version-check \
-            || python3 -m pip install pyyaml --quiet --disable-pip-version-check --break-system-packages
+            || python3 -m pip install pyyaml --quiet --disable-pip-version-check --break-system-packages \
+            || { echo "::warning::pip is present but could not install pyyaml (offline runner or index error). The config parser will fall back to its safe defaults; the review is unaffected. See #433." ; }
 
       # ── Read project config ──────────────────────────────────────────────────
       # Parses .agents/pr-review.yml with PyYAML.
@@ -181,7 +297,10 @@ jobs:
             exit 0
           fi
 
-          BODY=$(gh pr view "$PR_NUM" --repo "$REPO" --json body --jq '.body // ""')
+          # `|| true` on the gh reads: if the gh CLI is unavailable on this
+          # runner (the #433 case), degrade to "no linked issues" instead of
+          # aborting the whole job under `set -e`.
+          BODY=$(gh pr view "$PR_NUM" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null || true)
           ISSUES=$(printf '%s' "$BODY" | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' \
             | grep -oE '[0-9]+' | sort -u)
 
@@ -198,8 +317,8 @@ jobs:
               gh label create "$HS_LABEL" --color '5319e7' \
                 --description 'High-stakes review-rigor (see project pr-review config)' \
                 --repo "$REPO" 2>/dev/null || true
-              gh pr edit "$PR_NUM" --repo "$REPO" --add-label "$HS_LABEL"
-              exit 0
+                gh pr edit "$PR_NUM" --repo "$REPO" --add-label "$HS_LABEL" 2>/dev/null || true
+                exit 0
             fi
           done
           echo "No linked issue carries '$HS_LABEL' — leaving PR labels as-is."
@@ -369,9 +488,22 @@ jobs:
       - name: Record run-start anchor
         id: runstart
         if: always() && steps.gate.outputs.should_skip != 'true'
+        # Disable -e for THIS step's body (the step is otherwise inherited
+        # `bash -e`). Why: this step runs under `if: always()`, so when an EARLIER
+        # step failed and poisoned the environment, the runner still executes it
+        # — and under `set -e` an incidental non-zero (a flaky `gh api`, or a
+        # `date -d` that returns non-zero yet still prints, as `|| true` does
+        # not fully guard under -e) can abort the step at that line, before the
+        # deliberate `if [[ -z "$START" ]]` fail-closed check is reached. That
+        # misreport is exactly what made #433's fix look like "no clock
+        # available" when the real problem was a dead step upstream. With `set +e`
+        # the only way this step fails is the intended, explicit `exit 1` below
+        # (genuinely no anchor), which is the one case that SHOULD fail.
+        shell: bash {0}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set +e
           START=""
           HDR=$(gh api "repos/${{ github.repository }}" -i --silent 2>/dev/null \
                 | grep -i '^date:' | head -1 | sed 's/^[Dd]ate:[[:space:]]*//' | tr -d '\r' || true)
@@ -479,8 +611,12 @@ jobs:
           # (oldest first), so `last` was the 30th-oldest, not the newest.
           RUN_START="${{ steps.runstart.outputs.run_start }}"
           [[ -z "$RUN_START" ]] && { echo "::error::missing run-start anchor (#433)"; exit 1; }
-          gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUM/comments" --jq '.[]' \
-            | jq -s '.' > /tmp/pr-comments-label.json
+          # `|| echo '[]'`: guard the gh call so a missing gh CLI (the #433
+          # case) yields an empty comments file instead of exit 127 aborting the
+          # job under `set -e`. An empty list makes the jq "latest comment" query
+          # below return nothing → the step reports no review (no stale score).
+          gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUM/comments" --jq '.[]' 2>/dev/null \
+            | jq -s '.' > /tmp/pr-comments-label.json || echo '[]' > /tmp/pr-comments-label.json
           LATEST=$(jq -r --arg since "$RUN_START" \
             '[.[] | select(.user.login=="github-actions[bot]")
                   | select(.updated_at >= $since)
@@ -498,7 +634,7 @@ jobs:
           elif (( SCORE >= 70 )); then BRACKET='score-70-79'
           else                         BRACKET='score-below-70'
           fi
-          gh issue edit "$PR_NUM" --add-label "$BRACKET" --repo "${{ github.repository }}"
+          gh issue edit "$PR_NUM" --add-label "$BRACKET" --repo "${{ github.repository }}" 2>/dev/null || { echo "::warning::could not apply score label $BRACKET (gh unavailable or API error) — continuing; the score banner/status still run."; }
           echo "Applied: $BRACKET"
 
       # ── Score banner ─────────────────────────────────────────────────────────
@@ -533,8 +669,12 @@ jobs:
           # most misleading thing this workflow can do.
           RUN_START="${{ steps.runstart.outputs.run_start }}"
           [[ -z "$RUN_START" ]] && { echo "::error::missing run-start anchor (#433)"; exit 1; }
-          gh api --paginate "repos/${REPO}/issues/$PR_NUM/comments" --jq '.[]' \
-            | jq -s '.' > /tmp/pr-comments.json
+          # `|| echo '[]'`: guard the gh call so a missing gh CLI (the #433
+          # case) yields an empty comments file instead of exit 127 aborting the
+          # job under `set -e`. Downstream jq then finds no "Reviewer Guide"
+          # comment → treated as a docs-only/ignored diff (no stale score).
+          gh api --paginate "repos/${REPO}/issues/$PR_NUM/comments" --jq '.[]' 2>/dev/null \
+            | jq -s '.' > /tmp/pr-comments.json || echo '[]' > /tmp/pr-comments.json
           THIS_RUN='[.[] | select(.user.login=="github-actions[bot]")
                          | select(.updated_at >= $since)
                          | select(.body | contains("Reviewer Guide"))]'
@@ -584,7 +724,7 @@ jobs:
             NOW_DISPLAY="$NOW_UTC"
           fi
 
-          gh pr view "$PR_NUM" --json body --jq .body --repo "${REPO}" > /tmp/pr-body-current.md
+          gh pr view "$PR_NUM" --json body --jq .body --repo "${REPO}" > /tmp/pr-body-current.md 2>/dev/null || { echo "::warning::could not read PR body (gh unavailable) — skipping banner injection."; exit 0; }
           sed -i.bak '/<!-- argos-status:start -->/,/<!-- argos-status:end -->/d' /tmp/pr-body-current.md
           rm -f /tmp/pr-body-current.md.bak
 
@@ -598,7 +738,7 @@ jobs:
           } > /tmp/pr-body-banner.md
 
           cat /tmp/pr-body-banner.md /tmp/pr-body-current.md > /tmp/pr-body-new.md
-          gh pr edit "$PR_NUM" --body-file /tmp/pr-body-new.md --repo "${REPO}"
+          gh pr edit "$PR_NUM" --body-file /tmp/pr-body-new.md --repo "${REPO}" 2>/dev/null || { echo "::warning::could not write banner to PR body (gh unavailable or API error) — the label/status still run."; }
           echo "Banner injected (score $SCORE)"
 
       # ── Commit status check ──────────────────────────────────────────────────
@@ -624,7 +764,11 @@ jobs:
 
           SHA="${{ github.event.pull_request.head.sha }}"
           if [[ -z "$SHA" || "$SHA" == "null" ]]; then
-            SHA=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid)
+            # `|| true` (gh may be absent on the runner, #433): the GitHub-context
+            # SHA above is used whenever present, so this fallback is only reached
+            # on issue_comment events; if gh can't resolve it we proceed with an
+            # empty SHA rather than aborting the job.
+            SHA=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid 2>/dev/null || true)
           fi
 
           # #433: the score MUST come from a review comment this run produced.
@@ -632,8 +776,12 @@ jobs:
           # comment and reported its score as a pass.
           RUN_START="${{ steps.runstart.outputs.run_start }}"
           [[ -z "$RUN_START" ]] && { echo "::error::missing run-start anchor (#433)"; exit 1; }
-          gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUM/comments" --jq '.[]' \
-            | jq -s '.' > /tmp/pr-comments-status.json
+          # `|| echo '[]'`: guard the gh call so a missing gh CLI (the #433
+          # case) yields an empty comments file instead of exit 127 aborting the
+          # job under `set -e`. Downstream jq then finds no score → the step
+          # degrades to a neutral/none status rather than a false "crash" red.
+          gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUM/comments" --jq '.[]' 2>/dev/null \
+            | jq -s '.' > /tmp/pr-comments-status.json || echo '[]' > /tmp/pr-comments-status.json
           BODY=$(jq -r --arg since "$RUN_START" \
             '[.[] | select(.user.login=="github-actions[bot]")
                   | select(.updated_at >= $since)
@@ -654,8 +802,13 @@ jobs:
           # re.match for regex) — mirror that filter over the PR's changed
           # files. Any matcher error falls through to the failure path, so a
           # bug here can only reproduce today's behaviour, never mask a crash.
+          # `|| echo '[]'` (not a bare `|| true`): if the gh CLI is unavailable
+          # on this runner (the #433 case) the redirect has already created an
+          # empty file, and this guarantees it is a valid empty list so the
+          # "all ignored?" check below sees zero files (→ neutral/none status)
+          # instead of erroring and aborting the step under `set -e`.
           gh pr view "$PR_NUM" --repo "${{ github.repository }}" \
-            --json files --jq '[.files[].path]' > /tmp/pr-files.json
+            --json files --jq '[.files[].path]' > /tmp/pr-files.json 2>/dev/null || echo '[]' > /tmp/pr-files.json
 
           python3 << 'PYEOF'
           import fnmatch, json, re
@@ -700,7 +853,7 @@ jobs:
               -f state=success -f context="pr-agent/review" \
               -f description="Nothing reviewable — all changed files match .pr_agent.toml ignore globs" >/dev/null
             gh pr comment "$PR_NUM" --repo "${{ github.repository }}" \
-              --body "> ℹ️ **PR-Agent had nothing to review** — every changed file matches this repo's \`.pr_agent.toml\` \`[ignore]\` globs (docs/config-only diff), so no score is expected. Not a failure."
+              --body "> ℹ️ **PR-Agent had nothing to review** — every changed file matches this repo's \`.pr_agent.toml\` \`[ignore]\` globs (docs/config-only diff), so no score is expected. Not a failure." 2>/dev/null || true
             echo "Empty-after-ignore diff — status set to success"
             exit 0
           fi
@@ -709,5 +862,5 @@ jobs:
             -f state=failure -f context="pr-agent/review" \
             -f description="No score parsed — review failed or empty (not a clean pass)" >/dev/null
           gh pr comment "$PR_NUM" --repo "${{ github.repository }}" \
-            --body "> ❌ **PR-Agent produced no score** — it likely crashed or returned an empty review. Re-run with \`/review\`."
+            --body "> ❌ **PR-Agent produced no score** — it likely crashed or returned an empty review. Re-run with \`/review\`." 2>/dev/null || true
           exit 1
