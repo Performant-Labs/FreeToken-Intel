@@ -52,8 +52,17 @@ jobs:
           # it explicitly -- the pin must live in the workflow file, not be
           # inherited from the upstream script's `version="..."` default, which
           # someone upstream could bump.
-          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          ./actionlint .github/workflows/*.yml
+           bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+           # -config-file names the config EXPLICITLY. actionlint's default
+           # config filename is actionlint.yaml (NOT .yml) -- the config used to
+           # live at .github/actionlint.yml, so actionlint silently ignored it
+           # and the SC2016 suppression below never applied. (Harmless while the
+           # gate stayed green, but a silent "the config isn't loaded" state --
+           # the same drift class the playbook's retired `CI_RUNNER ||` bug was.)
+           # Naming the file here makes the dependency visible in this file
+           # instead of relying on a default, so a future config rename is a
+           # one-line, visible change rather than a silent no-op.
+           ./actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml
 
   secret-scan:
     name: Secret scan (gitleaks)
