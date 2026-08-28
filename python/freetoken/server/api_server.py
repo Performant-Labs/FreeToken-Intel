@@ -15,6 +15,7 @@ import logging
 
 from fastapi import FastAPI
 
+from freetoken.version import __version__
 from freetoken.server.args import ServerArgs
 from freetoken.server.openai_api import register_openai_routes
 
@@ -28,10 +29,13 @@ def create_app(server_args: ServerArgs, engine_holder) -> FastAPI:
     (raising ``NotYetImplemented`` while the loader/engine are still stubs).
     It is stored on ``app.state`` and invoked by the routes per request.
     """
+    # The version is imported, never re-declared: freetoken/version.py is the
+    # single source of truth (enforced by the conformance job in ci.yml -- a
+    # second literal version here would drift and fail the build).
     app = FastAPI(
         title="FreeToken-Intel",
         description="Edge-native MoE serving on Intel Arc Pro B70",
-        version="0.0.0",
+        version=__version__,
     )
     app.state.server_args = server_args
     app.state.engine_holder = engine_holder

@@ -232,6 +232,143 @@ jobs:
           path: ${{ runner.temp }}/gitleaks-report.json
           retention-days: 14
 
+  conformance:
+    name: Conformance (CUDA->SYCL + version singularity)
+    # The port's invariants, checked at the text level on every PR for
+    # free (#46). Three checks, all pure bash+git+grep -- no pip, no
+    # Node, no toolchain -- so the job is cheap and fork-safe. It runs on
+    # ubuntu-latest for the same reason as every other ci.yml job (public
+    # repo: a fork PR must never execute on owned hardware), and it
+    # deliberately needs no identity guard (nothing here runs on the
+    # fleet). It is independent of secret-scan and ci, so a conformance
+    # violation fails the PR fast without waiting for the heavy test job.
+    #
+    # WHY grep (not a compiler): a full `icpx -fsycl` compile of the
+    # kernel sources is the strongest form of the SYCL rule but needs the
+    # oneAPI toolchain, which lives on the B70 fleet and is not a public
+    # hosted image. The greps catch the invariant at the text level where
+    # it can be checked per-PR for free; the nightly's real compile
+    # (xpu.yml) is the backstop for what a grep cannot see.
+    #
+    # The annotation emitter percent-escapes every PR-controlled value
+    # (a crafted filename) before it reaches a ::error:: line, so a
+    # malicious path can't forge a workflow command in the log. Same
+    # escape_cmd/fail/ok shape as the playbook's conformance job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Conformance
+        run: |
+          set -euo pipefail
+
+          # Percent-escape a (possibly PR-controlled) string before
+          # interpolating it into a workflow annotation: a crafted
+          # filename could otherwise forge a workflow command in the log.
+          escape_cmd() { printf '%s' "$1" | sed 's/:/\\:/g; s/%/\\%/g; s/\r/\\r/g; s/\n/\\n/g'; }
+          ok() { printf 'ok %s\n' "$1"; }
+          fail() {
+            local msg
+            msg="$(escape_cmd "$1")"
+            printf '::error::conformance: %s\n' "$msg"
+            printf 'FAIL %s\n' "$1"
+            exit 1
+          }
+
+          VERSION_FILE="python/freetoken/version.py"
+          [ -f "$VERSION_FILE" ] || fail "version source '$VERSION_FILE' not found at repo root."
+
+          # Files that may legitimately declare their OWN version literal
+          # (and are therefore exempt from the singularity scan below). The
+          # check targets the single freetoken package version in
+          # $VERSION_FILE; a SEPARATE distributable that ships its own
+          # independent version is not drift from it. Keep this list minimal
+          # and deliberate -- adding an entry is a decision this job exists
+          # to police, not a way to hide drift in the main package.
+          VERSION_ALLOWLIST="
+          freetoken-kernel-cache/freetoken_kernel_cache/__init__.py
+          freetoken-kernel-cache/pyproject.toml
+          "
+
+          # --- Rule 1: SYCL extension rule -------------------------------
+          # Every file under the C++ source root that #includes
+          # <sycl/sycl.hpp> must also reference the sycl_ext:: extension
+          # namespace, unless allowlisted. A file that includes the SYCL
+          # header but uses no sycl_ext:: is the exact drift the "never
+          # compile against a fake SYCL" rule exists to catch. The
+          # allowlist (one path per line, '#' comments) is for files that
+          # legitimately use only the standard SYCL API.
+          C_SRC_ROOT="python/freetoken/kernel/csrc"
+          ALLOWLIST=".github/ci-conformance-allowlist"
+          if [ ! -d "$C_SRC_ROOT" ]; then
+            ok "no '$C_SRC_ROOT' directory -- SYCL rule is vacuously satisfied."
+          else
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              if [ -f "$ALLOWLIST" ] && grep -Fqx "$f" "$ALLOWLIST" 2>/dev/null; then
+                ok "allowlisted (standard SYCL only): $f"
+                continue
+              fi
+              if ! grep -q 'sycl_ext::' "$f"; then
+                fail "'$f' includes <sycl/sycl.hpp> but uses no sycl_ext:: extension -- it would compile against a fake/host SYCL and silently stop binding the XPU extensions. Either use sycl_ext:: (e.g. sycl_ext::make_kernel) or add the file to $ALLOWLIST if it legitimately uses only the standard SYCL API."
+              fi
+            done < <(grep -rl '#include <sycl/sycl.hpp>' "$C_SRC_ROOT" 2>/dev/null || true)
+            ok "SYCL extension rule: every sycl.hpp includer uses sycl_ext:: (or is allowlisted)."
+          fi
+
+          # --- Rule 2: no CUDA backdoors ---------------------------------
+          # The project's premise is CUDA -> SYCL. A stray CUDA include or
+          # build invocation in a source file is a premise violation, not a
+          # style issue. Scoped to code extensions: docs reference CUDA by
+          # name (the CUDA->Intel map in docs/architecture.md), which is
+          # legitimate and must not trip the gate. (venvs are gitignored and
+          # never in a CI checkout, so no venv exclusion is needed here.)
+          CUDA_MATCHES="$(git grep -lI -E '#include <cuda|cublas|cub/|nvcc' \
+            -- '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' '*.hxx' '*.cu' '*.cuh' \
+               '*.py' '*.toml' '*.cfg' 2>/dev/null || true)"
+          if [ -n "$CUDA_MATCHES" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              fail "CUDA backdoor: '$f' contains a CUDA include/invocation (#include <cuda*>, cublas, cub/, or nvcc) -- the premise is CUDA->SYCL; a stray CUDA reference in source is a premise violation. (Docs referencing CUDA by name are out of scope; this is a code file.)"
+            done <<< "$CUDA_MATCHES"
+          fi
+          ok "no-CUDA rule: no CUDA includes/invocations in any source file."
+
+          # --- Rule 3: version-source singularity ------------------------
+          # $VERSION_FILE is the ONLY place a literal freetoken version is
+          # declared; pyproject.toml keeps dynamic=["version"] pointing at
+          # it. A second __version__ that can drift from the first is
+          # exactly the two-sources-of-truth the playbook's
+          # release-conformance exists to prevent.
+          grep -qE 'dynamic\s*=\s*\[.*version.*\]' pyproject.toml \
+            || fail "pyproject.toml must keep dynamic = [\"version\"] (it currently does not -- the version source would drift silently)."
+
+          # Scan tracked, non-binary source files for a version literal
+          # declared as an __version__ assignment -- the thing that
+          # actually drifts. A broad "[0-9]+.[0-9]+.[0-9]+" pattern would
+          # false-positive on IP addresses (127.0.0.1) and port strings all
+          # over the codebase, and a toml "version=" match would flag the
+          # root pyproject's own dynamic version={attr=...} reference (the
+          # mechanism that points at the source, not a literal). So the
+          # check targets __version__ declarations only. Generated
+          # artifacts (*.egg-info) are not git-tracked, so git grep never
+          # sees them.
+          HITS="$(git grep -nI -E '__version__[[:space:]]*=' \
+            -- '*.py' 2>/dev/null || true)"
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            f="${line%%:*}"
+            [ "$f" = "$VERSION_FILE" ] && continue
+            if grep -Fqx "$f" <<< "$VERSION_ALLOWLIST"; then
+              ok "version allowlisted (separate distributable): $f"
+              continue
+            fi
+            fail "version singularity: '$f' declares __version__ beside $VERSION_FILE (the single freetoken version source). Import it from freetoken.version instead, or -- only if this file is a separate distributable that owns its own independent version -- add it to the job's VERSION_ALLOWLIST."
+          done <<< "$HITS"
+          ok "version singularity: $VERSION_FILE is the only literal version source."
+
+          echo "CONFORMANCE: all checks passed"
+
   ci:
     name: Typecheck, test, and CLI smoke (CPU)
     # The main per-PR job. Runs on GitHub-hosted ubuntu-latest -- NOT the

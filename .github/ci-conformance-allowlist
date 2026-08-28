@@ -1,0 +1,13 @@
+# Conformance allowlist (see docs/ci.md, "The SYCL conformance rule").
+#
+# One file path per line, relative to the repo root. '#' starts a comment.
+# A path here means: "this file #includes <sycl/sycl.hpp> but deliberately uses
+# only the standard SYCL API (no sycl_ext::), so the SYCL extension rule skips
+# it." Every entry must be a file that genuinely needs standard-only SYCL -- a
+# file that SHOULD use sycl_ext:: and is listed here to dodge the check is
+# exactly the drift the rule exists to catch. If a file is listed here and the
+# kernel-sycl work makes it use sycl_ext::, remove it from this list in the same
+# PR.
+#
+# (The version-singularity rule's allowlist is separate: it is the inline list
+# in the conformance job in .github/workflows/ci.yml.)
