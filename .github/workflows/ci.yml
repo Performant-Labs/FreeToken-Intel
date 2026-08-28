@@ -33,9 +33,16 @@ jobs:
     # failure class as the playbook's "drift announces itself" rule. The job
     # has NO `needs:` and is the first job, so a broken workflow file fails
     # fast and cheap before any install/compile/test step runs.
+    # Every `uses:` in this workflow is pinned to a full commit SHA (not a
+    # floating tag) with a trailing `# vN` comment naming the release the SHA
+    # is. Rule: bump pins DELIBERATELY, one PR per action, never implicitly --
+    # an unpinned tag is the same failure class as the playbook's retired
+    # `CI_RUNNER || 'ubuntu-latest'` bug: a silent, invisible behavior change
+    # (a new action release could change checkout or upload semantics under a
+    # green-looking run). docs/ci.md states this rule.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Lint workflow files (actionlint, pinned)
         run: |
           # Pin BOTH the download script (v1.7.12 tag, not a floating `main`)
@@ -74,7 +81,7 @@ jobs:
     # repo has no op.env.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           # pull_request's default ref is the synthetic merge commit -- fetch
@@ -219,7 +226,7 @@ jobs:
       - name: Upload gitleaks report
         if: always() && steps.gitleaks.outputs.leaks == 'true'
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gitleaks-report-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gitleaks-report.json
@@ -234,6 +241,13 @@ jobs:
     #      job. It must never execute on owned hardware, and the org CI_RUNNER
     #      variable is a private-org mechanism that does not apply here.
     #      (pre-flight and secret-scan above are on the same footing.)
+    #
+    #      Because ALL jobs in this workflow are on ubuntu-latest, a fork PR
+    #      never reaches owned hardware -- and so this workflow deliberately
+    #      carries NO `github.repository == ...` identity guard. Contrast
+    #      xpu.yml, whose build job runs on the fleet and therefore guards
+    #      every job on repo identity. Adding a guard here would be dead
+    #      weight; omitting one where it matters would be a fleet exposure.
     #
     #   2. The dual-venv contract. This job builds the CPU `.venv` -- which by
     #      the project's load-bearing separation must NEVER contain torch.
@@ -257,10 +271,10 @@ jobs:
     # the torch path is verified on a trusted, main-only schedule instead.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
 
@@ -333,7 +347,7 @@ jobs:
       - name: Upload CTRF test report
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ctrf-reports
           path: ctrf/

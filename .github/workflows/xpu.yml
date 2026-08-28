@@ -1,0 +1,215 @@
+name: xpu-nightly
+
+on:
+  schedule:
+    # 02:30 UTC -- off-peak for the Helsinki runner and for the human's work
+    # hours. A nightly, by definition, runs on the default branch only.
+    - cron: "30 2 * * *"
+  # Manual re-run, e.g. to re-test after a fleet/runner change or to force a
+  # run at a HEAD the check job would otherwise skip. `force: true` bypasses
+  # the stamp check (upstream parity, see the check job below).
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if this commit is already green on this branch"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Serialize runs: there is at most ONE B70 fleet runner and two runs must
+# never share it (a concurrent second run would interleave its steps on the
+# same machine). Parity with upstream FreeToken's nightly-wheels concurrency
+# (group on the workflow, NO cancel-in-progress). Note: this workflow has no
+# pull_request trigger, so `github.ref` is always refs/heads/<branch> here.
+concurrency:
+  group: xpu-nightly-${{ github.ref }}
+
+jobs:
+  # Decide whether HEAD needs a B70 run at all. Runs on a hosted runner so a
+  # no-op night costs nothing and never touches the (scarce) fleet.
+  #
+  # Fork-proofing: this job (and every other job in this workflow) carries an
+  # explicit repo-identity guard. Unlike the ci.yml jobs -- which run on
+  # ubuntu-latest, so a fork's code never executes on owned hardware and needs
+  # no guard (that is why ci.yml has none) -- the build job below runs on the
+  # self-hosted B70 fleet. A fork PR/dispatch must never reach it, and the
+  # org CI_RUNNER variable is a private-org mechanism that a fork does not see
+  # in the first place. The explicit guard is the belt to that suspenders: it
+  # makes the exposure visible in the file and survives an org transfer.
+  check:
+    if: github.repository == 'Performant-Labs/FreeToken-Intel'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Compare HEAD against the last green xpu-nightly run
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          # The gh CLI ships on ubuntu-latest and reads GH_TOKEN. The API lists
+          # runs newest-first, so the first one IS the last green run.
+          last_green_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?workflow=xpu.yml&status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
+          if [ "$FORCE" = "true" ]; then
+            echo "force=true -- bypassing the stamp check."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$last_green_sha" ] && [ "$GITHUB_SHA" = "$last_green_sha" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "already green at $GITHUB_SHA on ${GITHUB_REF} -- skipping; a no-op night must not touch the B70."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "last green xpu-nightly run: ${last_green_sha:-<none>}; this HEAD ($GITHUB_SHA) is untested on the B70."
+          fi
+
+  build:
+    needs: check
+    # Belt (the two lines above) and suspenders (this line) both gate the fleet:
+    # the check's repo-identity guard means a fork's run never gets a `true`,
+    # and the org CI_RUNNER variable is invisible to forks, so runs-on would be
+    # empty for them anyway. Neither mechanism depends on the other.
+    if: >
+      github.repository == 'Performant-Labs/FreeToken-Intel' &&
+      needs.check.outputs.build == 'true'
+    # The XPU fleet. NO `|| 'ubuntu-latest'` fallback -- the playbook's original
+    # `||` was a bug it has since retired (a repo that couldn't see the org
+    # variable silently ran on GitHub-hosted and stayed green; 15 of 21 repos
+    # were doing exactly that, invisibly). A missing/stale variable now yields
+    # an empty runs-on and the job fails immediately, so drift announces
+    # itself instead of being discovered months later. The CI_RUNNER variable
+    # is org-wide and visible to all repos, so it resolves here to
+    # self-hosted-linux (the Uranus fleet, which carries the B70).
+    runs-on: ${{ vars.CI_RUNNER }}
+    timeout-minutes: 60
+    steps:
+      # HARD XPU-presence guard, run FIRST (before checkout): The whole point
+      # of this nightly is torch-on-B70; if the runner we landed on has no
+      # XPU (fleet drift, a new runner image without the ICD, CI_RUNNER
+      # re-pointed at a wrong label) the venv contract below would fail
+      # opaquely and the CTRF artifact would be a wall of collection errors.
+      # Fail loudly and EARLY, in the step whose name says what happened, with
+      # a diagnostic that tells the on-call exactly which of the four causes it
+      # is. (sycl-ls is on PATH once oneAPI's setvars.sh is sourced; the fleet
+      # runner sources it at image build. If it is NOT on PATH here, that is
+      # itself fleet drift -- oneAPI is missing or un-sourced -- and fails the
+      # same way.)
+      - name: "Guard: this runner must have a real XPU"
+        id: sycl-ls-result
+        run: |
+          if ! command -v sycl-ls >/dev/null 2>&1; then
+            echo "::error::xpu-nightly: 'sycl-ls' is not on PATH on this runner. oneAPI is missing or its setvars.sh was not sourced at image build. The XPU nightly must NEVER run on a GPU-less box -- that is the exact drift this workflow exists to catch. Fix the runner image (re-point CI_RUNNER at a labeled B70 runner, or restore the ICD/oneAPI in the image)."
+            exit 1
+          fi
+          sycl-ls || { echo "::error::xpu-nightly: sycl-ls ran but found no Level Zero device -- the GPU ICD is not loaded on this host."; exit 1; }
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          echo "XPU present:"
+          sycl-ls
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Source the B70 pin (ONEAPI_DEVICE_SELECTOR=level_zero:0) + the oneAPI
+      # environment, exactly as a developer would (docs/dev-setup.md). This is
+      # what puts sycl-ls/icpx on PATH and pins the device index if an AMD iGPU
+      # shadows the Battlemage. It MUST come before the venv is activated so the
+      # venv's python resolves the XPU runtime.
+      #
+      # Persist the oneAPI/XPU environment across steps (each step is a fresh
+      # shell, so the sourced values are lost unless exported to the runner's
+      # per-step env file). CRITICAL: persist only the specific variables the
+      # XPU runtime needs (ONEAPI_*, LD_LIBRARY_PATH, PATH), NOT a blanket
+      # `env >> $GITHUB_ENV`. The oneAPI setvars.sh leaves shell FUNCTION
+      # definitions (ps4, printenv4, etc.) in the environment, and a blanket
+      # dump would write malformed `name() {...}` fragments into the env file --
+      # which the runner re-sources as `export` lines and chokes on, corrupting
+      # every subsequent step. (GITHUB_ENV is a special variable, so it is
+      # excluded by the same prefix filter.)
+      - name: Source oneAPI / XPU environment
+        run: |
+          set -a
+          . ./setvars-xpu.sh
+          set +a
+          env | grep -E '^(ONEAPI|LD_LIBRARY_PATH|PATH)=' >> "$GITHUB_ENV"
+
+      # The dual-venv contract says torch lives ONLY in .venv-xpu. The CPU CI
+      # job (ci.yml) enforces the install-side half with a hard "import torch
+      # must FAIL" guard on the CPU venv; THIS job is the other half -- the
+      # venv where torch is ALLOWED and required. The venv is expected to be
+      # pre-baked into the fleet runner image (docs/dev-setup.md step 6); if
+      # it is NOT yet baked (the image predates the XPU setup), we build it
+      # here from the documented 6-step sequence instead of failing the whole
+      # nightly -- the ephemeral containers mean the build does not persist,
+      # so it is a per-night cost until the image bakes the venv (the right
+      # end state; bake it into the pl-runner image and this branch becomes
+      # dead). If the venv is absent AND the build fails (no network to the
+      # XPU index, a broken wheel tag), the step fails loudly: that is real
+      # drift, not a "skip the torch tests" situation.
+      - name: "venv contract: .venv-xpu exists and has torch with an available XPU"
+        run: |
+          if [ ! -x .venv-xpu/bin/python ]; then
+            echo ".venv-xpu is not baked into this runner image -- building it (docs/dev-setup.md step 6)."
+            python3.11 -m venv .venv-xpu
+            # shellcheck disable=SC1091
+            . ./.venv-xpu/bin/activate
+            python -m pip install -U pip
+            python -m pip install -e ".[dev]"
+            # The XPU wheel's metadata pulls nvidia-* CUDA packages on a plain
+            # resolve, which must not land on a B70 box -- hence --no-deps and
+            # the explicit Intel-side deps below (docs/dev-setup.md).
+            python -m pip install --no-deps torch==2.13.0 \
+              --index-url https://download.pytorch.org/whl/xpu
+            python -m pip install \
+              oneccl==2022.0.0 oneccl-devel==2022.0.0 tbb==2023.0.0 \
+              umf==1.1.0 pyzes==0.1.1 tcmlib==1.5.0 triton-xpu==3.7.2 \
+              --index-url https://download.pytorch.org/whl/xpu
+            python -m pip install "sympy>=1.13.3"
+            python -m pip install \
+              onemkl-license==2026.0.0 onemkl-sycl-blas==2026.0.0 \
+              onemkl-sycl-dft==2026.0.0 onemkl-sycl-lapack==2026.0.0 \
+              onemkl-sycl-rng==2026.0.0 onemkl-sycl-sparse==2026.0.0 \
+              jinja2 networkx
+            python -m pip install --force-reinstall --no-deps \
+              intel-cmplr-lib-rt==2026.0.0 intel-cmplr-lib-ur==2026.0.0 \
+              intel-cmplr-lic-rt==2026.0.0 intel-sycl-rt==2026.0.0 \
+              intel-opencl-rt==2026.0.0 intel-openmp==2026.0.0 \
+              dpcpp-cpp-rt==2026.0.0 intel-pti==0.17.0
+          fi
+          . ./.venv-xpu/bin/activate
+          python -c "import torch; print('torch', torch.__version__); assert torch.xpu.is_available(), 'torch.xpu.is_available() is False -- the B70 ICD/oneAPI is not visible to this torch build (driver/ICD problem, not pip)'; print('XPU visible:', torch.xpu.device_count(), 'device(s)')"
+          echo "OK: .venv-xpu has torch with a live XPU (contract holds)."
+
+      # The actual nightly payload: the xpu-marked suite. The conftest.py
+      # policy deselects xpu-marked tests only when torch is ABSENT -- here
+      # torch is present, so `-m xpu` runs exactly the XPU-marked tests (the
+      # B70 path that the CPU CI job deliberately skips). The CTRF reporter
+      # writes the machine-readable result for the artifact below. If no tests
+      # carry the xpu marker yet (today's state, pre-#30), the run is a clean
+      # 0-test pass that still proves the venv+driver+GPU path is alive -- the
+      # venv-contract guard above is what makes that pass meaningful.
+      - name: XPU test suite
+        run: |
+          . ./.venv-xpu/bin/activate
+          python -m pip install -q pytest-json-ctrf
+          pytest -m xpu -v --ctrf ctrf/pytest-ctrf.json
+
+      # CTRF artifact. The ONLY continue-on-error in this workflow: an upload
+      # failure (network blip on the fleet) must never turn a red test run into
+      # a confusing third state. if: always() so a failing run still uploads its
+      # report (that is when the report is most needed). 30-day retention,
+      # parity with ci.yml. Name includes run id + attempt so a rerun cannot
+      # collide with the prior attempt's artifact.
+      - name: Upload CTRF test report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: xpu-ctrf-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ctrf/
+          retention-days: 30
+          if-no-files-found: ignore
