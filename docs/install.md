@@ -20,13 +20,37 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
 
-Install a **PyTorch XPU** wheel from Intel/PyTorch's XPU index (version pins
-live in later `device-layer` work). Then:
+Install a **PyTorch XPU** wheel into `.venv-xpu` from Intel's XPU index. The
+verified pins (Jupiter, Ubuntu 26.04, oneAPI 2026.1.1):
+
+| Piece | Pin | Why |
+| --- | --- | --- |
+| oneAPI DPC++ compiler | `intel-oneapi-compiler-dpcpp-cpp` **2026.1.1** | builds SYCL; `icpx` on PATH after `setvars.sh` |
+| PyTorch XPU wheel | `torch==2.13.0+xpu` from `https://download.pytorch.org/whl/xpu` | the wheel that makes `torch.xpu.is_available()` True |
+| Triton (Intel) | `triton==3.7.2` | Triton-Intel backend for the kernels |
 
 ```bash
+python3.11 -m venv .venv-xpu && source .venv-xpu/bin/activate
+pip install -U pip
+pip install -e ".[dev]"
+pip install torch --index-url https://download.pytorch.org/whl/xpu
+```
+
+Then verify the device layer (the goal of the `device-layer` issue):
+
+```bash
+source /opt/intel/oneapi/setvars.sh
 ft --version
 ft device
+# expect: torch.xpu available: True, device 0 name: Intel(R) Graphics,
+#         xe2/battlemage: True, Level Zero driver: 1.14, VRAM: 32 GB
 ```
+
+`ft device` now reads the **Level Zero driver** version (the Intel equivalent of
+upstream's CUDA UMD version) and the GPU's **total VRAM** straight from the
+device, rather than printing a fixed spec. On a CPU-only box the same command
+still runs and reports `torch.xpu available: False` with a `Level Zero driver:
+(not exposed)` line — it never crashes.
 
 ## Method 2: from PyPI
 
