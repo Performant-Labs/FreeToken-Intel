@@ -307,11 +307,18 @@ jobs:
       # the drift this check exists to catch, and `|| true` made it invisible.
       # A runner that somehow has a GPU is a fleet misconfiguration -- let it
       # fail loudly instead of silently passing.
+      #
+      # The assertion reads the tee'd file with a plain `grep` (NO pipe): the
+      # `ft device | tee` pipeline above is kept for human log visibility only.
+      # A `pipefail` + `grep -q` on the same pipe is a latent false-negative --
+      # grep -q exits 0 the moment it finds the match, but the upstream
+      # producer can then die on SIGPIPE, and with pipefail the pipeline's
+      # exit status becomes that producer's non-zero, not grep's 0. So the
+      # pass/fail decision must come from a separate, pipe-free grep.
       - name: CLI smoke
         run: |
           ft --version
           ft --help
-          set -o pipefail
           ft device | tee device.out
           grep -q "xpu available: False" device.out \
             || { echo "::error::ft device did not report 'xpu available: False' on a GPU-less runner -- either the runner unexpectedly has a GPU (fleet misconfiguration) or the device-detection drift this check guards against has regressed."; cat device.out; exit 1; }
