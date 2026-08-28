@@ -39,6 +39,7 @@ dependencies = [
     "tqdm>=4.66,<5",
     "transformers>=4.45,<6",
     "uvicorn>=0.30,<1",
+    "torch",
 ]
 
 [project.urls]
