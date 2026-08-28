@@ -42,7 +42,7 @@ jobs:
     # green-looking run). docs/ci.md states this rule.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@f49d1e467b517968b485431294bb39bd33f6256c # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Lint workflow files (actionlint, pinned)
         run: |
           # Pin BOTH the download script (v1.7.12 tag, not a floating `main`)
@@ -81,7 +81,7 @@ jobs:
     # repo has no op.env.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@f49d1e467b517968b485431294bb39bd33f6256c # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           # pull_request's default ref is the synthetic merge commit -- fetch
@@ -271,10 +271,10 @@ jobs:
     # the torch path is verified on a trusted, main-only schedule instead.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@f49d1e467b517968b485431294bb39bd33f6256c # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Python 3.11
-        uses: actions/setup-python@2466a935960f7dc705963504bc06a51a1caedc3e # v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
 
