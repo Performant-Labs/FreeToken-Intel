@@ -225,40 +225,117 @@ jobs:
           path: ${{ runner.temp }}/gitleaks-report.json
           retention-days: 14
 
-  test:
-    # Opt this repo onto the self-hosted Uranus fleet via the org CI_RUNNER
-    # variable (value: self-hosted-linux). Until that variable is scoped to this
-    # repo, it falls back to the GitHub-hosted ubuntu-latest runner. See
-    # pl-ops-handbook > platform-ops > github-runners.md ("Repo opt-in").
-    # The fleet image bakes a CPU PyTorch (pl-runner >= 1.66.1) into the
-    # runner's SYSTEM Python (/usr/bin/python3), so the torch tests
-    # (test_engine_loop, test_moe_offload_*, test_models_loader) can run here
-    # instead of being skipped on a torch-less runner -- but only if the job
-    # actually uses that system interpreter. actions/setup-python always
-    # downloads and uses its own separate CPython build under
-    # /opt/hostedtoolcache (verified via a run log: "Version 3.12 was not
-    # found in the local cache" -> downloads python-3.12.14-linux-24.04-x64.tar.gz
-    # every time, since these runners are ephemeral), which has no relationship
-    # to the image's baked torch at all. Running it on self-hosted silently
-    # defeated the whole point of baking torch in: every torch-marked test file
-    # skipped with "could not import torch", 4 skips standing in for ~22 actual
-    # tests never collected. So: skip setup-python entirely on the self-hosted
-    # fleet (Noble already ships python3.12 + pip on PATH, and the image has
-    # torch); keep it for the ubuntu-latest fallback, which has no baked torch
-    # and needs setup-python to get any Python at all.
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+  ci:
+    name: Typecheck, test, and CLI smoke (CPU)
+    # The main per-PR job. Runs on GitHub-hosted ubuntu-latest -- NOT the
+    # self-hosted fleet. Two reasons:
+    #
+    #   1. Fork safety. This repo is public, so a fork PR's code runs in this
+    #      job. It must never execute on owned hardware, and the org CI_RUNNER
+    #      variable is a private-org mechanism that does not apply here.
+    #      (pre-flight and secret-scan above are on the same footing.)
+    #
+    #   2. The dual-venv contract. This job builds the CPU `.venv` -- which by
+    #      the project's load-bearing separation must NEVER contain torch.
+    #      torch (the XPU build) lives only in the separate `.venv-xpu`. That
+    #      contract is enforced by the CUDA-import guard step below, which fails
+    #      if `import torch` ever succeeds in this venv.
+    #
+    # Python 3.11, not the 3.12 the previous revision used: the dev venvs
+    # (.venv AND .venv-xpu) are both 3.11, so the CPU CI venv must match the
+    # XPU venv's minor to keep wheel tags (cp311) aligned. A CPU venv on a
+    # different minor than the XPU venv is a silent divergence trap. (docs/
+    # dev-setup.md previously said "CI uses 3.12" -- that line is corrected in
+    # the same change.)
+    #
+    # Because this venv has no torch, the torch-dependent tests
+    # (test_engine_loop, test_models_loader, test_moe_offload_*) SKIP here via
+    # their module-level `pytest.importorskip("torch")` -- a clean skip, never
+    # a collection error. Their real coverage now lives on the XPU nightly
+    # (xpu.yml, #50), which runs them on the GPU runner where torch is present.
+    # This is the deliberate trade: per-PR CI stays fork-safe and torch-free;
+    # the torch path is verified on a trusted, main-only schedule instead.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        if: ${{ vars.CI_RUNNER == '' }}
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
+
       - name: Install
-        run: pip install -e ".[dev]"
+        run: |
+          python -m pip install -U pip
+          python -m pip install -e ".[dev]"
+
+      # Typecheck-before-lint ordering (playbook: a lint pass can mask a type
+      # error -- flotilla #236). We have no mypy/ruff yet, so the analogs are
+      # (a) byte-compile every module, then (b) the full CPU test suite.
+      - name: Byte-compile (syntax-class check)
+        run: python -m compileall -q python/
+
+      # Full CPU suite. xpu + slow + needs_weights are all excluded: xpu needs
+      # a GPU (nightly), slow is a long sweep, needs_weights needs a real
+      # checkpoint (FREETOKEN_TEST_MODEL) that CI does not have. The CTRF
+      # reporter (pytest-json-ctrf, installed in Install) writes the machine-
+      # readable result to ctrf/pytest-ctrf.json for the artifact below.
       - name: Unit tests (CPU)
-        run: pytest -m "not xpu and not slow" -q
+        run: |
+          python -m pip install -q pytest-json-ctrf
+          pytest -m "not xpu and not slow and not needs_weights" -q \
+            --ctrf ctrf/pytest-ctrf.json
+
+      # HARD venv-contract guard. The dual-venv split (.venv = CPU, never
+      # torch; .venv-xpu = the only place torch lives) is load-bearing: the
+      # whole CUDA->SYCL premise rests on the CPU side never importing a CUDA/
+      # CPU torch. Nothing else enforces it, so this step does. If `import
+      # torch` SUCCEEDS in the CI venv, someone added torch to [project]
+      # dependencies or [dev] -- that is a contract breach and fails the build
+      # with an explanatory annotation rather than failing opaquely inside a
+      # test.
+      - name: "venv contract: torch must NOT be importable"
+        run: |
+          if python -c "import torch" 2>/dev/null; then
+            echo "::error::venv-contract violated: 'import torch' SUCCEEDED in the CPU CI venv. The dual-venv contract (see docs/dev-setup.md) requires torch to live ONLY in .venv-xpu -- the CPU [.dev]/[project] dependency set must never pull in torch (CUDA or CPU). Remove it; if torch is genuinely needed on the CPU side that is a design change to discuss, not a silent dependency."
+            exit 1
+          fi
+          echo "OK: torch is not importable in the CPU venv (contract holds)."
+
+      # CLI smoke. Hardened from the previous `ft device || true`: on a
+      # GPU-less runner, `ft device` reporting an XPU as available is exactly
+      # the drift this check exists to catch, and `|| true` made it invisible.
+      # A runner that somehow has a GPU is a fleet misconfiguration -- let it
+      # fail loudly instead of silently passing.
+      #
+      # The assertion reads the tee'd file with a plain `grep` (NO pipe): the
+      # `ft device | tee` pipeline above is kept for human log visibility only.
+      # A `pipefail` + `grep -q` on the same pipe is a latent false-negative --
+      # grep -q exits 0 the moment it finds the match, but the upstream
+      # producer can then die on SIGPIPE, and with pipefail the pipeline's
+      # exit status becomes that producer's non-zero, not grep's 0. So the
+      # pass/fail decision must come from a separate, pipe-free grep.
       - name: CLI smoke
         run: |
           ft --version
           ft --help
-          ft device || true
+          ft device | tee device.out
+          grep -q "xpu available: False" device.out \
+            || { echo "::error::ft device did not report 'xpu available: False' on a GPU-less runner -- either the runner unexpectedly has a GPU (fleet misconfiguration) or the device-detection drift this check guards against has regressed."; cat device.out; exit 1; }
+          echo "OK: ft device reports 'xpu available: False'."
+
+      # CTRF artifact. The ONLY continue-on-error in this workflow: an artifact
+      # upload failure (network blip) must never turn a green or red test run
+      # into a confusing third state. if: always() so a failing run still
+      # uploads its report (that is when the report is most needed). 30-day
+      # retention, playbook parity. There is no PR check-run summary for CTRF
+      # (playbook parity) -- reading it today means downloading the artifact.
+      - name: Upload CTRF test report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctrf-reports
+          path: ctrf/
+          retention-days: 30
+          if-no-files-found: ignore

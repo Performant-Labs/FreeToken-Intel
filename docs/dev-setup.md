@@ -54,7 +54,7 @@ sudo apt install -y \
   ninja-build \
   curl \
   pkg-config
-python3 --version    # 3.10 or newer (CI uses 3.12)
+python3 --version    # 3.10 or newer (CI uses 3.11)
 ```
 
 `python3-venv` is required for `python3 -m venv`. Without it Ubuntu
