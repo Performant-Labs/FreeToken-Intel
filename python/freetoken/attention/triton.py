@@ -31,12 +31,15 @@ class TritonMetadata(BaseAttnMetadata):
 class TritonAttentionBackend(BaseAttnBackend):
     """Pure-torch grouped-query attention.
 
-    ``forward(q, k, v, layer_id, batch, attn_spec)`` takes ``q`` as
-    ``[num_tokens, num_heads, head_dim]`` and ``k`` / ``v`` as
-    ``[num_tokens, num_kv_heads, head_dim]`` (the *new* tokens this step), and
-    returns ``[num_tokens, num_heads, head_dim]``. K/V for the whole sequence
-    are read from the KV pool via the page table, so the buffer holds the full
-    history and each step only appends the new tokens.
+    ``forward(q, k, v, layer_id, batch, attn_spec)`` takes ``q`` / ``k`` / ``v``
+    head-major ``[heads, tokens, head_dim]`` (the *new* tokens this step) and
+    returns ``[heads, tokens, head_dim]``. K/V for the whole sequence are read
+    from the KV pool via the page table, so the buffer holds the full history
+    and each step only appends the new tokens.
+
+    Supports both ``AttnType.FULL`` (plain causal) and ``AttnType.SWA``: when
+    ``attn_spec.sliding_window > 0`` a query attends only the most recent
+    ``sliding_window`` keys (matching the SYCL kernel's branch-free mask).
     """
 
     def __init__(self, config) -> None:
@@ -95,6 +98,11 @@ class TritonAttentionBackend(BaseAttnBackend):
         # attend the whole q against that request's history in one shot. Without
         # it (a caller passing the whole batch's tokens) we walk the batch by
         # global token offset -- the original behavior.
+        # SWA: the layer's sliding-window size (0 / None => plain full causal).
+        # Read once here and passed into _attend_one, so the mask in both call paths
+        # (per-request and whole-batch) is identical.
+        window = int(attn_spec.sliding_window) if (attn_spec is not None and attn_spec.sliding_window) else 0
+
         if table_idx is not None:
             req = next((r for r in batch.reqs if r.table_idx == table_idx), batch.reqs[0])
             ext = q.shape[1]
@@ -103,7 +111,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             is_decode = req.device_len != len(req.input_ids)
             written = req.device_len if is_decode else ext
             q_pos = self._request_positions(batch, table_idx, ext)
-            out[:] = self._attend_one(req, q, q_pos, written, repeat, scale)
+            out[:] = self._attend_one(req, q, q_pos, written, repeat, scale, window)
             return out
 
         # Whole-batch call (table_idx is None): q/k/v span all requests, so walk
@@ -116,11 +124,11 @@ class TritonAttentionBackend(BaseAttnBackend):
             written = req.device_len if is_decode else req.extend_len
             qh = q[:, token_idx : token_idx + ext, :]
             q_pos = batch.positions[token_idx : token_idx + ext]
-            out[:, token_idx : token_idx + ext, :] = self._attend_one(req, qh, q_pos, written, repeat, scale)
+            out[:, token_idx : token_idx + ext, :] = self._attend_one(req, qh, q_pos, written, repeat, scale, window)
             token_idx += ext
         return out
 
-    def _attend_one(self, req, qh, q_pos, written, repeat, scale) -> torch.Tensor:
+    def _attend_one(self, req, qh, q_pos, written, repeat, scale, window: int = 0) -> torch.Tensor:
         """Attend a block of query rows against one request's KV history."""
         ctx = _get_ctx()
         kv_cache = ctx.kv_cache
@@ -137,11 +145,16 @@ class TritonAttentionBackend(BaseAttnBackend):
             # `repeat_interleave` gives the correct h // repeat mapping.
             k_all = k_all.repeat_interleave(repeat, dim=0)  # [num_heads, written, D]
             v_all = v_all.repeat_interleave(repeat, dim=0)
-        # scores = qh @ k_all^T -> [heads, qlen, written]. Causal mask is
+        # scores = qh @ k_all^T -> [heads, qlen, written]. The mask is
         # [1, qlen, written] (broadcast over the head dim), comparing query
-        # positions (dim 1) against key positions (dim 2).
+        # positions (dim 1) against key positions (dim 2). Causal: a query at
+        # position q attends keys at position <= q. SWA (window > 0) additionally
+        # restricts to the most recent `window` keys: q - keypos < window. This
+        # matches the SYCL kernel's branch-free mask exactly.
         key_pos = torch.arange(written, device=dev)
         allowed = q_pos[None, :, None] >= key_pos[None, None, :]
+        if window > 0:
+            allowed = allowed & ((q_pos[None, :, None] - key_pos[None, None, :]) < window)
         scores = torch.matmul(qh, k_all.transpose(-1, -2)) * scale
         scores = torch.where(allowed, scores, torch.full_like(scores, float("-inf")))
         return torch.matmul(torch.softmax(scores, dim=-1), v_all)  # [heads, qlen, D]
