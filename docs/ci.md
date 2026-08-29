@@ -31,7 +31,7 @@ flowchart TD
 | **pre-flight** | hosted | Workflow files parse and lint. Fails first, before any expensive job. |
 | **secret-scan** | hosted | No secret enters the tree. **Hard-fails** on a finding. |
 | **ci** | hosted | The CPU contract: torch-free venv, full CPU suite, live CLI smoke. |
-| **conformance** | hosted | The port's invariants: SYCL uses `sycl_ext::`, no CUDA backdoors, one version source. |
+| **conformance** | hosted | The port's invariants: SYCL uses `sycl::ext::oneapi`, no CUDA backdoors, one version source. |
 | **xpu-nightly** | B70 fleet | The XPU half of the contract: torch present, `torch.xpu` alive, xpu-marked tests pass. |
 | **PR-Agent review** | fleet | Advisory bot score + label. Not a gate. |
 
@@ -119,15 +119,18 @@ invariants (tracked in [#46]):
 
 * **SYCL extension rule** — every file under
   `python/freetoken/kernel/csrc/` that `#include`s
-  `<sycl/sycl.hpp>` must also reference the `sycl_ext::` extension
-  namespace (e.g. `sycl_ext::make_kernel`). The "never compile against
-  a fake SYCL" rule: a kernel written against the plain `sycl::` API
-  binds none of the XPU extensions, so it would *look* portable and
+  `<sycl/sycl.hpp>` must also reference the `sycl::ext::oneapi`
+  extension namespace (e.g. a `sycl::ext::oneapi::accessor_property_list`
+  accessor, or any `sycl::ext::oneapi::*` type). The "never compile
+  against a fake SYCL" rule: a kernel written against the plain `sycl::`
+  API binds none of the XPU extensions, so it would *look* portable and
   silently stop being GPU work. A file that legitimately uses only the
   standard SYCL API is listed in `.github/ci-conformance-allowlist`
   (one path per line, `#` comments); a new file that includes the
-  header, uses no `sycl_ext::`, and is not allowlisted **fails** the
-  job and names the file.
+  header, uses no `sycl::ext::oneapi`, and is not allowlisted **fails**
+  the job and names the file. (The namespace is `sycl::ext::oneapi`
+  because that is where the installed oneAPI 2026.1 toolkit puts its
+  XPU extensions — there is no `sycl_ext::` namespace in that toolkit.)
 * **No CUDA backdoors** — a `#include <cuda*>`, `cublas`, `cub/`, or
   `nvcc` reference in any source file is a premise violation, not a
   style issue: the whole point of the port is CUDA→SYCL. The check is
@@ -156,8 +159,8 @@ grep can't. (See "XPU nightly operations" below.)
 
 **To add a legitimately-standard-SYCL file:** add its path to
 `.github/ci-conformance-allowlist` in the same PR, with a comment
-saying why it needs no `sycl_ext::`. If the file later starts using
-`kernel-sycl`'s extension API, remove it from the list in that PR.
+saying why it needs no `sycl::ext::oneapi`. If the file later starts
+using `kernel-sycl`'s extension API, remove it from the list in that PR.
 Allowlisting a file *so it can dodge the check* is exactly the drift
 the rule exists to catch — treat an allowlist addition as a decision
 the conformance gate is there to police.

@@ -301,12 +301,19 @@ jobs:
 
           # --- Rule 1: SYCL extension rule -------------------------------
           # Every file under the C++ source root that #includes
-          # <sycl/sycl.hpp> must also reference the sycl_ext:: extension
-          # namespace, unless allowlisted. A file that includes the SYCL
-          # header but uses no sycl_ext:: is the exact drift the "never
-          # compile against a fake SYCL" rule exists to catch. The
-          # allowlist (one path per line, '#' comments) is for files that
-          # legitimately use only the standard SYCL API.
+          # <sycl/sycl.hpp> must also reference the Intel oneAPI SYCL
+          # extension namespace (sycl::ext::oneapi), unless allowlisted. A
+          # file that includes the SYCL header but touches no XPU extension
+          # is the exact drift the "never compile against a fake SYCL" rule
+          # exists to catch. The allowlist (one path per line, '#' comments)
+          # is for files that legitimately use only the standard SYCL API.
+          #
+          # NOTE: the namespace is sycl::ext::oneapi, NOT "sycl_ext::". That
+          # name (used by the upstream NVIDIA->Intel port notes) does not
+          # exist in the installed oneAPI 2026.1 toolkit -- its real Intel
+          # extensions (accessor property lists, USM, device id, ...) live
+          # under sycl::ext::oneapi. A sycl::ext::oneapi reference is what
+          # actually binds the XPU extensions, so that is what the rule greps.
           C_SRC_ROOT="python/freetoken/kernel/csrc"
           ALLOWLIST=".github/ci-conformance-allowlist"
           if [ ! -d "$C_SRC_ROOT" ]; then
@@ -318,11 +325,11 @@ jobs:
                 ok "allowlisted (standard SYCL only): $f"
                 continue
               fi
-              if ! grep -q 'sycl_ext::' "$f"; then
-                fail "'$f' includes <sycl/sycl.hpp> but uses no sycl_ext:: extension -- it would compile against a fake/host SYCL and silently stop binding the XPU extensions. Either use sycl_ext:: (e.g. sycl_ext::make_kernel) or add the file to $ALLOWLIST if it legitimately uses only the standard SYCL API."
+              if ! grep -q 'sycl::ext::oneapi' "$f"; then
+                fail "'$f' includes <sycl/sycl.hpp> but uses no sycl::ext::oneapi extension -- it would compile against a fake/host SYCL and silently stop binding the XPU extensions. Either use the Intel oneAPI extension namespace (e.g. sycl::ext::oneapi::accessor_property_list, or a sycl::ext::oneapi::* accessor) or add the file to $ALLOWLIST if it legitimately uses only the standard SYCL API."
               fi
             done < <(grep -rl '#include <sycl/sycl.hpp>' "$C_SRC_ROOT" 2>/dev/null || true)
-            ok "SYCL extension rule: every sycl.hpp includer uses sycl_ext:: (or is allowlisted)."
+            ok "SYCL extension rule: every sycl.hpp includer uses sycl::ext::oneapi (or is allowlisted)."
           fi
 
           # --- Rule 2: no CUDA backdoors ---------------------------------

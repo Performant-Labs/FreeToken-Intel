@@ -33,11 +33,11 @@ def pytest_collection_modifyitems(config, items):
     if importlib.util.find_spec("torch") is not None:
         # torch present (e.g. .venv-xpu on a B70 box) -> run everything.
         return
-    deselected = [item for item in _all_items if item.get_closest_marker("xpu") is not None]
+    deselected = [item for item in items if item.get_closest_marker("xpu") is not None]
     if not deselected:
         return
     config.hook.pytest_deselected(items=deselected)
-    items[:] = [item for item in _all_items if item.get_closest_marker("xpu") is None]
+    items[:] = [item for item in items if item.get_closest_marker("xpu") is None]
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
