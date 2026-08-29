@@ -79,8 +79,14 @@ jobs:
         id: decide
         env:
           GH_TOKEN: ${{ github.token }}
-          FORCE: ${{ inputs.force }}
-          SCOPE: ${{ inputs.scope }}
+          # `inputs.*` is EMPTY on `schedule` (cron) events -- workflow_dispatch
+          # input defaults do NOT apply to cron. Without these `?? ''` fallbacks
+          # FORCE/SCOPE would be empty and the stamp logic below would misfire.
+          # `force=''` -> falsy (no bypass); `scope=''` -> falls into the normal
+          # auto/stamp path. (The headroom guard on the fleet applies its own
+          # defaults for the thresholds, so an empty value there is also safe.)
+          FORCE: ${{ inputs.force || '' }}
+          SCOPE: ${{ inputs.scope || '' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF: ${{ github.ref }}
         run: |
@@ -180,9 +186,12 @@ jobs:
           sycl-ls
 
       # VRAM-HEADROOM guard + tenant-aware scope decision. Runs on the FLEET (a
-      # B70 is present -- the guard above just proved it) and BEFORE the venv
-      # build, so a "skip" decision costs a single cheap python probe and never
-      # burns the per-night venv-build time on a box that cannot run anything.
+      # B70 is present -- the sycl-ls guard above just proved it), AFTER the
+      # checkout (it sources ./setvars-xpu.sh, a repo-local file, so the working
+      # dir must already be the repo -- on a clean runner that is not true until
+      # checkout) but BEFORE the venv build, so a "skip" decision costs a single
+      # cheap python probe and never burns the per-night venv-build time on a box
+      # that cannot run anything.
       #
       # WHY THIS EXISTs: the sycl-ls guard above only proves a XPU is PRESENT.
       # It says nothing about whether the B70 has room in its HBM. The B70 is
@@ -220,21 +229,50 @@ jobs:
       # the very OOM this guard exists to prevent if someone reflexively re-runs.
       # The CTRF artifact below is uploaded unconditionally, so a skip leaves a
       # traceable "skipped: headroom" artifact rather than a silent green.
+
+
+      # Checkout first so the repo -- and the ./setvars-xpu.sh the headroom
+      # guard sources -- is present. NOTE: this step is UNGATED (no `if`). The
+      # headroom guard that follows it is also ungated and runs unconditionally
+      # (a self-contained python probe that exits 0 even when it decides
+      # scope=skip), so a `skip` decision costs a single cheap probe and then the
+      # downstream steps (below) drop out via their own `if: ... != 'skip'`
+      # gates. We must NOT put a `steps.headroom` gate on THIS step: the guard's
+      # step id is defined a few lines below, so referencing it here is a
+      # forward reference that GitHub rejects and actionlint flags.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: "Guard: VRAM headroom -> pick scope (skip / moe / full)"
         id: headroom
         env:
-          SCOPE: ${{ inputs.scope }}
-          MAX_HBM_GB: ${{ inputs.max_hbm_gb }}
-          MIN_HBM_GB_MOE: ${{ inputs.min_hbm_gb_moe }}
+          # `inputs.*` is EMPTY on `schedule` (cron) events -- workflow_dispatch
+          # defaults do not apply to cron. Default each to its dispatch value so
+          # a nightly resolves to the same behavior a `scope=auto` dispatch would
+          # (scope '' -> auto; thresholds 8 / 1). Without this, a cron run that
+          # reaches the build job would pass empty strings to the python below and
+          # crash on float('') before ever picking a scope.
+          SCOPE: ${{ inputs.scope || 'auto' }}
+          MAX_HBM_GB: ${{ inputs.max_hbm_gb || '8' }}
+          MIN_HBM_GB_MOE: ${{ inputs.min_hbm_gb_moe || '1' }}
         run: |
           set -a
           . ./setvars-xpu.sh
           set +a
+          # Redundant with the env defaults above, but makes the step correct even
+          # if those are ever narrowed: an empty SCOPE (any non-dispatch path) is
+          # treated as auto. MAX/MIN already have env defaults, so the python
+          # float() calls below can never receive an empty string.
+          SCOPE="${SCOPE:-auto}"
           # Probe free HBM with the venv's torch (baked into the image). If the
           # venv is not yet baked (a fresh image) the probe cannot run; in that
           # case fall through to the FULL scope and let the venv-build step
           # below construct it -- a brand-new image is, by definition, not yet
           # serving a tenant, so there is no headroom concern to decide.
+          # (This step now runs AFTER actions/checkout, so ./setvars-xpu.sh is
+          # present in the working dir; sourcing it here is a defensive re-source
+          # -- oneAPI is already on PATH from the Prime step -- that keeps the
+          # probe self-contained if the Prime step's GITHUB_ENV export is narrowed.)
           if [ ! -x .venv-xpu/bin/python ]; then
             echo "::notice::.venv-xpu not baked yet (fresh image) -- no headroom probe possible; assuming idle box -> scope=full."
             {
@@ -314,15 +352,6 @@ jobs:
               echo "xpu-nightly running FULL xpu suite (B70 idle: ${free_gb} GB free)."
               ;;
           esac
-
-      # venv build + XPU tests run ONLY when the guard above chose a testable
-      # scope. On `skip` the rest of the job (including the per-night venv build)
-      # is skipped -- a busy box must not pay that cost. `if` sees step outputs
-      # as ${{ steps.headroom.outputs.scope }}.
-      - name: Checkout
-        if: steps.headroom.outputs.scope != 'skip'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
       # Re-source the B70 device pin (ONEAPI_DEVICE_SELECTOR=level_zero:0) + the
       # oneAPI environment, exactly as a developer would (docs/dev-setup.md). The
       # environment was ALREADY primed at the top of the job and exported to
