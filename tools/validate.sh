@@ -313,11 +313,11 @@ gate_ci_tests() {
 }
 
 # --- gate 4: conformance (STUB -- parent issue #46 has not landed) ----------
-# When #46 adds the `conformance` CI job (sycl_ext rule + allowlist, no-CUDA,
-# single version source) this stub is replaced by the same grep/git checks that
-# job runs. Until then: a pass-by-skip.
+# When #46 adds the `conformance` CI job (sycl::ext::oneapi rule + allowlist,
+# no-CUDA, single version source) this stub is replaced by the same grep/git
+# checks that job runs. Until then: a pass-by-skip.
 gate_conformance() {
-  record SKIP conformance "(not yet implemented -- see #46: sycl_ext rule, no-CUDA, single version source)"
+  record SKIP conformance "(not yet implemented -- see #46: sycl::ext::oneapi rule, no-CUDA, single version source)"
 }
 
 # --- gate 5: xpu-nightly (#47/#50) ------------------------------------------

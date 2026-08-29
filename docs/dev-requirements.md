@@ -74,7 +74,7 @@ and [#3](https://github.com/Performant-Labs/FreeToken-Intel/issues/3).
 | Intel Arc **compute** driver | Device ownership for Battlemage | `lspci` shows the B70; `ft device` after PyTorch XPU |
 | **Level Zero** loader + Arc ICD | Kernel submit, USM, copies. One Arc ICD only — do not mix Data Center GPU ICDs ([intel-b70.md](intel-b70.md)) | `ls /usr/lib/libze_loader.so*` or `sycl-ls` |
 | **oneAPI DPC++** (`icpx`) | Compile in-tree SYCL (`icpx -fsycl`) | `icpx --version` after `source /opt/intel/oneapi/setvars.sh` |
-| SYCL headers / Level Zero headers | Shipped with the Base Toolkit | `icpx -fsycl` compiles `kernel/csrc/sycl/placeholder.cpp` |
+| SYCL headers / Level Zero headers | Shipped with the Base Toolkit | `icpx -fsycl` compiles `kernel/csrc/sycl/hello_copy.cpp` |
 | CMake ≥ 3.18 and Ninja | Out-of-tree SYCL extension builds | `cmake --version`, `ninja --version` |
 | **PyTorch XPU** wheel | `torch.xpu` — not the CUDA index | `python -c "import torch; print(torch.xpu.is_available())"` → `True` |
 | **Triton** with Intel GPU backend | Default attention / MoE kernels | `python -c "import triton; print(triton.__version__)"` |
