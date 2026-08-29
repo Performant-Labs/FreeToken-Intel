@@ -11,15 +11,18 @@ Layer ownership (see docs/architecture.md):
   device  — real since the XPU software epic (#33)
   args    — real since ``server-openai`` (#25); parse_args returns a ServerArgs
   resolve — real (registry + create_model are wired); the model *stubs* that
-            raise live in the engine layer, so this layer reports ok
+            raise live in the loader layer, so this layer reports ok
   loader  — real since ``models-loader`` (#17); load_model places dense weights
             on the XPU and builds the MoE host offload banks
-  engine  — ``engine-loop`` (#14) — the first stub today
-  server  — real since ``server-openai`` (#25); create_app builds the FastAPI app
+  engine  — real since ``engine-loop`` (#14); step/generate run the model
+  server  — real since ``server-openai`` (#25) + ``server-anthropic`` (#26);
+            create_app builds the FastAPI app with both route sets
 
-On today's tree the walk is: [ok] device, [ok] args, [ok] resolve, [ok] loader,
-then [stub] engine -> blocked: engine-loop (#14). When #14 lands the next line
-reports server (already live) and the server starts.
+The layer *checks* confirm wiring (importable entry points, buildable app) and
+never load a checkpoint, so the walk is network-free and CPU-runnable. The
+real deepest seam — the hero model's own ``forward``/weight stubs — lives in
+the model package and is exercised by the generation path at serve time, not
+by the spine's wiring checks.
 """
 from __future__ import annotations
 
@@ -48,10 +51,11 @@ _ISSUE_BY_LAYER = {
     "engine": "engine-loop (#14)",
     "server": "server-openai (#25)",
 }
-# The loader layer is real since #17; the first stub the walk stops at is the
-# engine. (The map above is kept complete so a future stub in any layer still
-# reports the issue that owns it.)
-FIRST_STUB_LAYER = "engine"
+# Every layer in LAYERS is live on today's tree (device #33, args #25,
+# resolve+loader #17, engine #14, server #25/#26): the spine's walk reports all
+# [ok] and starts the server. The map above is kept complete so a *future*
+# regression that re-stubs a layer still reports the issue that owns it.
+FIRST_STUB_LAYER = None
 
 
 @dataclass(frozen=True)
@@ -143,7 +147,7 @@ def _check_loader(_args: argparse.Namespace) -> None:
 
 
 def _check_engine(_args: argparse.Namespace) -> None:
-    # The engine is implemented (#14): the loop wires the model forward, the
+    # Real layer since ``engine-loop`` (#14): the loop wires the model forward, the
     # paged KV pool, the reference attention backend, and the sampler into a
     # prefill/decode loop. The spine confirms the loader->engine handoff exists
     # by exercising the real entry points.

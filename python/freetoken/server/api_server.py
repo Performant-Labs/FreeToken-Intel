@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from freetoken.version import __version__
 from freetoken.server.args import ServerArgs
+from freetoken.server.anthropic_api import register_anthropic_routes
 from freetoken.server.openai_api import register_openai_routes
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ def create_app(server_args: ServerArgs, engine_holder) -> FastAPI:
     app.state.server_args = server_args
     app.state.engine_holder = engine_holder
     register_openai_routes(app, engine_holder)
+    register_anthropic_routes(app, engine_holder)
     return app
 
 
