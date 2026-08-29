@@ -187,11 +187,23 @@ jobs:
 
       # VRAM-HEADROOM guard + tenant-aware scope decision. Runs on the FLEET (a
       # B70 is present -- the sycl-ls guard above just proved it), AFTER the
-      # checkout (it sources ./setvars-xpu.sh, a repo-local file, so the working
-      # dir must already be the repo -- on a clean runner that is not true until
-      # checkout) but BEFORE the venv build, so a "skip" decision costs a single
-      # cheap python probe and never burns the per-night venv-build time on a box
-      # that cannot run anything.
+      # checkout and BEFORE the venv build. It decides the scope from the box's
+      # live HBM (or from an explicit manual dispatch) so a busy box gets a clean,
+      # EXPLAINED skip (or a capped MoE-only run) and a "skip" never burns the
+      # per-night venv-build time on a box that cannot run anything.
+      #
+      # THE SUBTLETY (why the probe is written the way it is): .venv-xpu is
+      # git-ignored, so on a fresh runner image the venv does NOT exist until the
+      # venv-build step a few lines below creates it. We therefore must NOT gate
+      # the HBM probe on the venv being present -- doing so forced scope=full on
+      # every cold image, including a box a tenant was ALREADY using, which is the
+      # exact OOM this guard exists to prevent. Instead the probe prefers the venv
+      # (it has the XPU torch) but, when the venv is absent, falls back to the
+      # image's python3 and tries to import torch. A co-located vLLM serving
+      # process keeps torch importable, and torch.xpu.mem_get_info is DRIVER-level
+      # (process-independent), so that fallback still measures the box's real free
+      # HBM. Only when NO torch is importable anywhere is the box genuinely idle,
+      # in which case scope=full is the correct assumption.
       #
       # WHY THIS EXISTs: the sycl-ls guard above only proves a XPU is PRESENT.
       # It says nothing about whether the B70 has room in its HBM. The B70 is
@@ -264,36 +276,61 @@ jobs:
           # treated as auto. MAX/MIN already have env defaults, so the python
           # float() calls below can never receive an empty string.
           SCOPE="${SCOPE:-auto}"
-          # Probe free HBM with the venv's torch (baked into the image). If the
-          # venv is not yet baked (a fresh image) the probe cannot run; in that
-          # case fall through to the FULL scope and let the venv-build step
-          # below construct it -- a brand-new image is, by definition, not yet
-          # serving a tenant, so there is no headroom concern to decide.
-          # (This step now runs AFTER actions/checkout, so ./setvars-xpu.sh is
-          # present in the working dir; sourcing it here is a defensive re-source
-          # -- oneAPI is already on PATH from the Prime step -- that keeps the
-          # probe self-contained if the Prime step's GITHUB_ENV export is narrowed.)
-          if [ ! -x .venv-xpu/bin/python ]; then
-            echo "::notice::.venv-xpu not baked yet (fresh image) -- no headroom probe possible; assuming idle box -> scope=full."
-            {
-              echo "scope=full"
-              echo "free_gb=0.0"
-              echo "in_use_gb=0.0"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
+          # How the probe picks its interpreter. We must NOT gate the probe on
+          # `.venv-xpu/bin/python` existing: that venv is git-ignored, so it is
+          # absent on a fresh runner image until the venv-build step below creates
+          # it. Gating on it would force scope=full on every cold image -- including
+          # a box a tenant is ALREADY using -- which is the exact OOM this guard
+          # exists to prevent. Instead: prefer the venv (it has the XPU torch), but
+          # if it is absent, fall back to the image's python3 and try to import
+          # torch. A co-located vLLM serving process keeps torch importable (and
+          # torch.xpu.mem_get_info is driver-level, i.e. process-independent), so
+          # that fallback still measures real HBM on a busy box. Only when NO torch
+          # is importable anywhere is the box genuinely idle, and scope=full is the
+          # correct assumption (the venv-build step will then create the venv).
+          # (OneAPI is already on PATH from the Prime step, so the XPU libs the
+          # import needs are present here; oneAPI is NOT a repo file, so the probe
+          # is safe to run on a checkout -- see the step comment above.)
+          if [ -x .venv-xpu/bin/python ]; then
+            PYBIN="$PWD/.venv-xpu/bin/python"
+          else
+            PYBIN="$(command -v python3)"
           fi
-          . ./.venv-xpu/bin/activate
+          echo "headroom probe interpreter: ${PYBIN:-<none>}"
           # NOTE: the heredoc body below is indented to sit inside this `run: |`
           # block (a column-0 heredoc would terminate the YAML block scalar).
           # A heredoc preserves its body's indentation verbatim, so the python
-          # source stays valid. The script writes its decision to /headroom_out
-          # (absolute path: /tmp is per-ephemeral-container, so step outputs and
-          # this file must share a path that the next step also sees -- on this
-          # fleet the working dir is stable across steps of one job).
-          python - "$SCOPE" "$MAX_HBM_GB" "$MIN_HBM_GB_MOE" <<'PY'
+          # source stays valid. The script writes its decision to headroom_out.txt
+          # in the job working dir; on this fleet that dir is stable across steps
+          # of one job, so the next step reads the file back.
+          "$PYBIN" - "$SCOPE" "$MAX_HBM_GB" "$MIN_HBM_GB_MOE" <<'PY'
           import sys
           scope_arg, max_hbm_gb, min_hbm_gb_moe = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
-          import torch
+          # Explicit manual overrides are honored WITHOUT a probe: a manual
+          # dispatch is a deliberate "I know what I am doing" signal, so we never
+          # second-guess it (and never fail it over a missing/unreachable torch).
+          # `skip` needs no measurement at all; `full`/`moe` short-circuit here.
+          if scope_arg == "skip":
+              print("scope=skip (explicit) -> no XPU tests this run; nothing measured.")
+              with open("headroom_out.txt", "w") as f:
+                  f.write("scope=skip\nfree_gb=0.00\nin_use_gb=0.00\n")
+              sys.exit(0)
+          if scope_arg in ("full", "moe"):
+              print(f"scope={scope_arg} (explicit manual override) -> running as asked; no HBM probe needed.")
+              with open("headroom_out.txt", "w") as f:
+                  f.write(f"scope={scope_arg}\nfree_gb=0.00\nin_use_gb=0.00\n")
+              sys.exit(0)
+          # scope == 'auto' (the schedule's only option, and the '' default): the
+          # whole point is to MEASURE before deciding. Import torch (any torch --
+          # the venv's, or the image's / a co-located tenant's). mem_get_info is
+          # driver-level, so a non-venv torch still reports the box's real HBM.
+          try:
+              import torch
+          except Exception as e:  # no torch importable anywhere -> idle box
+              print(f"torch not importable ({e!r}) -> no tenant holding HBM -> assuming idle box -> scope=full.")
+              with open("headroom_out.txt", "w") as f:
+                  f.write("scope=full\nfree_gb=0.00\nin_use_gb=0.00\n")
+              sys.exit(0)
           if not torch.xpu.is_available():
               # The sycl-ls guard already proved a device exists; torch not seeing it is a
               # real ICD/driver problem, not a headroom question. Fail loudly (loud > quiet).
@@ -302,26 +339,18 @@ jobs:
           free, total = torch.xpu.mem_get_info(0)
           free_gb, total_gb, in_use_gb = free / 1e9, total / 1e9, (total - free) / 1e9
           print(f"HBM: free={free_gb:.2f} GB  in_use={in_use_gb:.2f} GB  total={total_gb:.2f} GB  (requested scope={scope_arg!r})")
-          if scope_arg == "skip":
-              print("scope=skip (explicit) -> no XPU tests this run.")
-              chosen = "skip"
-          elif scope_arg in ("full", "moe"):
-              print(f"scope={scope_arg} (explicit manual override) -> running as asked.")
-              chosen = scope_arg
-          elif scope_arg == "auto":
-              if free_gb >= max_hbm_gb:
-                  chosen = "full"
-                  print(f"free {free_gb:.2f} GB >= {max_hbm_gb} GB -> scope=full (B70 idle, running the whole xpu suite).")
-              elif free_gb >= min_hbm_gb_moe:
-                  chosen = "moe"
-                  print(f"free {free_gb:.2f} GB < {max_hbm_gb} GB but >= {min_hbm_gb_moe} GB -> scope=moe (a tenant is using the box; running only the capped MoE subset).")
-              else:
-                  chosen = "skip"
-                  pct = (in_use_gb / total_gb * 100) if total_gb > 0 else 0.0
-                  print(f"free {free_gb:.2f} GB < {min_hbm_gb_moe} GB -> scope=skip (even the capped MoE subset does not fit; a tenant holds {pct:.0f}% of HBM. Not running -- would OOM and risk the tenant's process.)")
+          # Only 'auto' reaches here: explicit skip/full/moe short-circuited above
+          # (and an unknown scope also exits above, so scope_arg is provably 'auto').
+          if free_gb >= max_hbm_gb:
+              chosen = "full"
+              print(f"free {free_gb:.2f} GB >= {max_hbm_gb} GB -> scope=full (B70 idle, running the whole xpu suite).")
+          elif free_gb >= min_hbm_gb_moe:
+              chosen = "moe"
+              print(f"free {free_gb:.2f} GB < {max_hbm_gb} GB but >= {min_hbm_gb_moe} GB -> scope=moe (a tenant is using the box; running only the capped MoE subset).")
           else:
-              print(f"::error::unknown scope {scope_arg!r} (expected auto|full|moe|skip).")
-              sys.exit(1)
+              chosen = "skip"
+              pct = (in_use_gb / total_gb * 100) if total_gb > 0 else 0.0
+              print(f"free {free_gb:.2f} GB < {min_hbm_gb_moe} GB -> scope=skip (even the capped MoE subset does not fit; a tenant holds {pct:.0f}% of HBM. Not running -- would OOM and risk the tenant's process.)")
           with open("headroom_out.txt", "w") as f:
               f.write(f"scope={chosen}\nfree_gb={free_gb:.2f}\nin_use_gb={in_use_gb:.2f}\n")
           PY
