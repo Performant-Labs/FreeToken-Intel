@@ -254,6 +254,56 @@ jobs:
       # forward reference that GitHub rejects and actionlint flags.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # UNGATED (no `if`): runs BEFORE the headroom guard so its probe has a
+      # torch-capable interpreter (.venv-xpu/bin/python) -- a tenant's torch
+      # lives in its OWN venv, so the image's python3 cannot probe headroom
+      # (and the Source step after the guard is still gated on its scope).
+      # The dual-venv contract says torch lives ONLY in .venv-xpu. The CPU CI
+      # job (ci.yml) enforces the install-side half with a hard "import torch
+      # must FAIL" guard on the CPU venv; THIS job is the other half -- the
+      # venv where torch is ALLOWED and required. The venv is expected to be
+      # pre-baked into the fleet runner image (docs/dev-setup.md step 6); if
+      # it is NOT yet baked (the image predates the XPU setup), we build it
+      # here from the documented 6-step sequence instead of failing the whole
+      # nightly -- the ephemeral containers mean the build does not persist,
+      # so it is a per-night cost until the image bakes the venv (the right
+      # end state; bake it into the pl-runner image and this branch becomes
+      # dead). If the venv is absent AND the build fails (no network to the
+      # XPU index, a broken wheel tag), the step fails loudly: that is real
+      # drift, not a "skip the torch tests" situation.
+      - name: "venv contract: .venv-xpu exists and has torch with an available XPU"
+        run: |
+          if [ ! -x .venv-xpu/bin/python ]; then
+            echo ".venv-xpu is not baked into this runner image -- building it (docs/dev-setup.md step 6)."
+            python3.11 -m venv .venv-xpu
+            # shellcheck disable=SC1091
+            . ./.venv-xpu/bin/activate
+            python -m pip install -U pip
+            python -m pip install -e ".[dev]"
+            # The XPU wheel's metadata pulls nvidia-* CUDA packages on a plain
+            # resolve, which must not land on a B70 box -- hence --no-deps and
+            # the explicit Intel-side deps below (docs/dev-setup.md).
+            python -m pip install --no-deps torch==2.13.0 \
+              --index-url https://download.pytorch.org/whl/xpu
+            python -m pip install \
+              oneccl==2022.0.0 oneccl-devel==2022.0.0 tbb==2023.0.0 \
+              umf==1.1.0 pyzes==0.1.1 tcmlib==1.5.0 triton-xpu==3.7.2 \
+              --index-url https://download.pytorch.org/whl/xpu
+            python -m pip install "sympy>=1.13.3"
+            python -m pip install \
+              onemkl-license==2026.0.0 onemkl-sycl-blas==2026.0.0 \
+              onemkl-sycl-dft==2026.0.0 onemkl-sycl-lapack==2026.0.0 \
+              onemkl-sycl-rng==2026.0.0 onemkl-sycl-sparse==2026.0.0 \
+              jinja2 networkx
+            python -m pip install --force-reinstall --no-deps \
+              intel-cmplr-lib-rt==2026.0.0 intel-cmplr-lib-ur==2026.0.0 \
+              intel-cmplr-lic-rt==2026.0.0 intel-sycl-rt==2026.0.0 \
+              intel-opencl-rt==2026.0.0 intel-openmp==2026.0.0 \
+              dpcpp-cpp-rt==2026.0.0 intel-pti==0.17.0
+          fi
+          . ./.venv-xpu/bin/activate
+          python -c "import torch; print('torch', torch.__version__); assert torch.xpu.is_available(), 'torch.xpu.is_available() is False -- the B70 ICD/oneAPI is not visible to this torch build (driver/ICD problem, not pip)'; print('XPU visible:', torch.xpu.device_count(), 'device(s)')"
+          echo "OK: .venv-xpu has torch with a live XPU (contract holds)."
 
       - name: "Guard: VRAM headroom -> pick scope (skip / moe / full)"
         id: headroom
@@ -276,18 +326,15 @@ jobs:
           # treated as auto. MAX/MIN already have env defaults, so the python
           # float() calls below can never receive an empty string.
           SCOPE="${SCOPE:-auto}"
-          # How the probe picks its interpreter. We must NOT gate the probe on
-          # `.venv-xpu/bin/python` existing: that venv is git-ignored, so it is
-          # absent on a fresh runner image until the venv-build step below creates
-          # it. Gating on it would force scope=full on every cold image -- including
-          # a box a tenant is ALREADY using -- which is the exact OOM this guard
-          # exists to prevent. Instead: prefer the venv (it has the XPU torch), but
-          # if it is absent, fall back to the image's python3 and try to import
-          # torch. A co-located vLLM serving process keeps torch importable (and
-          # torch.xpu.mem_get_info is driver-level, i.e. process-independent), so
-          # that fallback still measures real HBM on a busy box. Only when NO torch
-          # is importable anywhere is the box genuinely idle, and scope=full is the
-          # correct assumption (the venv-build step will then create the venv).
+          # How the probe picks its interpreter. The venv-build step now runs
+          # BEFORE this guard, so .venv-xpu/bin/python exists here on every fleet
+          # run and the probe uses it -- the interpreter guaranteed to see the XPU.
+          # We no longer 'guess' headroom from the image's python3: a co-located
+          # tenant's torch lives in ITS OWN venv and is not importable from the
+          # system python3, so that fallback would read 'no torch -> idle' on a
+          # fresh, busy box and run the
+          # FULL suite against the tenant. The python3 fallback below is kept only
+          # as a LAST-RESORT that FAILS LOUD (exit 1) rather than guessing a scope.
           # (OneAPI is already on PATH from the Prime step, so the XPU libs the
           # import needs are present here; oneAPI is NOT a repo file, so the probe
           # is safe to run on a checkout -- see the step comment above.)
@@ -321,16 +368,21 @@ jobs:
                   f.write(f"scope={scope_arg}\nfree_gb=0.00\nin_use_gb=0.00\n")
               sys.exit(0)
           # scope == 'auto' (the schedule's only option, and the '' default): the
-          # whole point is to MEASURE before deciding. Import torch (any torch --
-          # the venv's, or the image's / a co-located tenant's). mem_get_info is
-          # driver-level, so a non-venv torch still reports the box's real HBM.
+          # whole point is to MEASURE before deciding. Import torch from the venv
+          # (the venv-build step ran before this guard, so it is present here).
+          # mem_get_info is driver-level, so it reports the box's real HBM
+          # including any co-located tenant.
           try:
               import torch
-          except Exception as e:  # no torch importable anywhere -> idle box
-              print(f"torch not importable ({e!r}) -> no tenant holding HBM -> assuming idle box -> scope=full.")
-              with open("headroom_out.txt", "w") as f:
-                  f.write("scope=full\nfree_gb=0.00\nin_use_gb=0.00\n")
-              sys.exit(0)
+          except Exception as e:
+              # The venv was built (and asserted to have torch) BEFORE this guard,
+              # so reaching here means the venv is broken/absent -- a real fleet
+              # defect, NOT a 'the box is idle' signal. We must NOT guess a scope:
+              # guessing 'full' on a fresh image is exactly the busy-box OOM this
+              # guard exists to prevent. Fail loud -- the `[ -f headroom_out.txt ]`
+              # check a few lines below turns this into a red step with a message.
+              print(f"::error::cannot import torch in the headroom probe (the venv was built before this step, so it should have torch) -- {e!r}. Refusing to guess headroom; fix the venv/ICD.")
+              sys.exit(1)
           if not torch.xpu.is_available():
               # The sycl-ls guard already proved a device exists; torch not seeing it is a
               # real ICD/driver problem, not a headroom question. Fail loudly (loud > quiet).
@@ -401,54 +453,6 @@ jobs:
           . ./setvars-xpu.sh
           set +a
           env | grep -E '^(ONEAPI|LD_LIBRARY_PATH|PATH)=' >> "$GITHUB_ENV"
-
-      # The dual-venv contract says torch lives ONLY in .venv-xpu. The CPU CI
-      # job (ci.yml) enforces the install-side half with a hard "import torch
-      # must FAIL" guard on the CPU venv; THIS job is the other half -- the
-      # venv where torch is ALLOWED and required. The venv is expected to be
-      # pre-baked into the fleet runner image (docs/dev-setup.md step 6); if
-      # it is NOT yet baked (the image predates the XPU setup), we build it
-      # here from the documented 6-step sequence instead of failing the whole
-      # nightly -- the ephemeral containers mean the build does not persist,
-      # so it is a per-night cost until the image bakes the venv (the right
-      # end state; bake it into the pl-runner image and this branch becomes
-      # dead). If the venv is absent AND the build fails (no network to the
-      # XPU index, a broken wheel tag), the step fails loudly: that is real
-      # drift, not a "skip the torch tests" situation.
-      - name: "venv contract: .venv-xpu exists and has torch with an available XPU"
-        if: steps.headroom.outputs.scope != 'skip'
-        run: |
-          if [ ! -x .venv-xpu/bin/python ]; then
-            echo ".venv-xpu is not baked into this runner image -- building it (docs/dev-setup.md step 6)."
-            python3.11 -m venv .venv-xpu
-            # shellcheck disable=SC1091
-            . ./.venv-xpu/bin/activate
-            python -m pip install -U pip
-            python -m pip install -e ".[dev]"
-            # The XPU wheel's metadata pulls nvidia-* CUDA packages on a plain
-            # resolve, which must not land on a B70 box -- hence --no-deps and
-            # the explicit Intel-side deps below (docs/dev-setup.md).
-            python -m pip install --no-deps torch==2.13.0 \
-              --index-url https://download.pytorch.org/whl/xpu
-            python -m pip install \
-              oneccl==2022.0.0 oneccl-devel==2022.0.0 tbb==2023.0.0 \
-              umf==1.1.0 pyzes==0.1.1 tcmlib==1.5.0 triton-xpu==3.7.2 \
-              --index-url https://download.pytorch.org/whl/xpu
-            python -m pip install "sympy>=1.13.3"
-            python -m pip install \
-              onemkl-license==2026.0.0 onemkl-sycl-blas==2026.0.0 \
-              onemkl-sycl-dft==2026.0.0 onemkl-sycl-lapack==2026.0.0 \
-              onemkl-sycl-rng==2026.0.0 onemkl-sycl-sparse==2026.0.0 \
-              jinja2 networkx
-            python -m pip install --force-reinstall --no-deps \
-              intel-cmplr-lib-rt==2026.0.0 intel-cmplr-lib-ur==2026.0.0 \
-              intel-cmplr-lic-rt==2026.0.0 intel-sycl-rt==2026.0.0 \
-              intel-opencl-rt==2026.0.0 intel-openmp==2026.0.0 \
-              dpcpp-cpp-rt==2026.0.0 intel-pti==0.17.0
-          fi
-          . ./.venv-xpu/bin/activate
-          python -c "import torch; print('torch', torch.__version__); assert torch.xpu.is_available(), 'torch.xpu.is_available() is False -- the B70 ICD/oneAPI is not visible to this torch build (driver/ICD problem, not pip)'; print('XPU visible:', torch.xpu.device_count(), 'device(s)')"
-          echo "OK: .venv-xpu has torch with a live XPU (contract holds)."
 
       # The actual nightly payload. The conftest.py policy deselects xpu-marked
       # tests only when torch is ABSENT -- here torch is present, so `-m xpu`
