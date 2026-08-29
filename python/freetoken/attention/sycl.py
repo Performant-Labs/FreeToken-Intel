@@ -1,29 +1,411 @@
-"""Native SYCL attention on Xe2. Replaces FlashInfer / sgl-kernel CUDA.
+"""Native SYCL attention on Xe2 (replaces FlashInfer / sgl-kernel CUDA).
 
 Upstream NVIDIA path: python/freetoken/attention/fi.py + fa.py
 Fill in: GitHub issue `attn-sycl` (see docs/architecture.md).
+
+This is the *fast* attention backend for the Intel Arc Pro B70. Where the
+reference ``triton`` backend computes GQA attention in pure torch (correct but
+a Python loop over requests, with a gather per layer), this backend hands the
+whole batch to a hand-written oneAPI DPC++ (SYCL) kernel -- one ``nd_range``
+launch per phase that runs the full paged, grouped-query, causal (or sliding-
+window) attention on the B70. It implements the same ``BaseAttnBackend``
+contract, so the model's ``forward`` is unchanged.
+
+The kernel (``csrc/sycl/attention.cpp``) is compiled with ``icpx -fsycl`` and
+loaded through ``freetoken.kernel.utils`` (AOT cache + JIT fallback). All five
+pointers it touches -- ``q`` / ``k_cache`` / ``v_cache`` / ``table`` / ``out`` --
+are torch XPU (USM) tensors, and the kernel reads the layout note in that file
+for the exact per-phase ``table`` this module must build.
+
+Only an XPU can run it: on a CPU-only box the backend raises on first use (the
+engine's ``"auto"`` resolution never picks ``sycl`` -- ``torch`` is the default).
 """
 from __future__ import annotations
 
-from freetoken._stub import unimplemented
+import ctypes
+import pathlib
+
+import torch
+
+from freetoken.kernel import _toolchain, aot
+from freetoken.kernel import utils as kernel_utils
+
+from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
+
+# The compiled kernel's entry points (see csrc/sycl/attention.cpp).
+_KERNEL_NAME = "attention"
+_KERNEL_SRC = pathlib.Path(__file__).parent.parent / "kernel" / "csrc" / "sycl" / "attention.cpp"
+
+# (const float* q, const float* kc, const float* vc, const int* table,
+#  int bs, int K, int qh, int kv, int d, float sm_scale, int sliding_window,
+#  float* out)
+_FN_TYPES = [
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_float,
+    ctypes.c_int,
+    ctypes.c_void_p,
+]
 
 
-class SyclAttentionBackend:
-    def __init__(self, *args, **kwargs) -> None:
-        pass
+class SyclMetadata(BaseAttnMetadata):
+    """Per-phase USM ``table`` tensors the SYCL kernel reads (built on the CPU).
 
-    def forward(self, *args, **kwargs):
-        unimplemented("SyclAttentionBackend.forward", "attn-sycl")
+    A ``table`` is a torch XPU int32 tensor (a USM pointer the kernel can read --
+    see the memory-model note in ``attention.cpp``); row 0 carries the per-request
+    metadata and the remaining rows carry the key slot index for each attended
+    position. The stride differs by phase (decode ``[bs, K, 3]`` vs prefill
+    ``[bs, K, 5]``), so the two phases carry *separate* tables and are launched
+    separately -- a batch may mix prefills and decodes (the engine sets
+    ``batch.phase`` per the "any prefill?" rule), so each request is routed to the
+    kernel that matches its own phase.
+    """
 
-    def prepare_metadata(self, *args, **kwargs):
-        unimplemented("SyclAttentionBackend.prepare_metadata", "attn-sycl")
+    def __init__(self, decode: torch.Tensor | None, prefill: torch.Tensor | None) -> None:
+        self.decode = decode  # [bs_dec, K, 3] USM int32 (or None if no decode reqs)
+        self.prefill = prefill  # [bs_pre, K, 5] USM int32 (or None if no prefill reqs)
 
-    def init_capture_graph(self, *args, **kwargs):
-        unimplemented("SyclAttentionBackend.init_capture_graph", "attn-sycl")
+    def get_last_indices(self, bs: int) -> torch.Tensor:
+        # The model's per-layer forward consumes the tables via the global
+        # context, never via this accessor; the first ``bs`` slots are the decode
+        # rows (one per decode request).
+        if self.decode is None:
+            return torch.empty((bs,), dtype=torch.int32)
+        return self.decode[:, 0, 0][:bs]
 
-    def prepare_for_capture(self, *args, **kwargs):
-        unimplemented("SyclAttentionBackend.prepare_for_capture", "attn-sycl")
 
-    def prepare_for_replay(self, *args, **kwargs):
-        unimplemented("SyclAttentionBackend.prepare_for_replay", "attn-sycl")
+def _xpu_available() -> bool:
+    try:
+        return bool(getattr(torch, "xpu", None) and torch.xpu.is_available())
+    except Exception:
+        return False
 
+
+def _get_ctx():
+    from freetoken.core import get_global_ctx
+
+    return get_global_ctx()
+
+
+class SyclAttentionBackend(BaseAttnBackend):
+    """Paged grouped-query attention on the B70, driven by a native SYCL kernel.
+
+    ``forward(q, k, v, layer_id, batch, attn_spec)`` takes ``q`` head-major
+    ``[num_q_heads, num_tokens, head_dim]`` and ``k`` / ``v`` head-major
+    ``[num_kv_heads, num_tokens, head_dim]`` (the *new* tokens this step; one per
+    request in decode, the whole prompt in prefill). It builds the USM metadata
+    tables from the batch + page table, transposes the queries to the token-major
+    layout the kernel expects, routes each request to the kernel matching its own
+    phase (a batch may mix
+    prefills and decodes), and calls the compiled ``decode_attention`` /
+    ``prefill_attention`` entry point through ctypes. The K/V history is read
+    from the pool via the identity page table (slot ``pos`` holds the token at
+    position ``pos``), exactly as the reference backend does -- the kernel just
+    does the attention math on-device instead of in torch.
+    """
+
+    def __init__(self, config) -> None:
+        self.config = config
+        self.device = torch.device("xpu" if _xpu_available() else "cpu")
+        self.capture = None
+        self.capture_bs: list[int] = []
+        self.max_graph_bs = 0
+        # No graph capture in this backend: the reference engine does not drive
+        # capture/replay, and a SYCL nd_range launch is not a graph node.
+        # The fields exist so BaseAttnBackend.reset_capture() stays safe.
+        self._decode = None
+        self._prefill = None
+        self._kv_num_slots = self._resolve_num_slots(config)
+
+    # -- lazy kernel load ----------------------------------------------------
+
+    def _resolve_num_slots(self, config) -> int:
+        """The KV pool's slot count (``num_pages * page_size``).
+
+        The engine attaches the pool to the global context ahead of building the
+        backend, so read it from there; fall back to deriving it from the engine
+        config the way the pool is sized (``num_page_override`` or
+        ``max_running_req * max_seq_len``).
+        """
+        try:
+            pool = getattr(_get_ctx(), "kv_cache", None)
+            if pool is not None and hasattr(pool, "num_slots"):
+                return int(pool.num_slots)
+        except Exception:
+            pass
+        num_pages = config.num_page_override or (config.max_running_req * config.max_seq_len)
+        return int(num_pages) * int(config.page_size)
+
+    def _ensure_loaded(self) -> None:
+        """Compile (or load from the AOT cache) attention.cpp and bind entry points.
+
+        Done lazily on first use: the module imports cleanly on a CPU-only box
+        (it only touches torch.xpu when actually running a kernel), but the
+        compile needs the oneAPI toolchain + an XPU, so it must not run in the
+        constructor on a box that has neither.
+        """
+        if self._decode is not None:
+            return
+        if not _xpu_available():
+            raise RuntimeError(
+                "the SYCL attention backend requires a torch XPU device; "
+                "use the 'torch' (reference) backend on a CPU-only box"
+            )
+        if not _KERNEL_SRC.is_file():
+            raise _toolchain.ToolchainError(f"attention kernel source not found at {_KERNEL_SRC}")
+        # The existence check and the build must use the SAME cache key, else a
+        # miss-check against one key would dlopen a path the build never wrote
+        # (two historically-diverged keys: the JIT _build_key folds in the source
+        # bytes, the AOT cache_key did not -- a source edit then left the
+        # miss-check pointing at an empty dir while the build wrote elsewhere).
+        # Both now use aot.cache_key(name, source), which folds in the source.
+        cache_dir = kernel_utils._jit_cache_dir()
+        so_path = cache_dir / aot.cache_key(_KERNEL_NAME, str(_KERNEL_SRC)) / f"{_KERNEL_NAME}.so"
+        if not so_path.is_file():
+            aot.build_aot_cache(_KERNEL_NAME, str(_KERNEL_SRC), str(cache_dir))
+        self._module = kernel_utils.KernelModule(path=so_path, loaded=kernel_utils._load(so_path), from_cache=False)
+        decode = self._module.loaded.decode_attention
+        decode.argtypes = _FN_TYPES
+        decode.restype = None
+        prefill = self._module.loaded.prefill_attention
+        prefill.argtypes = _FN_TYPES
+        prefill.restype = None
+        self._decode = decode
+        self._prefill = prefill
+
+    def _ptr(self, tensor: torch.Tensor) -> ctypes.c_void_p:
+        return ctypes.c_void_p(tensor.data_ptr())
+
+    # -- BaseAttnBackend interface -------------------------------------------
+
+    def prepare_metadata(self, batch) -> None:
+        self.metadata = self._build_metadata(batch)
+
+    def init_capture_graph(self, max_seq_len: int, bs_list) -> None:
+        self.max_graph_bs = max(bs_list) if bs_list else 0
+
+    def prepare_for_capture(self, batch) -> None:
+        return None
+
+    def prepare_for_replay(self, batch) -> None:
+        # Nothing to rebind: forward() rebuilds the tables from the live batch.
+        return None
+
+    # -- metadata + forward ---------------------------------------------------
+
+    def _build_metadata(self, batch) -> SyclMetadata:
+        """Build the USM metadata tables from the batch + page table.
+
+        The model drives this backend **per request** (the decoder layer runs
+        each request's layers on its own hidden slice, so ``forward`` receives
+        one request's q/k/v at a time and passes that request's ``table_idx``).
+        The tables carry **one row per request, in batch order** (row ``b`` ==
+        ``batch.reqs[b]``); ``forward`` selects the row matching the current
+        ``table_idx`` and launches the kernel with ``bs=1`` over that row.
+        Requests are classified by their *own* phase (extend_len 1 -> decode,
+        else prefill) rather than the batch-level flag (a step may mix phases).
+        Row 0 of each request carries its slot / kv_len / qpos (and ext / cum_ext
+        for prefill); the remaining rows carry the key slot index for each
+        attended position from the pool's identity page table.
+        """
+        device = self.device
+        pool = _get_ctx().kv_cache
+        K = self._kv_num_slots
+
+        # Per-request phase: a request is in *decode* once a token has been
+        # generated (device_len > len(input_ids)); its first step is *prefill*.
+        # This is the SAME signal the engine's step() and the model's forward use
+        # (NOT ``req.extend_len == 1`` -- extend_len is device_len - cached_len
+        # and grows every step, so it is 1 only on a degenerate first decode).
+        # The per-request new-token count comes from ``batch.extend_lens`` (the
+        # engine's authoritative vector: prompt_len in prefill, 1 in decode).
+        dec_idx: list[int] = []
+        pre_idx: list[int] = []
+        for b, req in enumerate(batch.reqs):
+            (dec_idx if req.device_len != len(req.input_ids) else pre_idx).append(b)
+        bs_dec, bs_pre = len(dec_idx), len(pre_idx)
+
+        # ``positions`` / ``out_loc`` are token-indexed: one entry per *new* token,
+        # flattened across requests in request order. Request ``b``'s new tokens
+        # occupy the *global* token range [gbase[b], gbase[b] + ext_b). Under the
+        # identity page table the new token's out_loc slot == its absolute position
+        # == gbase[b] + j, so deriving the query position / history length from
+        # gbase (NOT from out_loc[i] indexed by the request's position in its own
+        # phase list -- that only coincides with the token offset in a pure
+        # single-phase batch) keeps the metadata correct for mixed-phase batches.
+        # Per-request new-token counts: the engine's authoritative vector
+        # (prompt_len in prefill, 1 in decode), else derive from request state.
+        # Flatten to plain ints (extend_lens may be a tensor) so downstream
+        # indexing / arithmetic is dtype-independent.
+        exts = batch.extend_lens
+        if exts is not None:
+            exts = [int(e) for e in exts]
+        else:
+            exts = [
+                (r.device_len - r.cached_len) if r.device_len == len(r.input_ids) else 1
+                for r in batch.reqs
+            ]
+        # gbase[b] = the global *token* offset of request b's first new token
+        # (cumulative sum of the preceding requests' extend lengths) -- the index
+        # into the flattened batch.positions / batch.out_loc tensors.
+        gbase = [0]
+        for e in exts[:-1]:
+            gbase.append(gbase[-1] + e)
+
+        # The causal mask compares a query's *absolute* position (its index in the
+        # sequence) against the key positions (0 .. kv_len-1). batch.positions is
+        # the flatten of absolute positions in token order, so this request's
+        # first new token's absolute position is batch.positions[gbase[b]]. (The
+        # token offset gbase[b] itself is NOT the absolute position once a request
+        # has generated tokens -- a decode request at token offset b sits at
+        # absolute position device_len-1.)
+        positions = batch.positions
+        if positions is None:
+            # No token tensors (defensive): fall back to the token offsets, which
+            # equal the absolute positions only in a pure first-step prefill batch.
+            positions = torch.tensor(gbase, dtype=torch.int64)
+
+        dec_table = torch.zeros((max(bs_dec, 1), K, 3), dtype=torch.int32)
+        for i, b in enumerate(dec_idx):
+            req = batch.reqs[b]
+            kv_len = req.device_len  # full history incl. the just-appended token
+            qpos = int(positions[gbase[b]].item())  # absolute position of the new token
+            dec_table[i, 0, 0] = qpos
+            dec_table[i, 0, 1] = kv_len
+            dec_table[i, 0, 2] = qpos
+            dec_table[i, 1 : 1 + kv_len, 0] = pool.page_table[req.table_idx, torch.arange(kv_len)]
+
+        pre_table = torch.zeros((max(bs_pre, 1), K, 5), dtype=torch.int32)
+        for i, b in enumerate(pre_idx):
+            req = batch.reqs[b]
+            ext = exts[b]
+            qpos0 = int(positions[gbase[b]].item())  # absolute pos of first new token
+            kv_len = req.cached_len + ext  # all history through this step
+            pre_table[i, 0, 0] = qpos0
+            pre_table[i, 0, 1] = kv_len
+            pre_table[i, 0, 2] = qpos0
+            pre_table[i, 0, 3] = ext
+            pre_table[i, 0, 4] = 0  # per-request launch: this slice starts at token 0
+            pre_table[i, 1 : 1 + kv_len, 0] = pool.page_table[req.table_idx, torch.arange(kv_len)]
+
+        # The kernel reads the tables as USM pointers; they must be torch XPU
+        # tensors (a host tensor's data_ptr is not a USM pointer and the kernel
+        # could not read it -- see the memory-model note in attention.cpp).
+        # .to(device) + synchronize makes the host-built tables visible to the
+        # device before any kernel reads them.
+        dec_usm = dec_table.to(device) if bs_dec else None
+        pre_usm = pre_table.to(device) if bs_pre else None
+        torch.xpu.synchronize()
+        return SyclMetadata(dec_usm, pre_usm)
+
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        layer_id: int,
+        batch,
+        attn_spec: AttentionSpec | None = None,
+        table_idx: int | None = None,
+    ) -> torch.Tensor:
+        # The model drives this backend **per request**: the decoder layer runs
+        # each request's layers on its own hidden slice, so q/k/v hold ONLY this
+        # request's new tokens (head-major [heads, ext, d]) and ``table_idx``
+        # names the request. We therefore launch the kernel with ``bs=1`` over
+        # this request's table row -- row ``b`` of the (one-row-per-request,
+        # batch-ordered) table is ``batch.reqs[b]``, so the row to launch is the
+        # one whose table_idx matches. The output is written back to the same
+        # [heads, ext, d] token-major block the model reads via out.transpose.
+        self._ensure_loaded()
+        window = int(attn_spec.sliding_window) if (attn_spec is not None and attn_spec.sliding_window) else 0
+        metadata = getattr(self, "metadata", None)
+        if metadata is None:
+            metadata = self._build_metadata(batch)
+            self.metadata = metadata
+        qh = q.shape[0]
+        kv = k.shape[0]
+        d = q.shape[-1]
+        ext = q.shape[1]
+        sm_scale = (
+            float(attn_spec.sm_scale)
+            if (attn_spec is not None and attn_spec.sm_scale is not None)
+            else (1.0 / (d ** 0.5))
+        )
+        pool = _get_ctx().kv_cache
+        k_cache, v_cache = pool.k_buffer, pool.v_buffer
+        table_dim = self._kv_num_slots  # the pool's slot count -- the kernel's slot bound
+
+        # The kernel's table ABI indexes request ``i`` at table row ``i`` and
+        # reads rows [i, i+K). A ``bs=1`` launch of *this* request must therefore
+        # sit at table row 0. The stored table has one row per request in batch
+        # order, so find this request's row and make a 1-row USM view of it.
+        req = next((r for r in batch.reqs if table_idx is None or r.table_idx == table_idx), batch.reqs[0])
+        b = batch.reqs.index(req)
+        # Same phase signal as _build_metadata / the engine's step(): a request
+        # is in decode once a token has been generated (device_len grew past the
+        # prompt length). NOT ``extend_len == 1`` (that grows every step).
+        is_decode = req.device_len != len(req.input_ids)
+        table = metadata.decode if is_decode else metadata.prefill
+        if table is None:
+            # No rows of this phase were built (should not happen when the
+            # request is of this phase); fall back to the other phase's table.
+            table = metadata.decode if metadata.prefill is None else metadata.prefill
+        # The stored table has one row per request *of this phase*, in batch
+        # order: row i == the i-th request (in batch order) of this phase --
+        # exactly the dec_idx / pre_idx order _build_metadata used. The kernel's
+        # bs=1 launch reads rows [0, 0+K), so point it at this request's row by
+        # passing a 1-row USM slice at the phase-list index (a torch slice of an
+        # XPU tensor stays USM-backed: same storage, a row offset). Count the
+        # matching-phase requests up to and including this one (b) to get the
+        # phase-list index.
+        phase_idx = sum(1 for j in range(b + 1) if (batch.reqs[j].device_len != len(batch.reqs[j].input_ids)) == is_decode) - 1
+        one_row = table[phase_idx : phase_idx + 1]
+        # q is head-major [qh, ext, d]; the kernel wants token-major [ext, qh, d].
+        q_tok = q.transpose(0, 1).contiguous()
+        out = torch.zeros((ext, qh, d), device=q.device, dtype=torch.float32)
+
+        torch.xpu.synchronize()
+        if is_decode:
+            self._decode(
+                self._ptr(q_tok),
+                self._ptr(k_cache),
+                self._ptr(v_cache),
+                self._ptr(one_row),
+                1,
+                table_dim,
+                qh,
+                kv,
+                d,
+                ctypes.c_float(sm_scale),
+                window,
+                self._ptr(out),
+            )
+        else:
+            self._prefill(
+                self._ptr(q_tok),
+                self._ptr(k_cache),
+                self._ptr(v_cache),
+                self._ptr(one_row),
+                1,
+                table_dim,
+                qh,
+                kv,
+                d,
+                ctypes.c_float(sm_scale),
+                window,
+                self._ptr(out),
+            )
+        torch.xpu.synchronize()
+        # The kernel wrote token-major [ext, qh, d]; the model wants head-major
+        # [qh, ext, d] (it does o_proj on out.transpose(1, 2)).
+        return out.transpose(0, 1).contiguous()
+
+
+__all__ = ["SyclAttentionBackend", "SyclMetadata"]

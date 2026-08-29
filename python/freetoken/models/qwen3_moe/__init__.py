@@ -153,6 +153,15 @@ class _Qwen3Attention(nn.Module):
         return (x_f * cos + rotated * sin).to(x.dtype)
 
     def forward(self, hidden_states, positions, table_idx, ctx, batch):
+        # ``hidden_states`` is *this request's* hidden slice -- the decoder layer
+        # runs each request's layers on its own token rows (hidden[token_slice]),
+        # so the slice length is this request's new-token count, NOT the
+        # whole batch's token count. Project that slice (bsz = its length), not
+        # the whole batch, and write *only those* K/V rows to the pool: a
+        # whole-batch projection would write every request's K/V into this
+        # request's out_loc (a cross-request KV corruption). This is why the
+        # prefill batch is correct on XPU -- the pool row count matches the
+        # number of out_loc entries this request actually writes.
         bsz, _ = hidden_states.shape
         # Lay the projections out head-major [heads, tokens, head_dim]: the
         # attention backend expects q/k/v in that order (so the per-request
@@ -164,10 +173,19 @@ class _Qwen3Attention(nn.Module):
         v = self.v_proj(hidden_states).view(self.num_kv_heads, bsz, self.head_dim)
         q = self._rope(self.q_norm(q), positions)
         k = self._rope(self.k_norm(k), positions)
-        # Append this step's K/V to the paged pool (token-ordered, so the
-        # out_loc gather aligns), then attend over the full KV history.
-        ctx.kv_cache.write_kv(k, v, batch.out_loc)
-        out = ctx.attn_backend.forward(q, k, v, self.layer_id, batch)
+        # Append this request's K/V to the pool. ``positions`` here is this
+        # request's token positions (the decoder layer passed
+        # positions[token_slice]); the new token's out_loc slot equals its
+        # absolute position under the identity page table, so index out_loc by
+        # this request's positions rather than the whole-batch out_loc.
+        ctx.kv_cache.write_kv(k, v, positions)
+        # ``table_idx`` identifies *this* request (the decoder layer runs each
+        # request's layers on its own hidden slice, so q/k/v hold only this
+        # request's new tokens, not the whole batch's). The backend uses it to
+        # read this request's KV history from the pool and to interpret the
+        # per-request q/k/v; without it a backend cannot tell which request is
+        # 'current' when a step mixes multiple requests.
+        out = ctx.attn_backend.forward(q, k, v, self.layer_id, batch, table_idx=table_idx)
         return self.o_proj(out.transpose(1, 2).reshape(bsz, -1))
 
 
@@ -390,6 +408,16 @@ class Qwen3MoeForCausalLM(nn.Module):
             self.moe_offload = False
         self.moe_cache = None
         self.moe_layer_id = None
+        # The modules above (nn.Linear / nn.RMSNorm) are registered on the CPU,
+        # and the loader fills them in place without moving them -- so without
+        # this the dense weights (norms, projections, lm_head) would stay on the
+        # CPU while the engine feeds XPU activations, and the first forward would
+        # hit a device mismatch. Move the whole module to its target device here
+        # (a no-op for the CPU reference path). The host-offload path is
+        # unaffected: parse_config never sets use_offload_moe, so this branch
+        # only moves in-VRAM models, whose expert params are not built here.
+        if self.device.type != "cpu":
+            self.to(self.device)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, out_loc: torch.Tensor) -> torch.Tensor:
         """Run one engine step; return the **last-position** logits ``[bs, V]``.
@@ -410,15 +438,19 @@ class Qwen3MoeForCausalLM(nn.Module):
         out = torch.empty((batch.size, self.config.hidden_size), device=hidden.device, dtype=hidden.dtype)
 
         offset = 0
-        # The engine tags the prompt step ``phase="prefill"`` and every later
-        # step ``phase="decode"`` (see engine.step). ``batch.is_prefill`` is the
-        # authoritative phase signal; the ``num_tokens > batch.size`` check is a
-        # phase-independent fallback (a prefill step carries >1 token per request,
-        # a decode step exactly one) so the forward is correct even if a caller
-        # hands a decode-tagged prompt.
-        prefill = batch.is_prefill or (num_tokens > batch.size)
+        # Per-request token counts, in request order. The engine sets these in
+        # step() (extend_len for a request still prefilling its prompt, 1 once
+        # it has entered decode) so a step that mixes phases sizes each
+        # request's slice by its own count -- a single batch-level phase flag
+        # would over/under-slice in a mixed batch. When a caller doesn't
+        # populate them (it never does via the engine), fall back to the old
+        # global-phase heuristic.
+        extend_lens = batch.extend_lens
+        if extend_lens is None:
+            prefill = batch.is_prefill or (num_tokens > batch.size)
+            extend_lens = [req.extend_len if prefill else 1 for req in reqs]
         for i, req in enumerate(reqs):
-            ext = req.extend_len if prefill else 1
+            ext = int(extend_lens[i])
             token_slice = slice(offset, offset + ext)
             h = hidden[token_slice]
             for layer in self.layers:

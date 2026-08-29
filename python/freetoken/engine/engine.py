@@ -181,6 +181,7 @@ class Engine:
         input_ids: List[int] = []
         positions: List[int] = []
         out_locs: List[int] = []
+        extend_lens: List[int] = []
         for req in reqs:
             # Per-request phase: prefill while no token has been generated yet
             # (the whole prompt is new), decode afterwards (one new token).
@@ -194,16 +195,23 @@ class Engine:
                     positions.append(pos)
                     out_locs.append(pos)
             else:  # decode: one new token per request
+                ext = 1
                 pos = req.device_len - 1
                 last = req.input_ids
                 input_ids.append(int(last[-1]))
                 positions.append(pos)
                 out_locs.append(pos)
+            extend_lens.append(ext)
 
         device = self.device
         batch.input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
         batch.positions = torch.tensor(positions, dtype=torch.int64, device=device)
         batch.out_loc = torch.tensor(out_locs, dtype=torch.int64, device=device)
+        # Per-request new-token counts (extend_len in prefill, 1 in decode) in
+        # request order. The model's forward slices the token tensors by these
+        # instead of a single batch-level phase flag, so a step that mixes
+        # prefill and decode requests slices each request's tokens by its own count.
+        batch.extend_lens = torch.tensor(extend_lens, dtype=torch.int64, device=device)
 
         with self.ctx.forward_batch(batch):
             self.attn_backend.prepare_metadata(batch)

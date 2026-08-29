@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from .base import AttentionSpec, AttnType, BaseAttnBackend, BaseAttnMetadata
+from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 
 
 class TritonMetadata(BaseAttnMetadata):
@@ -63,23 +63,24 @@ class TritonAttentionBackend(BaseAttnBackend):
     def prepare_for_replay(self, batch) -> None:
         return None
 
-    def forward(self, q, k, v, layer_id: int, batch, attn_spec: AttentionSpec | None = None) -> torch.Tensor:
-        # q / k / v: [num_tokens, heads, head_dim] (token-ordered across the
-        # batch). For decode, one token per request, so num_tokens == bs.
-        # The KV pool holds each request's *written* history (prompt during
-        # prefill, full history during decode); the new tokens' K/V were just
-        # written into it, so reading ``written`` rows covers the full context.
-        #
-        # The model lays the per-token K/V out **head-major**: q / k / v are
-        # [heads, tokens, head_dim]. The pool is token-major [tokens, kv, D],
-        # so to attend we transpose the read to head-major [kv, tokens, D] and
-        # expand the KV head dim to the full query head count (GQA) by
-        # repeating along dim 0. That makes
-        #   scores = qh [H, qlen, D] @ k_all.t [D, T]  -> [H, qlen, T]
-        # (heads on dim 0, query tokens dim 1, key tokens dim 2), so the
-        # causal mask is [1, qlen, T] -- broadcast over the head dim.
-        ctx = _get_ctx()
-        kv_cache = ctx.kv_cache
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        layer_id: int,
+        batch,
+        attn_spec: AttentionSpec | None = None,
+        table_idx: int | None = None,
+    ) -> torch.Tensor:
+        # q / k / v: [heads, tokens, head_dim] (head-major), holding the *new*
+        # tokens for the request(s) this step processes. The model runs each
+        # request's layers on its own hidden slice, so when ``table_idx`` is
+        # given (the per-request call pattern the model uses), q/k/v hold ONLY
+        # that one request's tokens -- attend them against that request's KV
+        # history from the pool. When ``table_idx`` is None (a caller that hands
+        # the whole batch's tokens in one call), fall back to the original
+        # walk-the-batch behavior.
         # q / k / v are head-major [heads, tokens, head_dim], so the head count
         # is dim 0 (dim 1 is the token dim -- do NOT read heads from there).
         num_heads = q.shape[0]
@@ -88,42 +89,74 @@ class TritonAttentionBackend(BaseAttnBackend):
         scale = 1.0 / (q.shape[-1] ** 0.5)
 
         out = torch.empty_like(q)
-        # Walk the batch in token order (matches the model's per-request slicing
-        # and the flattened out_loc / positions tensors).
+
+        # Locate the request this call is for. With ``table_idx`` (the model's
+        # per-request call pattern) q/k/v hold ONLY that request's tokens, so we
+        # attend the whole q against that request's history in one shot. Without
+        # it (a caller passing the whole batch's tokens) we walk the batch by
+        # global token offset -- the original behavior.
+        if table_idx is not None:
+            req = next((r for r in batch.reqs if r.table_idx == table_idx), batch.reqs[0])
+            ext = q.shape[1]
+            # Per-request phase (NOT the batch-level flag -- a batch can mix
+            # phases): a request is decoding once a token has been generated.
+            is_decode = req.device_len != len(req.input_ids)
+            written = req.device_len if is_decode else ext
+            q_pos = self._request_positions(batch, table_idx, ext)
+            out[:] = self._attend_one(req, q, q_pos, written, repeat, scale)
+            return out
+
+        # Whole-batch call (table_idx is None): q/k/v span all requests, so walk
+        # the batch in token order (matches the flattened out_loc / positions).
+        # Each request's phase is decided per-request (a batch can mix phases).
         token_idx = 0
-        for i, req in enumerate(batch.reqs):
-            if batch.is_decode:
-                ext = 1
-                written = req.device_len  # full history (new token already in pool)
-            else:
-                ext = req.extend_len
-                written = ext  # only this request's prompt tokens are in the pool
-            # Read the request's KV history from the pool (token-major
-            # [written, kv, D]), then transpose to head-major [kv, written, D].
-            k_tok, v_tok = kv_cache.read_kv(req.table_idx, torch.arange(written, device=q.device))
-            k_all = k_tok.transpose(0, 1).contiguous()  # [kv, written, D]
-            v_all = v_tok.transpose(0, 1).contiguous()  # [kv, written, D]
-            if repeat != 1:
-                # GQA: repeat each KV head so there is one key/value per query
-                # head. repeat along dim 0 -> [num_heads, written, D].
-                k_all = k_all.repeat(repeat, 1, 1)
-                v_all = v_all.repeat(repeat, 1, 1)
-            # This request's new queries (token slice). q is head-major
-            # [heads, tokens, D], so slice the token (middle) dim.
-            qh = q[:, token_idx : token_idx + ext, :]  # [heads, qlen, D]
-            # scores = qh @ k_all^T -> [heads, qlen, written]: heads on dim 0,
-            # query-token on dim 1, key-token on dim 2. The causal mask must
-            # therefore be [1, qlen, written] (broadcast over the head dim),
-            # comparing query positions (dim 1) against key positions (dim 2).
+        for req in batch.reqs:
+            is_decode = req.device_len != len(req.input_ids)
+            ext = 1 if is_decode else req.extend_len
+            written = req.device_len if is_decode else req.extend_len
+            qh = q[:, token_idx : token_idx + ext, :]
             q_pos = batch.positions[token_idx : token_idx + ext]
-            key_pos = torch.arange(written, device=q.device)
-            allowed = q_pos[None, :, None] >= key_pos[None, None, :]  # [1, qlen, written]
-            scores = torch.matmul(qh, k_all.transpose(-1, -2)) * scale
-            scores = torch.where(allowed, scores, torch.full_like(scores, float("-inf")))
-            o = torch.matmul(torch.softmax(scores, dim=-1), v_all)  # [heads, qlen, D]
-            out[:, token_idx : token_idx + ext, :] = o
+            out[:, token_idx : token_idx + ext, :] = self._attend_one(req, qh, q_pos, written, repeat, scale)
             token_idx += ext
         return out
+
+    def _attend_one(self, req, qh, q_pos, written, repeat, scale) -> torch.Tensor:
+        """Attend a block of query rows against one request's KV history."""
+        ctx = _get_ctx()
+        kv_cache = ctx.kv_cache
+        dev = qh.device
+        k_tok, v_tok = kv_cache.read_kv(req.table_idx, torch.arange(written, device=dev))
+        k_all = k_tok.transpose(0, 1).contiguous()  # [kv, written, D]
+        v_all = v_tok.transpose(0, 1).contiguous()  # [kv, written, D]
+        if repeat != 1:
+            # GQA: repeat each KV head so there is one key/value per query head.
+            k_all = k_all.repeat(repeat, 1, 1)  # [num_heads, written, D]
+            v_all = v_all.repeat(repeat, 1, 1)
+        # scores = qh @ k_all^T -> [heads, qlen, written]. Causal mask is
+        # [1, qlen, written] (broadcast over the head dim), comparing query
+        # positions (dim 1) against key positions (dim 2).
+        key_pos = torch.arange(written, device=dev)
+        allowed = q_pos[None, :, None] >= key_pos[None, None, :]
+        scores = torch.matmul(qh, k_all.transpose(-1, -2)) * scale
+        scores = torch.where(allowed, scores, torch.full_like(scores, float("-inf")))
+        return torch.matmul(torch.softmax(scores, dim=-1), v_all)  # [heads, qlen, D]
+
+    def _request_positions(self, batch, table_idx: int, ext: int) -> torch.Tensor:
+        """This request's new-token positions (for the causal mask).
+
+        ``batch.positions`` is the whole-batch flatten in request order; the
+        request identified by ``table_idx`` occupies a contiguous run of ``ext``
+        positions starting at its global token offset (cumulative extend lengths
+        of the preceding requests).
+        """
+        offset = 0
+        for r in batch.reqs:
+            if r.table_idx == table_idx:
+                break
+            # Per-request phase: a request that has generated a token is in
+            # decode (one new token this step); otherwise it is prefilling.
+            offset += 1 if (r.device_len != len(r.input_ids)) else r.extend_len
+        return batch.positions[offset : offset + ext]
 
 
 def _xpu_available() -> bool:

@@ -61,6 +61,7 @@ def create_triton_backend(config):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
         requires_sycl=True,
+        consumes_attn_spec=True,
     ),
 )
 def create_sycl_backend(config):

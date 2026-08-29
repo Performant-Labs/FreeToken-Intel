@@ -70,6 +70,13 @@ class Batch:
     input_ids: object | None = None
     positions: object | None = None
     out_loc: object | None = None
+    # Per-request new-token count (== extend_len in prefill, 1 in decode), in
+    # request order. The model's per-request forward slices the token tensors by
+    # these; the engine fills it in step(). A batch may mix phases (one request
+    # still prefilling its prompt, another already decoding), so a single
+    # batch-level phase flag is NOT enough to size each request's slice -- this
+    # per-request vector is the authoritative count.
+    extend_lens: object | None = None
 
     @property
     def is_prefill(self) -> bool:
