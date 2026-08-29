@@ -59,13 +59,15 @@ class SyclMetadata(BaseAttnMetadata):
     """Per-phase USM ``table`` tensors the SYCL kernel reads (built on the CPU).
 
     A ``table`` is a torch XPU int32 tensor (a USM pointer the kernel can read --
-    see the memory-model note in ``attention.cpp``); row 0 carries the per-request
-    metadata and the remaining rows carry the key slot index for each attended
-    position. The stride differs by phase (decode ``[bs, K, 3]`` vs prefill
-    ``[bs, K, 5]``), so the two phases carry *separate* tables and are launched
-    separately -- a batch may mix prefills and decodes (the engine sets
-    ``batch.phase`` per the "any prefill?" rule), so each request is routed to the
-    kernel that matches its own phase.
+    see the memory-model note in ``attention.cpp``). Each request ``b`` owns a
+    block of ``K`` rows; the key slot for attended position ``p`` (``0 <= p <
+    kv_len``) is read from row ``b*K + p``, column 0, so the ``kv_len`` key slots
+    occupy rows ``[0, kv_len)`` -- *including row 0*, whose other columns carry
+    the per-request metadata (``kv_len``, ``qpos``[/``ext``]). The stride differs
+    by phase (decode ``[bs, K, 3]`` vs prefill ``[bs, K, 5]``), so the two phases
+    carry *separate* tables and are launched separately -- a batch may mix
+    prefills and decodes (the engine sets ``batch.phase`` per the "any prefill?"
+    rule), so each request is routed to the kernel that matches its own phase.
     """
 
     def __init__(self, decode: torch.Tensor | None, prefill: torch.Tensor | None) -> None:
@@ -73,12 +75,14 @@ class SyclMetadata(BaseAttnMetadata):
         self.prefill = prefill  # [bs_pre, K, 5] USM int32 (or None if no prefill reqs)
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
-        # The model's per-layer forward consumes the tables via the global
-        # context, never via this accessor; the first ``bs`` slots are the decode
-        # rows (one per decode request).
+        # Vestigial interface method: the model's per-layer forward consumes the
+        # tables via the global context, never via this accessor. For the decode
+        # table, row 0 col 0 is the *first* key slot and row 0 col 2 is the query
+        # position (the row-0 layout is [slot, kv_len, qpos]); the "last index" a
+        # decode request attends up to is its query position, so return col 2.
         if self.decode is None:
             return torch.empty((bs,), dtype=torch.int32)
-        return self.decode[:, 0, 0][:bs]
+        return self.decode[:, 0, 2][:bs]
 
 
 def _xpu_available() -> bool:
@@ -272,15 +276,25 @@ class SyclAttentionBackend(BaseAttnBackend):
             # equal the absolute positions only in a pure first-step prefill batch.
             positions = torch.tensor(gbase, dtype=torch.int64)
 
+        # The kernel's table ABI (attention.cpp): row 0 of a request's block is
+        # [slot, kv_len, qpos] (decode, stride 3) or [slot, kv_len, qpos0, ext,
+        # cum_ext] (prefill, stride 5), and the key-slot for position p is read
+        # from row p col 0 for p in 0..kv_len-1. So the key slots occupy rows
+        # [0, kv_len) -- row 0 col 0 is the *first* slot, and the last slot (row
+        # kv_len-1) is the newest. (Storing qpos at row 0 col 0 and the slots at
+        # rows [1, kv_len) -- the obvious-looking layout -- is an off-by-one that
+        # reads qpos as a slot and drops the newest key; it is invisible with
+        # zeroed weights but corrupts attention on real weights.)
         dec_table = torch.zeros((max(bs_dec, 1), K, 3), dtype=torch.int32)
         for i, b in enumerate(dec_idx):
             req = batch.reqs[b]
             kv_len = req.device_len  # full history incl. the just-appended token
             qpos = int(positions[gbase[b]].item())  # absolute position of the new token
-            dec_table[i, 0, 0] = qpos
             dec_table[i, 0, 1] = kv_len
             dec_table[i, 0, 2] = qpos
-            dec_table[i, 1 : 1 + kv_len, 0] = pool.page_table[req.table_idx, torch.arange(kv_len)]
+            # Key slots for positions 0..kv_len-1 -> rows 0..kv_len-1 col 0
+            # (row 0 col 0 is the first slot; it shares row 0 with kv_len/qpos).
+            dec_table[i, 0 : kv_len, 0] = pool.page_table[req.table_idx, torch.arange(kv_len)]
 
         pre_table = torch.zeros((max(bs_pre, 1), K, 5), dtype=torch.int32)
         for i, b in enumerate(pre_idx):
@@ -288,12 +302,12 @@ class SyclAttentionBackend(BaseAttnBackend):
             ext = exts[b]
             qpos0 = int(positions[gbase[b]].item())  # absolute pos of first new token
             kv_len = req.cached_len + ext  # all history through this step
-            pre_table[i, 0, 0] = qpos0
             pre_table[i, 0, 1] = kv_len
             pre_table[i, 0, 2] = qpos0
             pre_table[i, 0, 3] = ext
             pre_table[i, 0, 4] = 0  # per-request launch: this slice starts at token 0
-            pre_table[i, 1 : 1 + kv_len, 0] = pool.page_table[req.table_idx, torch.arange(kv_len)]
+            # Key slots for positions 0..kv_len-1 -> rows 0..kv_len-1 col 0.
+            pre_table[i, 0 : kv_len, 0] = pool.page_table[req.table_idx, torch.arange(kv_len)]
 
         # The kernel reads the tables as USM pointers; they must be torch XPU
         # tensors (a host tensor's data_ptr is not a USM pointer and the kernel

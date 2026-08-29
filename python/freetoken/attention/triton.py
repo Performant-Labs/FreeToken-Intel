@@ -129,9 +129,14 @@ class TritonAttentionBackend(BaseAttnBackend):
         k_all = k_tok.transpose(0, 1).contiguous()  # [kv, written, D]
         v_all = v_tok.transpose(0, 1).contiguous()  # [kv, written, D]
         if repeat != 1:
-            # GQA: repeat each KV head so there is one key/value per query head.
-            k_all = k_all.repeat(repeat, 1, 1)  # [num_heads, written, D]
-            v_all = v_all.repeat(repeat, 1, 1)
+            # GQA: query head h attends KV head h // repeat. That is an
+            # *interleave* of the KV heads ([0,0,1,1] for 2 kv heads, repeat 2),
+            # NOT a tile ([0,1,0,1]) -- `.repeat(repeat, ...)` tiles the whole
+            # axis and would map query heads to the wrong KV head whenever there
+            # are multiple KV heads (head 1 would read KV head 1 instead of 0).
+            # `repeat_interleave` gives the correct h // repeat mapping.
+            k_all = k_all.repeat_interleave(repeat, dim=0)  # [num_heads, written, D]
+            v_all = v_all.repeat_interleave(repeat, dim=0)
         # scores = qh @ k_all^T -> [heads, qlen, written]. Causal mask is
         # [1, qlen, written] (broadcast over the head dim), comparing query
         # positions (dim 1) against key positions (dim 2).
