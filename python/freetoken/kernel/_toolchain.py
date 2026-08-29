@@ -1,8 +1,8 @@
 """Locate the Intel oneAPI DPC++ toolchain (icpx) and its SYCL flags.
 
-Upstream NVIDIA path: ``python/freetoken/kernel/_toolchain.py`` (locates ``nvcc``
-and checks it matches torch's CUDA build). The Intel equivalent is the oneAPI
-DPC++ compiler ``icpx`` and the ``-fsycl`` flags that build a Level Zero
+Upstream NVIDIA path: the same filename in the reference repo locates the
+NVIDIA GPU compiler and checks it matches torch's GPU build. The Intel equivalent is the
+oneAPI DPC++ compiler ``icpx`` and the ``-fsycl`` flags that build a Level Zero
 program. Filled in for GitHub issue ``kernel-sycl`` (see docs/architecture.md).
 
 Everything here is import-safe on a CPU-only box: locating ``icpx`` shells out

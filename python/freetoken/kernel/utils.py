@@ -1,10 +1,11 @@
 """Kernel build/load helpers for the Intel SYCL toolchain.
 
-Upstream NVIDIA path: ``python/freetoken/kernel/utils.py`` (compile with nvcc,
-load with tvm-ffi). The Intel equivalent: compile with ``icpx -fsycl`` (which
-links the SYCL runtime + Level Zero loader), and load the resulting shared
-object with :mod:`ctypes` -- ``tvm_ffi`` is not a dependency of the XPU venv,
-and a raw ``extern "C"`` entry point is all the toolchain smoke test needs.
+Upstream NVIDIA path: the same filename in the reference repo compiles with
+the NVIDIA GPU compiler and loads with tvm-ffi. The Intel equivalent: compile
+with ``icpx -fsycl`` (which links the SYCL runtime + Level Zero loader), and
+load the resulting shared object with :mod:`ctypes` -- ``tvm_ffi`` is not a
+dependency of the XPU venv, and a raw ``extern "C"`` entry point is all the
+toolchain smoke test needs.
 
 Filled in for GitHub issue ``kernel-sycl`` (see docs/architecture.md).
 """
