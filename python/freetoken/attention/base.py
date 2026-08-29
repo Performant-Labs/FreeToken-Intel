@@ -35,7 +35,16 @@ class BaseAttnMetadata(ABC):
 
 class BaseAttnBackend(ABC):
     @abstractmethod
-    def forward(self, q, k, v, layer_id: int, batch, attn_spec: AttentionSpec | None = None): ...
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        layer_id: int,
+        batch,
+        attn_spec: AttentionSpec | None = None,
+        table_idx: int | None = None,
+    ): ...
 
     @abstractmethod
     def prepare_metadata(self, batch) -> None: ...
@@ -63,9 +72,18 @@ class HybridBackend(BaseAttnBackend):
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
 
-    def forward(self, q, k, v, layer_id: int, batch, attn_spec: AttentionSpec | None = None):
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        layer_id: int,
+        batch,
+        attn_spec: AttentionSpec | None = None,
+        table_idx: int | None = None,
+    ):
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
-        return backend.forward(q, k, v, layer_id, batch, attn_spec=attn_spec)
+        return backend.forward(q, k, v, layer_id, batch, attn_spec=attn_spec, table_idx=table_idx)
 
     def prepare_metadata(self, batch) -> None:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
