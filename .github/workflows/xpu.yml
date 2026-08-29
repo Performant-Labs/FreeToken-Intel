@@ -254,10 +254,20 @@ jobs:
       # forward reference that GitHub rejects and actionlint flags.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # UNGATED (no `if`): runs BEFORE the headroom guard so its probe has a
-      # torch-capable interpreter (.venv-xpu/bin/python) -- a tenant's torch
-      # lives in its OWN venv, so the image's python3 cannot probe headroom
-      # (and the Source step after the guard is still gated on its scope).
+      # Runs BEFORE the headroom guard so its probe has a torch-capable
+      # interpreter (.venv-xpu/bin/python) -- a tenant's torch lives in its OWN
+      # venv, so the image's python3 cannot probe headroom (on a fresh, busy box
+      # it would read 'no torch -> idle' and run the FULL suite against the
+      # tenant). (And the Source step after the guard is still gated on its scope.)
+      #
+      # GATED on the DISPATCH input, not on the guard: on `schedule` (cron) the
+      # dispatch inputs are empty, so `inputs.scope != 'skip'` is true and the
+      # venv is built for the auto probe -- which is the whole point of the guard.
+      # A MANUAL `scope=skip` is a deliberate "don't touch the B70" no-op, so we
+      # bypass the build (zero cost, and it cannot fail on a fresh image with no
+      # network to the XPU index). This is what lets `scope=skip` remain a true
+      # escape hatch even after this step moved ahead of the guard.
+      #
       # The dual-venv contract says torch lives ONLY in .venv-xpu. The CPU CI
       # job (ci.yml) enforces the install-side half with a hard "import torch
       # must FAIL" guard on the CPU venv; THIS job is the other half -- the
@@ -272,6 +282,7 @@ jobs:
       # XPU index, a broken wheel tag), the step fails loudly: that is real
       # drift, not a "skip the torch tests" situation.
       - name: "venv contract: .venv-xpu exists and has torch with an available XPU"
+        if: inputs.scope != 'skip'
         run: |
           if [ ! -x .venv-xpu/bin/python ]; then
             echo ".venv-xpu is not baked into this runner image -- building it (docs/dev-setup.md step 6)."
