@@ -14,6 +14,36 @@ on:
         description: "Run even if this commit is already green on this branch"
         type: boolean
         default: false
+      # Which slice of the xpu-marked suite to run on the B70. `auto` (the
+      # default, and the only option the 02:30 schedule can use) lets the
+      # headroom guard on the fleet pick the scope from live VRAM: `full` when the B70 is idle,
+      # `moe` (the capped MoE subset) when a serving process is already holding
+      # most of the HBM, and `skip` when even the capped subset does not fit.
+      # See the headroom guard below. `moe`/`full`/`skip` are for manual
+      # dispatch only (e.g. 'I know the box is free, force the full suite').
+      scope:
+        description: "Which xpu tests to run: auto (headroom-driven), moe (capped MoE only), full, or skip"
+        type: choice
+        options: [auto, moe, full, skip]
+        default: auto
+      # Headroom thresholds, in GB of FREE HBM. The guard reads the driver-level
+      # counter (free = total - in_use across ALL processes, including a
+      # co-located vLLM serving process -- verified: a second process sees the
+      # tenant's allocation). `max_hbm_gb` is what the FULL suite needs before
+      # the guard will run it. `min_hbm_gb_moe` is the floor for the capped MoE
+      # subset: the MoE tests peak ~0.7 GB ABOVE the tenant's baseline (weights
+      # are read once per expert, never expanded -- measured on this fleet with
+      # vLLM holding 30 GB, in_use went 30.17 -> 30.82 GB), so a 1 GB floor is
+      # the safe minimum. Set low enough that a box with ~2.3 GB free (a busy
+      # vLLM) still runs the MoE subset with margin, instead of skipping.
+      max_hbm_gb:
+        description: "Free-HBM (GB) the FULL xpu suite needs before the guard will run it (default 8)"
+        type: string
+        default: "8"
+      min_hbm_gb_moe:
+        description: "Free-HBM (GB) the capped MoE subset needs before the guard will run it (default 1)"
+        type: string
+        default: "1"
 
 permissions:
   contents: read
@@ -50,6 +80,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
+          SCOPE: ${{ inputs.scope }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF: ${{ github.ref }}
         run: |
@@ -59,6 +90,15 @@ jobs:
             --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
           if [ "$FORCE" = "true" ]; then
             echo "force=true -- bypassing the stamp check."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SCOPE" != "auto" ] && [ -n "$SCOPE" ]; then
+            # A manual non-auto scope is an explicit, intentional override. The
+            # stamp check keys off the last FULL-suite green run, but a `moe` or
+            # `full` dispatch is a deliberate re-test of a possibly-already-green
+            # HEAD, so it must NOT be collapsed into a no-op skip here -- the
+            # headroom guard on the fleet is the authority on what is actually
+            # runnable tonight, and it runs downstream of this job.
+            echo "scope=$SCOPE (manual override) -- bypassing the stamp check; the headroom guard decides the final scope on the fleet."
             echo "build=true" >> "$GITHUB_OUTPUT"
           elif [ -n "$last_green_sha" ] && [ "$GITHUB_SHA" = "$last_green_sha" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
@@ -139,7 +179,148 @@ jobs:
           echo "XPU present:"
           sycl-ls
 
+      # VRAM-HEADROOM guard + tenant-aware scope decision. Runs on the FLEET (a
+      # B70 is present -- the guard above just proved it) and BEFORE the venv
+      # build, so a "skip" decision costs a single cheap python probe and never
+      # burns the per-night venv-build time on a box that cannot run anything.
+      #
+      # WHY THIS EXISTs: the sycl-ls guard above only proves a XPU is PRESENT.
+      # It says nothing about whether the B70 has room in its HBM. The B70 is
+      # shared: a vLLM process serving a model all day can be holding ~28-30 GB
+      # of the 32 GB, leaving a few GB free. The old workflow would sail through
+      # the sycl-ls guard and then OOM deep inside the test suite -- a wall of
+      # torch Indexing.h asserts that reads like a code regression but is really
+      # "the box is busy" -- and on torch-XPU a hard HBM OOM can take the
+      # co-located serving process (or the ICD) down with it. This guard makes a
+      # busy box a clean, EXPLAINED skip (or a capped MoE-only run) instead.
+      #
+      # The measurement is reliable: torch.xpu.mem_get_info() reports the
+      # DRIVER-level (total, free) across ALL processes on the device -- a second
+      # process observes a co-located vLLM's allocation (verified on this fleet:
+      # free 2.4 GB / total 32.5 GB with torch's own allocation 0.0 GB). That is
+      # exactly the number we need: free_HBM = what is left for us.
+      #
+      # DECISION (scope is a job output consumed by the test-suite step below):
+      #   - explicit `skip`              -> SKIP (no venv build, no tests)
+      #   - explicit `full`/`moe`        -> run that scope as asked (manual)
+      #   - `auto` (the schedule's only option):
+      #       free >= max_hbm_gb         -> FULL  (B70 idle; run the whole suite)
+      #       min_hbm_gb_moe <= free < max_hbm_gb -> MOE (a tenant is using the
+      #                                              box; run only the capped MoE
+      #                                              subset, which fits in the
+      #                                              remaining headroom)
+      #       free <  min_hbm_gb_moe     -> SKIP  (even the capped subset does
+      #                                              not fit; running it would
+      #                                              OOM and risk the tenant)
+      #
+      # A `skip` is a SUCCESS, not a failure: "the B70 is in use by another
+      # process right now" is a normal, expected state (that is the whole point
+      # of the guard), not a defect in the code or the fleet. Failing the run
+      # here would (a) post a misleading red on a healthy tree and (b) re-trigger
+      # the very OOM this guard exists to prevent if someone reflexively re-runs.
+      # The CTRF artifact below is uploaded unconditionally, so a skip leaves a
+      # traceable "skipped: headroom" artifact rather than a silent green.
+      - name: "Guard: VRAM headroom -> pick scope (skip / moe / full)"
+        id: headroom
+        env:
+          SCOPE: ${{ inputs.scope }}
+          MAX_HBM_GB: ${{ inputs.max_hbm_gb }}
+          MIN_HBM_GB_MOE: ${{ inputs.min_hbm_gb_moe }}
+        run: |
+          set -a
+          . ./setvars-xpu.sh
+          set +a
+          # Probe free HBM with the venv's torch (baked into the image). If the
+          # venv is not yet baked (a fresh image) the probe cannot run; in that
+          # case fall through to the FULL scope and let the venv-build step
+          # below construct it -- a brand-new image is, by definition, not yet
+          # serving a tenant, so there is no headroom concern to decide.
+          if [ ! -x .venv-xpu/bin/python ]; then
+            echo "::notice::.venv-xpu not baked yet (fresh image) -- no headroom probe possible; assuming idle box -> scope=full."
+            {
+              echo "scope=full"
+              echo "free_gb=0.0"
+              echo "in_use_gb=0.0"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          . ./.venv-xpu/bin/activate
+          # NOTE: the heredoc body below is indented to sit inside this `run: |`
+          # block (a column-0 heredoc would terminate the YAML block scalar).
+          # A heredoc preserves its body's indentation verbatim, so the python
+          # source stays valid. The script writes its decision to /headroom_out
+          # (absolute path: /tmp is per-ephemeral-container, so step outputs and
+          # this file must share a path that the next step also sees -- on this
+          # fleet the working dir is stable across steps of one job).
+          python - "$SCOPE" "$MAX_HBM_GB" "$MIN_HBM_GB_MOE" <<'PY'
+          import sys
+          scope_arg, max_hbm_gb, min_hbm_gb_moe = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+          import torch
+          if not torch.xpu.is_available():
+              # The sycl-ls guard already proved a device exists; torch not seeing it is a
+              # real ICD/driver problem, not a headroom question. Fail loudly (loud > quiet).
+              print("::error::torch.xpu.is_available() is False though sycl-ls found a device -- ICD/driver drift. Refusing to guess at headroom.")
+              sys.exit(1)
+          free, total = torch.xpu.mem_get_info(0)
+          free_gb, total_gb, in_use_gb = free / 1e9, total / 1e9, (total - free) / 1e9
+          print(f"HBM: free={free_gb:.2f} GB  in_use={in_use_gb:.2f} GB  total={total_gb:.2f} GB  (requested scope={scope_arg!r})")
+          if scope_arg == "skip":
+              print("scope=skip (explicit) -> no XPU tests this run.")
+              chosen = "skip"
+          elif scope_arg in ("full", "moe"):
+              print(f"scope={scope_arg} (explicit manual override) -> running as asked.")
+              chosen = scope_arg
+          elif scope_arg == "auto":
+              if free_gb >= max_hbm_gb:
+                  chosen = "full"
+                  print(f"free {free_gb:.2f} GB >= {max_hbm_gb} GB -> scope=full (B70 idle, running the whole xpu suite).")
+              elif free_gb >= min_hbm_gb_moe:
+                  chosen = "moe"
+                  print(f"free {free_gb:.2f} GB < {max_hbm_gb} GB but >= {min_hbm_gb_moe} GB -> scope=moe (a tenant is using the box; running only the capped MoE subset).")
+              else:
+                  chosen = "skip"
+                  pct = (in_use_gb / total_gb * 100) if total_gb > 0 else 0.0
+                  print(f"free {free_gb:.2f} GB < {min_hbm_gb_moe} GB -> scope=skip (even the capped MoE subset does not fit; a tenant holds {pct:.0f}% of HBM. Not running -- would OOM and risk the tenant's process.)")
+          else:
+              print(f"::error::unknown scope {scope_arg!r} (expected auto|full|moe|skip).")
+              sys.exit(1)
+          with open("headroom_out.txt", "w") as f:
+              f.write(f"scope={chosen}\nfree_gb={free_gb:.2f}\nin_use_gb={in_use_gb:.2f}\n")
+          PY
+          # Pull the decision back into the step outputs. The file is written
+          # relative to the job working dir; it persists to the next step on this
+          # fleet (one working dir per job run). Guard the sed against a missing
+          # file (the python sys.exit(1) path leaves no file) so we fail loud.
+          [ -f headroom_out.txt ] || { echo "::error::headroom guard did not produce headroom_out.txt -- the probe failed before deciding a scope."; exit 1; }
+          scope="$(sed -n 's/^scope=//p' headroom_out.txt)"
+          free_gb="$(sed -n 's/^free_gb=//p' headroom_out.txt)"
+          in_use_gb="$(sed -n 's/^in_use_gb=//p' headroom_out.txt)"
+          [ -n "$scope" ] || { echo "::error::headroom guard produced an empty scope."; exit 1; }
+          # One grouped redirect (not three separate `>>`s) so shellcheck's
+          # SC2129 stays quiet: the three outputs share a single target file.
+          {
+            echo "scope=$scope"
+            echo "free_gb=$free_gb"
+            echo "in_use_gb=$in_use_gb"
+          } >> "$GITHUB_OUTPUT"
+          case "$scope" in
+            skip)
+              echo "::notice::xpu-nightly SKIPPED (headroom): B70 has ${free_gb} GB free / ${in_use_gb} GB in use -- below the ${MIN_HBM_GB_MOE} GB MoE floor. Another process (e.g. a serving model) is using the box. No tests ran; this is expected, not a failure."
+              ;;
+            moe)
+              echo "xpu-nightly running CAPPED MoE-only scope (B70 partially busy: ${free_gb} GB free). Full xpu suite deferred until the box is idle."
+              ;;
+            full)
+              echo "xpu-nightly running FULL xpu suite (B70 idle: ${free_gb} GB free)."
+              ;;
+          esac
+
+      # venv build + XPU tests run ONLY when the guard above chose a testable
+      # scope. On `skip` the rest of the job (including the per-night venv build)
+      # is skipped -- a busy box must not pay that cost. `if` sees step outputs
+      # as ${{ steps.headroom.outputs.scope }}.
       - name: Checkout
+        if: steps.headroom.outputs.scope != 'skip'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Re-source the B70 device pin (ONEAPI_DEVICE_SELECTOR=level_zero:0) + the
@@ -156,6 +337,7 @@ jobs:
       # subsequent step. (GITHUB_ENV is a special variable, so it is excluded by
       # the same prefix filter.)
       - name: Source oneAPI / XPU environment
+        if: steps.headroom.outputs.scope != 'skip'
         run: |
           set -a
           . ./setvars-xpu.sh
@@ -176,6 +358,7 @@ jobs:
       # XPU index, a broken wheel tag), the step fails loudly: that is real
       # drift, not a "skip the torch tests" situation.
       - name: "venv contract: .venv-xpu exists and has torch with an available XPU"
+        if: steps.headroom.outputs.scope != 'skip'
         run: |
           if [ ! -x .venv-xpu/bin/python ]; then
             echo ".venv-xpu is not baked into this runner image -- building it (docs/dev-setup.md step 6)."
@@ -209,19 +392,55 @@ jobs:
           python -c "import torch; print('torch', torch.__version__); assert torch.xpu.is_available(), 'torch.xpu.is_available() is False -- the B70 ICD/oneAPI is not visible to this torch build (driver/ICD problem, not pip)'; print('XPU visible:', torch.xpu.device_count(), 'device(s)')"
           echo "OK: .venv-xpu has torch with a live XPU (contract holds)."
 
-      # The actual nightly payload: the xpu-marked suite. The conftest.py
-      # policy deselects xpu-marked tests only when torch is ABSENT -- here
-      # torch is present, so `-m xpu` runs exactly the XPU-marked tests (the
-      # B70 path that the CPU CI job deliberately skips). The CTRF reporter
-      # writes the machine-readable result for the artifact below. If no tests
-      # carry the xpu marker yet (today's state, pre-#30), the run is a clean
-      # 0-test pass that still proves the venv+driver+GPU path is alive -- the
-      # venv-contract guard above is what makes that pass meaningful.
-      - name: XPU test suite
+      # The actual nightly payload. The conftest.py policy deselects xpu-marked
+      # tests only when torch is ABSENT -- here torch is present, so `-m xpu`
+      # runs exactly the XPU-marked tests (the B70 path the CPU CI job skips).
+      # The headroom guard above chose SCOPE:
+      #   full -> the whole xpu-marked suite (-m xpu).
+      #   moe  -> the capped MoE subset only (-m xpu -k moe). This is the
+      #            scope the auto guard falls back to when a tenant (e.g. vLLM
+      #            serving a model) is already holding most of the HBM. The
+      #            `-k moe` term selects exactly the xpu-marked MoE tests
+      #            (test_moe_fused.py) and EXCLUDES the attention backends
+      #            (test_attention_sycl / test_attention_triton), whose
+      #            KV-cache/page-table buffers are what OOM on a busy box.
+      #            The tenant is protected by the guard above: it only ever
+      #            chooses `moe` when at least min_hbm_gb_moe of HBM is free,
+      #            and the MoE tests were measured to peak ~0.7 GB over the
+      #            tenant's baseline, so the floor carries a real safety margin.
+      #            (Note: torch's `max_split_size_mb` is a *soft* fragmentation
+      #            hint on this build -- it does NOT hard-refuse a larger single
+      #            allocation -- so the headroom floor, not an allocator knob,
+      #            is what guarantees we cannot starve the tenant.)
+      # The CTRF reporter writes the machine-readable result for the artifact
+      # below. If a scope selects zero tests, the run is a clean 0-test pass.
+      - name: "XPU test suite (scope: ${{ steps.headroom.outputs.scope }})"
+        if: steps.headroom.outputs.scope != 'skip'
+        env:
+          SCOPE: ${{ steps.headroom.outputs.scope }}
         run: |
           . ./.venv-xpu/bin/activate
+          export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+          # Keep the test process's allocator deterministic (no expandable
+          # segment growth) so its HBM footprint is stable and bounded by the
+          # headroom floor the guard already enforced.
+          export PYTORCH_XPU_ALLOC_CONF="expandable_segments:False"
           python -m pip install -q pytest-json-ctrf
-          pytest -m xpu -v --ctrf ctrf/pytest-ctrf.json
+          mkdir -p ctrf
+          case "$SCOPE" in
+            moe)
+              echo "Running CAPPED MoE-only subset: pytest -m xpu -k moe"
+              pytest -m xpu -k moe -v --ctrf ctrf/pytest-ctrf.json
+              ;;
+            full)
+              echo "Running FULL xpu suite: pytest -m xpu"
+              pytest -m xpu -v --ctrf ctrf/pytest-ctrf.json
+              ;;
+            *)
+              echo "::error::headroom guard produced an unrunnable scope '$SCOPE' (expected full|moe); the skip path should have caught this."
+              exit 1
+              ;;
+          esac
 
       # CTRF artifact. The ONLY continue-on-error in this workflow: an upload
       # failure (network blip on the fleet) must never turn a red test run into
