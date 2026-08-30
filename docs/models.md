@@ -8,7 +8,7 @@ tunes first, and 32 GB is enough with offload.
 
 | Model | Status | Issue |
 | --- | --- | --- |
-| Qwen3.6 / Qwen3.5 MoE (`Qwen3_5Moe*`) | config + weights (forward pending) | `models-qwen35` |
+| Qwen3.6 / Qwen3.5 MoE (`Qwen3_5Moe*`) | known-good: config + weights + forward (fused/offload), B70-verified vs CPU reference | `models-qwen35` |
 | Qwen3-MoE | stub | `models-qwen3-moe` |
 | Qwen3 / Qwen2 / Llama / Mistral / Gemma-4 dense | stub | `models-dense` |
 | gpt-oss | stub | `models-gpt-oss` |
