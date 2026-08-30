@@ -322,7 +322,13 @@ jobs:
               gh label create "$HS_LABEL" --color '5319e7' \
                 --description 'High-stakes review-rigor (see project pr-review config)' \
                 --repo "$REPO" 2>/dev/null || true
-                gh pr edit "$PR_NUM" --repo "$REPO" --add-label "$HS_LABEL" 2>/dev/null || true
+                # `gh issue edit --add-label`, not `gh pr edit --add-label`: on this
+                # repo's self-hosted runner (jupiter-b70) `gh pr edit` reliably fails
+                # (confirmed via job logs across every PR-Agent run) while `gh issue
+                # edit` against the same PR number succeeds — PRs are issues under
+                # the hood, so the label lands identically. See the "Inject score
+                # banner" step below for the same swap and the root-cause writeup.
+                gh issue edit "$PR_NUM" --repo "$REPO" --add-label "$HS_LABEL" 2>/dev/null || true
                 exit 0
             fi
           done
@@ -743,8 +749,35 @@ jobs:
           } > /tmp/pr-body-banner.md
 
           cat /tmp/pr-body-banner.md /tmp/pr-body-current.md > /tmp/pr-body-new.md
-          gh pr edit "$PR_NUM" --body-file /tmp/pr-body-new.md --repo "${REPO}" 2>/dev/null || { echo "::warning::could not write banner to PR body (gh unavailable or API error) — the label/status still run."; }
-          echo "Banner injected (score $SCORE)"
+
+          # `gh api PATCH .../pulls/$PR_NUM -f body=...`, not `gh pr edit --body-file`:
+          # on this repo's self-hosted runner (jupiter-b70), `gh pr edit --body-file`
+          # failed on EVERY PR-Agent run so far, with no visible error — the old
+          # `2>/dev/null || { warn }` swallowed the real error, and the unconditional
+          # `echo "Banner injected"` right after printed success regardless, so every
+          # run "passed" in the log while the PR body was never actually touched. The
+          # score-bracket label step directly above it (`gh issue edit --add-label`)
+          # succeeded on every one of those same runs, which is why only the banner
+          # went missing. Testing `gh pr edit` against this org outside CI reproduces
+          # a hard failure (a GraphQL query it issues needs org/team read access no
+          # repo-scoped token — including the Actions GITHUB_TOKEN — can ever have),
+          # while both `gh issue edit --add-label` and this `gh api` PATCH complete
+          # normally with the same credentials — consistent with, though not provably
+          # identical to, whatever `gh pr edit` was hitting in CI. If banners still
+          # don't land after this change, the real error is no longer swallowed —
+          # read it from the `::warning::` this step prints instead of guessing again.
+          # `gh api -f body=@file` does NOT read the file (it sends the literal string
+          # "@path") on the gh version installed here — read the file into a shell
+          # variable and pass that instead. The `if` form keeps this compatible with
+          # the job's `bash -e`: a failed command substitution used directly as an
+          # `if` condition does not abort the step, so the real error can be reported
+          # instead of silently discarded.
+          NEW_BODY="$(cat /tmp/pr-body-new.md)"
+          if BANNER_ERR=$(gh api -X PATCH "repos/${REPO}/pulls/${PR_NUM}" -f body="$NEW_BODY" --silent 2>&1); then
+            echo "Banner injected (score $SCORE)"
+          else
+            echo "::warning::could not write banner to PR body via gh api PATCH: ${BANNER_ERR}"
+          fi
 
       # ── Commit status check ──────────────────────────────────────────────────
       # Green = PR-Agent ran and returned a score, OR the PR diff is entirely
