@@ -11,6 +11,7 @@ length).
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sys
 import threading
@@ -378,9 +379,17 @@ def test_main_dry_run_against_intel_server(live_server, capsys):
     assert "--profile freetoken-launch" in out
 
 
-def test_main_install_only_needs_no_server(monkeypatch):
+def test_main_install_only_needs_no_server(tmp_path, monkeypatch):
     # --install-only short-circuits before resolve_server_url, so it must succeed even
     # though --server points at an address with nothing listening (nothing connects).
-    # codex is on PATH here, so the preparer resolves it without touching the network.
+    # A fake `codex` is placed on PATH so the test is hermetic: the agent resolves
+    # without a real install or network, and it passes on a GitHub runner (where the
+    # real codex/curl are absent) as well as on a dev box that already has codex.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text("#!/bin/sh\nexit 0\n")
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ["PATH"])
     monkeypatch.delenv("FREETOKEN_HOST", raising=False)
     assert main(["codex", "--install-only", "--server", "http://127.0.0.1:1"]) == 0
