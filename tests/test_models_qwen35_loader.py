@@ -118,8 +118,8 @@ def _qwen35_weights() -> dict:
             # A_log / dt_bias are [num_v_heads] (the decay-rate + delta inputs);
             # providing them so the linear path is fully weight-driven (not just
             # its default init) -- the forward cross-check then exercises them.
-            w[f"model.language_model.layers.{layer}.linear_attn.A_log.weight"] = torch.randn(NV)
-            w[f"model.language_model.layers.{layer}.linear_attn.dt_bias.weight"] = torch.randn(NV)
+            w[f"model.language_model.layers.{layer}.linear_attn.A_log"] = torch.randn(NV)
+            w[f"model.language_model.layers.{layer}.linear_attn.dt_bias"] = torch.randn(NV)
         else:  # full-GQA layer
             # q_proj is doubled (query + the output gate, attn_output_gate=True);
             # o_proj maps [heads*head_dim] -> hidden; k/v are GQA (NKV heads,
