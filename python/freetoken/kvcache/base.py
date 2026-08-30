@@ -42,7 +42,11 @@ class BaseKVCachePool:
         self.num_pages = num_pages
         self.num_slots = num_pages * page_size
         self.num_kv_heads = model_config.num_key_value_heads
-        self.head_dim = model_config.hidden_size // model_config.num_attention_heads
+        # Some models (Qwen3.5/3.6) set an explicit head_dim that differs from
+        # hidden // num_heads; honor it when present, else derive.
+        self.head_dim = getattr(model_config, "head_dim", None) or (
+            model_config.hidden_size // model_config.num_attention_heads
+        )
         self.k_buffer = torch.empty(
             (self.num_slots, self.num_kv_heads, self.head_dim), device=device, dtype=dtype
         )

@@ -234,3 +234,56 @@ def test_bank_views_full_and_prefill(cache):
     assert full[1].shape == (S, H, I)
     head = cache.bank_views(n=E)
     assert head[0].shape == (E, 2 * I, H)
+
+
+def _assert_maps_consistent(c: OffloadMoeCache) -> None:
+    """The forward's per-layer ``slot_for_id`` rows must agree with the cache's
+    global ``id_of_slot`` map. The forward indexes the slot pool by
+    ``slot_for_id[layer][expert]`` (qwen3_5_moe), so a row entry pointing at a
+    slot that ``id_of_slot`` attributes to the *other* layer makes the forward
+    read the wrong expert's bytes -- a silent divergence from the in-VRAM path.
+    This is the regression for issue #18 T2 (the stale cross-layer ``slot_for_id``
+    entries that survive a cross-layer LRU eviction)."""
+    for l in range(L):
+        for e in range(E):
+            s = int(c.slot_for_id[l, e].item())
+            if s >= 0:
+                owner = int(c.id_of_slot[s].item())
+                assert owner == l * E + e, (
+                    f"slot {s}: slot_for_id[{l},{e}] points at a slot owned by "
+                    f"flat id {owner} (layer {owner // E}, expert {owner % E}), "
+                    f"but the forward will read it as (layer {l}, expert {e})"
+                )
+
+
+def test_cross_layer_eviction_keeps_slot_for_id_consistent():
+    # A pool smaller than the model's total experts (S=6 < 2*E=8) forces a
+    # cross-layer LRU eviction: materializing layer 1 evicts layer 0's
+    # least-recently-used slots. The eviction reassigns those slots (id_of_slot)
+    # to layer 1, but the old bookkeeping only cleared the *evicting* layer's
+    # slot_for_id row, leaving layer 0's row holding stale positive slot ids that
+    # now point at layer 1's slots. The forward would then index the pool by
+    # those stale ids and read the wrong expert (issue #18 T2: offload tokens
+    # diverged from in-VRAM starting at token 7). The cache must keep
+    # slot_for_id derived from id_of_slot so the two never disagree.
+    c = OffloadMoeCache(L, E, 6, DEVICE, prefill_overlap=False)  # pool < both layers
+    c.set_bank_sources(_bank_sources())
+
+    # Prefill: materialize both layers; layer 1 evicts layer 0's LRU experts.
+    c.materialize_layer(0)
+    c.copy_missing()
+    c.materialize_layer(1)
+    c.copy_missing()
+    # The evicted (layer 0, experts 0/1) rows must read -1, not stale slot ids.
+    _assert_maps_consistent(c)
+    assert int(c.slot_for_id[0, 0].item()) == -1, "evicted layer-0 expert must not stay resident"
+    assert int(c.slot_for_id[0, 1].item()) == -1, "evicted layer-0 expert must not stay resident"
+
+    # Decode: alternate layers, routing each layer's experts one at a time so the
+    # global LRU keeps evicting across layers. The per-layer rows must track the
+    # reassignments every step (the divergence appeared mid-decode, not at prefill).
+    for l in range(L):
+        for e in range(E):
+            c.ensure_experts(l, torch.tensor([e], dtype=torch.int64))
+            c.copy_missing()
+            _assert_maps_consistent(c)

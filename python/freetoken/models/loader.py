@@ -17,6 +17,8 @@ is to place weights and build the parameter set, which is what this implements.
 """
 from __future__ import annotations
 
+import importlib
+
 import torch
 
 from freetoken.models.register import _load_attr, get_model_class, get_model_spec
@@ -55,8 +57,24 @@ def load_model(
 
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
-    use_offload = moe_backend is not None and "offload" in moe_backend
-    model_config = _load_attr(spec.module, spec.parse_config)(hf_config, use_offload_moe=use_offload)
+    # The offload flag is baked into the model config at parse time, but
+    # resolving ``moe_backend="auto"`` (the default) needs to know whether the
+    # model is a MoE -- which the config only exposes *after* parsing. So parse
+    # once without offload, inspect the result, resolve the backend, and re-parse
+    # only if the resolution flips the flag (the common ``auto``-on-XPU path).
+    parse_config = _load_attr(spec.module, spec.parse_config)
+    model_config = parse_config(hf_config, use_offload_moe=False)
+    from freetoken.moe import resolve_moe_backend
+
+    is_moe_early = bool(getattr(model_config, "is_moe", False))
+    # Only an explicit "auto" (the EngineConfig default) is resolved here; an
+    # explicit name or None is honored as-is so existing call sites that pass
+    # None for the in-VRAM path are unaffected.
+    if moe_backend == "auto":
+        moe_backend = resolve_moe_backend(moe_backend, is_moe=is_moe_early)
+    use_offload = moe_backend in ("offload", "cpu", "hybrid")
+    if use_offload != bool(getattr(model_config, "use_offload_moe", False)):
+        model_config = parse_config(hf_config, use_offload_moe=use_offload)
     # Build the model *on this device* (the loader already resolved it): an
     # explicit device wins, and only a None device lets the model default to
     # the XPU. Without this the model would re-default to the XPU and ignore
@@ -66,10 +84,21 @@ def load_model(
     # effective dtype onto it so the modules and the streamed weights share a
     # dtype (no bf16-module / fp32-weight mismatch when the engine pins one).
     object.__setattr__(model_config, "dtype", dtype)
+    # Qwen3.5/3.6 keeps its forward classes torch-free at import (the CPU venv
+    # parses the config without torch); the model rebinds them to real
+    # nn.Module subclasses lazily. The rebind must complete BEFORE the model is
+    # instantiated -- its __init__ uses an explicit super() that resolves
+    # nn.Module only if the class already carries the nn.Module base -- so
+    # trigger it here, in the loader, not in the constructor. Only adapters that
+    # expose _ensure_torch need this (others import torch at module scope).
+    _mod = importlib.import_module(spec.module)
+    _ensure = getattr(_mod, "_ensure_torch", None)
+    if callable(_ensure):
+        _ensure()
     model = get_model_class(hf_config.architectures[0], model_config, device=device)
 
     is_moe = bool(getattr(model_config, "is_moe", False))
-    offload = is_moe and use_offload
+    offload = is_moe and use_offload and moe_backend in ("offload", "cpu", "hybrid")
     if dummy:
         # Offline path: no checkpoint is read, so the model's MoE experts must
         # come from fabricated banks. To make this *reproducible* (the engine's

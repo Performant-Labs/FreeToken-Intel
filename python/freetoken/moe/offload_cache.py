@@ -162,6 +162,32 @@ class OffloadMoeCache:
 
     # -- reset -----------------------------------------------------------------
 
+    def _resync_slot_for_id(self) -> None:
+        """Rebuild the per-layer ``slot_for_id`` rows from ``id_of_slot``.
+
+        ``id_of_slot`` (slot -> flat id) is the single source of truth: every
+        mutation (eviction or (re)acquisition) updates it, and it is the view
+        the eviction scan (``id_of_slot[victim]``) and :meth:`resident_slots`
+        already trust. ``slot_for_id`` (the per-layer expert -> slot rows) is the
+        forward's view, and the two must never disagree: when a layer evicts a
+        slot that another layer owns, the ``flat_slots[old_id] = -1`` clear is
+        computed from the evicting layer's id and lands on the *wrong* row (a
+        no-op), leaving the evicted layer's ``slot_for_id`` row holding a stale
+        positive slot id that points at a slot now owned by the other layer. The
+        forward would then index the slot pool by that stale id and read the
+        wrong expert's bytes -- a silent divergence from the in-VRAM path.
+        Deriving ``slot_for_id`` from ``id_of_slot`` after each mutation makes
+        the desync impossible: a slot is counted as layer L's expert e only if
+        ``id_of_slot[slot] == L*E + e``.
+        """
+        E = self.num_experts
+        S = self.cache_size
+        self.slot_for_id.fill_(-1)
+        for slot in range(S):
+            id_ = int(self.id_of_slot[slot].item())
+            if id_ >= 0:
+                self.slot_for_id[id_ // E, id_ % E] = slot
+
     def reset(self) -> None:
         """Clear all slot mappings, usage, the step counter, and the stats."""
         self.slot_for_id.fill_(-1)
@@ -186,8 +212,13 @@ class OffloadMoeCache:
 
     # -- prefill: whole-layer materialize --------------------------------------
 
-    def materialize_layer(self, layer_id: int) -> None:
+    def materialize_layer(self, layer_id: int, expert_ids: torch.Tensor | None = None) -> None:
         """Place a whole layer into the slot pool for a prefill forward.
+
+        If ``expert_ids`` ([n, k] routed expert ids) is given, it is rewritten
+        in place to *slot* ids (a position whose expert was evicted stays -1),
+        matching the contract :meth:`ensure_experts` establishes for decode --
+        so the offload forward indexes the slot pool identically on both phases.
 
         This is a *batched timestamp-LRU* pass over the whole layer's experts,
         not a fixed-slot double buffer: the pool is a single global LRU shared by
@@ -265,6 +296,25 @@ class OffloadMoeCache:
         self.num_indices.fill_(num)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
+
+        # Resync the per-layer rows from id_of_slot (the authoritative view):
+        # Phase 2's flat clear only clears the evicting layer's own row, so an
+        # evicted layer's stale entries would otherwise survive (see
+        # _resync_slot_for_id). id_of_slot was already set for every touched slot
+        # above, so this rebuilds slot_for_id exactly.
+        self._resync_slot_for_id()
+        # Rebind the row view (the resync may have reallocated the tensor storage
+        # via fill_); Phase 3 reads this layer's fresh rows.
+        layer_slots = self.slot_for_id[layer_id]
+
+        # Phase 3: rewrite every routed position to its (new) slot id so the
+        # prefill forward indexes the slot pool by slot id, exactly as decode
+        # (ensure_experts Phase 3) does. A position whose expert was evicted
+        # (slot -1) is left -1 (skipped by the forward's routed >= 0 mask).
+        if expert_ids is not None:
+            flat = expert_ids.reshape(-1)
+            for i in range(flat.numel()):
+                flat[i] = int(layer_slots[int(flat[i].item())].item())
 
     # -- decode: timestamp LRU -------------------------------------------------
 
@@ -347,6 +397,13 @@ class OffloadMoeCache:
         self.num_indices.fill_(num)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+
+        # Resync the per-layer rows from id_of_slot: a miss evicts the global
+        # LRU slot, which another layer may own; the flat clear above only
+        # touches the evicting layer's row, so the evicted layer's stale
+        # entries would otherwise survive (see _resync_slot_for_id).
+        self._resync_slot_for_id()
+        layer_slots = self.slot_for_id[layer_id]
 
         # Phase 3: rewrite every position to its (new) slot; a position whose
         # expert was left non-resident (pool exhausted) stays -1.
