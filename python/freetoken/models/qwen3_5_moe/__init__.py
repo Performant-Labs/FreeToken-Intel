@@ -906,36 +906,96 @@ class _Qwen35MoE:
         return out
 
     def _forward_offload(self, flat, top_idx, top_w, ctx, batch):
-        """Serve the routed experts through the host-offload LRU slot pool
-        (mirrors qwen3_moe's offload path). ``ctx.model`` carries ``moe_cache``
-        + ``moe_layer_id``; ``top_idx`` is rewritten to slot ids in place."""
+        """Serve the routed experts through the host-offload LRU slot pool.
+
+        All slot-routing bookkeeping is done on the *host* (the cache's
+        ``slot_for_id`` map is already Python-side), and the forward pushes only
+        a clean, in-bounds ``top_idx`` plus tiny CPU-built index/mask tensors to
+        the XPU. This is deliberate: rewriting ``top_idx`` in place on the XPU
+        (the old path) left per-element writes that raced the async topk/softmax
+        kernels, so the forward could read a stale id and index the slot pool
+        out of bounds -- an XPU kernel abort (Indexing.h "index out of bounds")
+        that takes down the whole GPU. Host-driven routing makes the ids
+        deterministic and in-bounds by construction.
+        """
         model = ctx.model
         layer_id = model.moe_layer_id[self.layer_id]
         cache = model.moe_cache
         is_prefill = (batch is not None and batch.is_prefill) or flat.shape[0] > 1
+        is_xpu = bool(getattr(cache, "is_xpu", False))
+        B, k = top_idx.shape
+        # 1) Snapshot the routed *expert* ids on the host (the topk output is a
+        #    fresh tensor; reading it back here is a clean D2H of its final value).
+        expert_ids = top_idx.to("cpu")
+        # 2) Let the LRU pool decide residency (prefill: whole layer; decode:
+        #    only the routed experts), staging the host->XPU copy plan.
         if is_prefill:
             cache.materialize_layer(layer_id)
         else:
-            cache.ensure_experts(layer_id, top_idx)
+            cache.ensure_experts(layer_id, expert_ids)
         cache.copy_missing()
+        # 3) Map expert -> slot on the host from the cache's own (Python) map.
+        #    An expert the pool evicted maps to -1 -> clamped to 0 with valid=False.
+        slots = cache.slot_for_id[layer_id].to("cpu").tolist()
+        S = cache.cache_size
         gu, dn = cache.bank_views()  # ([S, 2I, H], [S, H, I])
         intermediate = int(model.config.moe_intermediate_size)
+        dev = flat.device
         out = torch.zeros_like(flat)
-        k = top_idx.shape[1]
-        for slot_pos in range(k):
-            routed = top_idx[:, slot_pos]  # [B] slot ids (after ensure_experts)
-            valid = routed >= 0
-            if not valid.any():
-                continue
-            s = routed[valid]
-            for s_i in torch.unique(s).tolist():
-                sub = valid & (routed == s_i)
-                out[sub] += top_w[sub, slot_pos, None] * _expert_compute(
-                    gu[s_i, 0:intermediate],
-                    gu[s_i, intermediate : 2 * intermediate],
-                    dn[s_i],
-                    flat[sub],
+        routed_cpu = torch.empty(B, k, dtype=torch.int64)
+        valid_cpu = torch.zeros(B, k, dtype=torch.bool)
+        for i in range(B):
+            for j in range(k):
+                slot = slots[int(expert_ids[i, j])]
+                ok = 0 <= slot < S
+                routed_cpu[i, j] = slot if ok else 0
+                valid_cpu[i, j] = ok
+        # Loud guard: an out-of-range slot means a stale map entry (should be -1);
+        # fail in Python, not with a GPU abort. (The clamp above already makes the
+        # push in-bounds, so this is a belt-and-suspenders tripwire.)
+        if is_xpu and (~valid_cpu).any():
+            stale = int(routed_cpu[~valid_cpu].max()) if (~valid_cpu).any() else -1
+            if stale >= S:
+                raise IndexError(
+                    f"layer {self.layer_id}: offload routed slot id {stale} >= "
+                    f"cache_size {S}: stale slot map (ensure_experts desync)"
                 )
+        # 4) Host-side: (column j, slot s_i) -> the list of row indices that route
+        #    to that slot in that column. Built purely on the host from routed_cpu /
+        #    valid_cpu, so the loop below never needs to ask the device "which rows
+        #    matched?". (A boolean-mask index -- out[sub], with sub = valid &
+        #    (routed == s) -- would call nonzero() internally; nonzero's output
+        #    shape is data-dependent, so each use forces an implicit device->host
+        #    sync once per slot per column, INSIDE the loop. On the shared XPU that mid-block
+        #    sync is what faults: no amount of torch.xpu.synchronize() around the
+        #    block helps, because the offending sync is in its middle. Integer
+        #    index_select / index_add_ have static shapes and never call nonzero.)
+        groups: list[tuple[int, int, list[int]]] = []
+        for j in range(k):
+            by_slot: dict[int, list[int]] = {}
+            for i in range(B):
+                if bool(valid_cpu[i, j]):
+                    by_slot.setdefault(int(routed_cpu[i, j]), []).append(i)
+            groups.extend((j, s_i, rows) for s_i, rows in by_slot.items())
+        # 5) Push the routing to the XPU (one op). Validity is already encoded in
+        #    which rows appear in `groups`, so no separate valid tensor is pushed.
+        routed_dev = routed_cpu.to(dev)
+        # 6) Gather per slot on the XPU using host-computed INTEGER indices:
+        #    static shapes, no nonzero(), no implicit D2H anywhere in the loop.
+        #    index_add_ accumulates exactly as `out[sub] += ...` did (and handles
+        #    duplicate indices, though rows are unique within a (j, s_i) group).
+        for j, s_i, rows in groups:
+            idx = torch.tensor(rows, dtype=torch.long, device=dev)
+            y = top_w.index_select(0, idx)[:, j, None] * _expert_compute(
+                gu[s_i, 0:intermediate],
+                gu[s_i, intermediate : 2 * intermediate],
+                dn[s_i],
+                flat.index_select(0, idx),
+            )
+            out.index_add_(0, idx, y)
+        # 7) Leave top_idx in the slot-id contract (harmless; nothing downstream
+        #    reads it, but keeps the "top_idx holds slot ids" invariant true).
+        top_idx.copy_(routed_dev)
         return out
 
 

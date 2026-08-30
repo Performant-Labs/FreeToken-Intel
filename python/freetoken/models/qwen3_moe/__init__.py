@@ -306,8 +306,12 @@ class _Qwen3MoE(nn.Module):
         # so ``batch.is_prefill`` is the phase signal; the ``flat.shape[0] > 1``
         # check is a phase-independent fallback (prefill >1 token, decode == 1).
         is_prefill = (batch is not None and batch.is_prefill) or flat.shape[0] > 1
+        is_xpu = bool(getattr(cache, "is_xpu", False))
         if is_prefill:
-            cache.materialize_layer(layer_id)
+            # materialize_layer rewrites top_idx to slot ids in place (same
+            # contract as ensure_experts), so prefill and decode index the
+            # slot pool identically.
+            cache.materialize_layer(layer_id, top_idx)
         else:
             cache.ensure_experts(layer_id, top_idx)
         cache.copy_missing()
@@ -316,17 +320,32 @@ class _Qwen3MoE(nn.Module):
         # ("gate_up" first, "down" second); index the pool (S slots) and pick
         # the per-slot row by slot id.
         gu, dn = cache.bank_views()  # ([S, 2I, H], [S, H, I])
+        S = gu.shape[0]
         intermediate = int(model.config.moe_intermediate_size)
 
         out = torch.zeros_like(flat)
         k = top_idx.shape[1]
         for slot_pos in range(k):
             routed = top_idx[:, slot_pos]  # [B] slot ids (after ensure_experts)
-            valid = routed >= 0
+            # Mask out-of-range slot ids too (>= S): a stale/recycled id from
+            # ensure_experts/copy_missing would index gu/dn out of bounds and
+            # abort the (shared) XPU kernel, so clamp it out of the gather.
+            valid = (routed >= 0) & (routed < S)
             if not valid.any():
                 continue
+            if is_xpu:
+                if (routed >= S).any() and (routed >= 0).any():
+                    raise IndexError(
+                        f"layer {self.layer_id}: offload routed slot id "
+                        f"{int(routed.max())} >= cache_size {S}: stale slot id "
+                        "(ensure_experts/copy_missing desync)"
+                    )
             s = routed[valid]  # the slot each token's expert landed in
-            for s_i in torch.unique(s).tolist():
+            # Dedup on the host (the routed set per step is tiny): the XPU's
+            # torch.unique runs an async sort-scatter that aborts (Indexing.h
+            # "index out of bounds") when a slot id races the pool; a CPU
+            # unique + CPU->XPU gather is deterministic and identical in math.
+            for s_i in torch.unique(s.cpu()).tolist():
                 sub = valid & (routed == s_i)
                 out[sub] += top_w[sub, slot_pos, None] * _expert_compute(
                     gu[s_i, 0:intermediate],
