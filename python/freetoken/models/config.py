@@ -28,6 +28,10 @@ class ModelConfig:
     num_experts: int | None = None
     num_attention_heads: int | None = None
     num_key_value_heads: int | None = None
+    # The per-head dimension. ``None`` means "derive it" (hidden // num_heads) --
+    # correct for most models, but Qwen3.5/3.6 (qwen3_5_moe) sets this explicitly
+    # (head_dim=256 while hidden//heads would give 128). The KV pool reads this.
+    head_dim: int | None = None
     intermediate_size: int | None = None
     moe_intermediate_size: int | None = None
     num_experts_per_tok: int | None = None

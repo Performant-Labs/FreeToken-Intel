@@ -17,6 +17,8 @@ is to place weights and build the parameter set, which is what this implements.
 """
 from __future__ import annotations
 
+import importlib
+
 import torch
 
 from freetoken.models.register import _load_attr, get_model_class, get_model_spec
@@ -66,6 +68,17 @@ def load_model(
     # effective dtype onto it so the modules and the streamed weights share a
     # dtype (no bf16-module / fp32-weight mismatch when the engine pins one).
     object.__setattr__(model_config, "dtype", dtype)
+    # Qwen3.5/3.6 keeps its forward classes torch-free at import (the CPU venv
+    # parses the config without torch); the model rebinds them to real
+    # nn.Module subclasses lazily. The rebind must complete BEFORE the model is
+    # instantiated -- its __init__ uses an explicit super() that resolves
+    # nn.Module only if the class already carries the nn.Module base -- so
+    # trigger it here, in the loader, not in the constructor. Only adapters that
+    # expose _ensure_torch need this (others import torch at module scope).
+    _mod = importlib.import_module(spec.module)
+    _ensure = getattr(_mod, "_ensure_torch", None)
+    if callable(_ensure):
+        _ensure()
     model = get_model_class(hf_config.architectures[0], model_config, device=device)
 
     is_moe = bool(getattr(model_config, "is_moe", False))
