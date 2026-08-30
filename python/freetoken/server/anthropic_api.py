@@ -57,6 +57,11 @@ class AnthropicMessageRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     stop_sequences: list[str] | None = None
+    # Anthropic's extended-thinking opt-in: ``{"type": "enabled", ...}`` turns the
+    # checkpoint's thinking toggle on; ``{"type": "disabled"}`` (or absence) leaves
+    # it at the template default. Mapped onto the shared thinking kwargs (issue
+    # #97) so the same probed thinking profile the OpenAI path uses applies.
+    thinking: dict | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -75,6 +80,22 @@ def _to_chat_messages(system: str | None, messages: list[dict]) -> list[dict]:
     for message in messages:
         rendered.append({"role": message.get("role", "user"), "content": message.get("content", "")})
     return rendered
+
+
+def _to_chat_template_kwargs(thinking: dict | None) -> dict:
+    """Map an Anthropic ``thinking`` opt-in onto the shared thinking kwargs.
+
+    Anthropic enables extended thinking with ``{"type": "enabled"}`` and disables
+    it with ``{"type": "disabled"}`` (or by omitting the field). The chat-template
+    toggles the ecosystem's templates read are ``enable_thinking`` (qwen/glm/gemma)
+    and ``thinking_mode`` (minimax-m3), so an "enabled" block broadcasts both —
+    Jinja ignores the spelling its template doesn't declare — and "disabled" /
+    absent maps to the template's own default (no kwarg), matching the OpenAI
+    path's treatment of the same probed thinking profile (issue #97).
+    """
+    if thinking and str(thinking.get("type", "")) == "enabled":
+        return {"enable_thinking": True, "thinking_mode": "enabled"}
+    return {}
 
 
 def register_anthropic_routes(app: FastAPI, engine_holder) -> None:
@@ -158,6 +179,7 @@ def register_anthropic_routes(app: FastAPI, engine_holder) -> None:
             model=model_name,
             max_tokens=request.max_tokens,
             reasoning_parser=reasoning_parser,
+            chat_template_kwargs=_to_chat_template_kwargs(request.thinking),
         ):
             # The OpenAI routes surface the parser's "thinking" stream as a
             # separate ``reasoning_content`` key; Anthropic has that concept
@@ -202,6 +224,7 @@ def register_anthropic_routes(app: FastAPI, engine_holder) -> None:
             model=model_name,
             max_tokens=request.max_tokens,
             reasoning_parser=reasoning_parser,
+            chat_template_kwargs=_to_chat_template_kwargs(request.thinking),
         ):
             if reasoning_delta:
                 reasoning_parts.append(reasoning_delta)

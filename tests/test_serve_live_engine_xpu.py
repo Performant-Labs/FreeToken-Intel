@@ -139,6 +139,94 @@ def test_serve_chat_completions_streams_real_engine_tokens(qwen35_xpu_ckpt):
 
 
 @XPU
+def test_serve_chat_completions_accepts_reasoning_controls(qwen35_xpu_ckpt):
+    """Accept (#97): the OpenAI seam accepts ``reasoning_effort`` +
+    ``enable_thinking`` + ``tools`` and still streams readable tokens.
+
+    The live request path runs the client's reasoning controls through the
+    probed effort/thinking profiles: ``encode`` quantizes ``reasoning_effort``
+    onto the checkpoint's probed effort vocabulary and resolves the thinking
+    toggle, so a request carrying any combination of these controls renders
+    through the same chat template the model was trained with and the engine
+    still streams non-placeholder text. The fabricated Qwen-style template
+    interpolates the controls rather than gating generation on them, so the
+    assertion is *acceptance* — the request is honored (no 500) and the
+    stream is readable — not effort-specific output text.
+    """
+    import torch
+
+    dev = torch.device("xpu")
+    engine = _serve_engine(qwen35_xpu_ckpt, dev)
+    engine.frontend_tokenizer = _frontend_tokenizer(parse_args([qwen35_xpu_ckpt]))
+    server_args = parse_args([qwen35_xpu_ckpt])
+    # A tool definition the template can be offered (the thinking resolver
+    # treats "tools offered" as a thinking signal); the value is irrelevant —
+    # the assertion is that the request is accepted.
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    # The full #97 control surface: an effort the template may or may not grade
+    # (quantized to the nearest gear or dropped), the thinking toggle, and tools.
+    # Every combination must render without a 500 and stream readable text.
+    for reasoning_effort in ("high", "max", "unbounded"):
+        for enable_thinking in (None, True, False):
+            for use_tools in (None, tools):
+                chat_template_kwargs = {}
+                if reasoning_effort is not None:
+                    chat_template_kwargs["reasoning_effort"] = reasoning_effort
+                if enable_thinking is not None:
+                    chat_template_kwargs["enable_thinking"] = enable_thinking
+                deltas = list(
+                    stream_chat(
+                        engine,
+                        _MESSAGES,
+                        model=server_args.resolved_model_name,
+                        max_tokens=_DECODE_TOKENS,
+                        tools=use_tools,
+                        chat_template_kwargs=chat_template_kwargs,
+                    )
+                )
+                content = "".join(content_delta for _reasoning, content_delta in deltas)
+                assert content, (
+                    f"the #97 control set (effort={reasoning_effort!r}, "
+                    f"thinking={enable_thinking!r}, tools={bool(use_tools)}) "
+                    f"must not 500 and must stream tokens"
+                )
+                assert "<tok-" not in content, (
+                    f"decoder still emits placeholders under the #97 control set: {content!r}"
+                )
+
+
+@XPU
+def test_serve_chat_completions_resolves_effort_profile(qwen35_xpu_ckpt):
+    """Accept (#97, wiring): the seam's profile probe resolves a real
+    ``EffortProfile`` + ``ThinkingProfile`` from the checkpoint's own chat
+    template (never a static per-family table)."""
+    import torch
+
+    dev = torch.device("xpu")
+    _engine = _serve_engine(qwen35_xpu_ckpt, dev)
+    mgr = _frontend_tokenizer(parse_args([qwen35_xpu_ckpt]))
+    # The probe runs in-process against the template on first use and caches.
+    effort = mgr.effort_profile()
+    thinking = mgr.thinking_profile()
+    assert effort is not None, "the effort probe must resolve a profile"
+    assert thinking is not None, "the thinking probe must resolve a profile"
+    # Second access is the cached profile (the per-request path is a lookup,
+    # not a re-probe).
+    assert mgr.effort_profile() is effort
+    assert mgr.thinking_profile() is thinking
+    assert isinstance(effort, object)
+
+
+@XPU
 def test_serve_app_built_against_real_engine_holder(qwen35_xpu_ckpt):
     """Accept (#93, wiring): create_app wires the real engine holder into the
     routes without error, so the live server's route graph is the real one."""

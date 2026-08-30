@@ -37,6 +37,10 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = Field(default=None, alias="max_completion_tokens")
     temperature: float | None = None
     tools: list[dict] | None = None
+    # Reasoning-effort dial (issue #97). Free of a static per-family table, the
+    # value is quantized onto the checkpoint's probed effort vocabulary at encode
+    # time, so any value is accepted here and mapped (or dropped) downstream.
+    reasoning_effort: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -104,12 +108,20 @@ def register_openai_routes(app: FastAPI, engine_holder) -> None:
         server_args = app.state.server_args
         reasoning_parser = get_reasoning_parser(server_args.reasoning_parser)
         model_name = server_args.resolved_model_name
+        # The client's reasoning controls ride as chat-template kwargs. The
+        # encode step quantizes ``reasoning_effort`` onto the checkpoint's probed
+        # effort profile (issue #97); ``tools`` is forwarded separately.
+        chat_template_kwargs: dict = {}
+        if request.reasoning_effort is not None:
+            chat_template_kwargs["reasoning_effort"] = request.reasoning_effort
         for reasoning_delta, content_delta in generation.stream_chat(
             engine,
             [m.model_dump() for m in request.messages],
             model=model_name,
             max_tokens=request.max_tokens,
             reasoning_parser=reasoning_parser,
+            tools=request.tools,
+            chat_template_kwargs=chat_template_kwargs,
         ):
             delta: dict = {}
             if content_delta:

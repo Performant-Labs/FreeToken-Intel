@@ -127,7 +127,14 @@ def _fallback_id_space(engine) -> int:
     return max(2, min(int(vocab), _FALLBACK_ID_SPACE_MAX))
 
 
-def _prompt_token_ids(engine, prompt: str, messages: list[dict] | None = None) -> list[int]:
+def _prompt_token_ids(
+    engine,
+    prompt: str,
+    messages: list[dict] | None = None,
+    *,
+    tools: list[dict] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+) -> list[int]:
     """Encode the request to the token ids the engine consumes.
 
     With the real message frontend (``#95``) the prompt is the chat rendered
@@ -136,12 +143,23 @@ def _prompt_token_ids(engine, prompt: str, messages: list[dict] | None = None) -
     with) — not from re-tokenizing a flattened string, which would not match the
     template's exact boundaries. The caller passes ``messages`` so the chat is
     re-rendered here; ``prompt`` is kept only as the no-tokenizer fallback input.
+
+    ``tools`` and ``chat_template_kwargs`` carry the client's reasoning controls
+    (issue #97); they are forwarded to ``encode``, which quantizes effort onto
+    the checkpoint's probed profile and resolves the thinking toggle. They are
+    no-ops on the no-tokenizer fallback path.
     """
     tokenize_mgr = _resolve_tokenize_manager(engine)
     if tokenize_mgr is not None and hasattr(tokenize_mgr, "encode"):
-        return tokenize_mgr.encode(messages if messages is not None else [{"role": "user", "content": prompt}])
+        return tokenize_mgr.encode(
+            messages if messages is not None else [{"role": "user", "content": prompt}],
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
     # No tokenizer attached (pre-load holder): keep the seam exercisable with a
     # single in-vocab id so the engine's prefill + embedding / KV math still run.
+    # The client's reasoning controls (reasoning_effort / thinking) only apply
+    # through the real chat template, so they are ignored on this path.
     vocab = getattr(getattr(getattr(engine, "config", None), "model_config", None), "vocab_size", None)
     space = max(2, min(int(vocab), _FALLBACK_ID_SPACE_MAX)) if vocab else _FALLBACK_ID_SPACE_MAX
     digest = hashlib.sha256(prompt.encode("utf-8")).digest()
@@ -183,6 +201,8 @@ def _stream_tokens(
     model: str,
     max_tokens: int | None,
     messages: list[dict] | None = None,
+    tools: list[dict] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     """Admit ``prompt`` to the engine and yield each generated token's text.
 
@@ -221,7 +241,7 @@ def _stream_tokens(
     budget = max_tokens if max_tokens and max_tokens > 0 else _FALLBACK_MAX_TOKENS
     engine.add_request(
         Req(
-            input_ids=_prompt_token_ids(engine, prompt, messages),
+            input_ids=_prompt_token_ids(engine, prompt, messages, tools=tools, chat_template_kwargs=chat_template_kwargs),
             table_idx=0,  # add_request reassigns the real slot index
             cached_len=0,
             output_len=budget,
@@ -242,19 +262,42 @@ def stream_chat(
     model: str,
     max_tokens: int | None = None,
     reasoning_parser=None,
+    tools: list[dict] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ):
     """Yield ``(reasoning_delta, content_delta)`` per decoded token.
 
     ``reasoning_parser`` is stateful across the whole stream (it buffers
     partial tags), so each token is fed through it and ``flush()`` drains the
     remainder once the stream ends. With no parser, every token is content.
+
+    ``tools`` and ``chat_template_kwargs`` carry the client's reasoning controls
+    (issue #97): they are forwarded to the encode step, where effort is
+    quantized onto the checkpoint's probed profile and the thinking toggle is
+    resolved, so the rendered prompt reflects the request's effort / thinking.
     """
     prompt = _prompt_from_messages(messages)
     if reasoning_parser is None:
-        for token in _stream_tokens(engine, prompt, model=model, max_tokens=max_tokens, messages=messages):
+        for token in _stream_tokens(
+            engine,
+            prompt,
+            model=model,
+            max_tokens=max_tokens,
+            messages=messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        ):
             yield "", token
         return
-    for token in _stream_tokens(engine, prompt, model=model, max_tokens=max_tokens, messages=messages):
+    for token in _stream_tokens(
+        engine,
+        prompt,
+        model=model,
+        max_tokens=max_tokens,
+        messages=messages,
+        tools=tools,
+        chat_template_kwargs=chat_template_kwargs,
+    ):
         for reasoning_delta, content_delta in reasoning_parser.parse([token]):
             if reasoning_delta or content_delta:
                 yield reasoning_delta, content_delta

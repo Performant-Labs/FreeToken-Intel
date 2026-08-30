@@ -54,6 +54,30 @@ def _messages_payload(**overrides):
     return payload
 
 
+def test_messages_accepts_thinking_opt_in():
+    """Accept (#97): the Anthropic route accepts the ``thinking`` opt-in and
+    maps it onto the shared thinking kwargs without a 500. The stub engine has
+    no tokenizer, so the encode path is the no-tokenizer fallback; the point is
+    acceptance at the HTTP boundary plus the mapping the seam applies."""
+    from freetoken.server.anthropic_api import _to_chat_template_kwargs
+
+    app = _make_app(["Hello", " world"])
+    response = _client(app).post(
+        "/v1/messages", json=_messages_payload(thinking={"type": "enabled"})
+    )
+    assert response.status_code == 200
+    assert response.json()["content"][0]["text"] == "Hello world"
+    # The mapping is the seam's single source of truth: "enabled" turns the
+    # thinking toggle on (broadcast across the dialect spellings); "disabled" or
+    # absent leaves the template default (no kwarg).
+    assert _to_chat_template_kwargs({"type": "enabled"}) == {
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+    }
+    assert _to_chat_template_kwargs({"type": "disabled"}) == {}
+    assert _to_chat_template_kwargs(None) == {}
+
+
 def test_messages_non_streaming_envelope():
     app = _make_app(["Hello", " world"])
     response = _client(app).post("/v1/messages", json=_messages_payload())

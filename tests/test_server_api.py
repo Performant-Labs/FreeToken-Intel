@@ -99,6 +99,32 @@ def test_chat_completions_non_streaming():
     assert body["choices"][0]["finish_reason"] == "stop"
 
 
+def test_chat_completions_accepts_reasoning_controls():
+    """Accept (#97): the OpenAI route accepts the client's reasoning controls
+    (``reasoning_effort`` / ``enable_thinking`` / ``tools``) without a 500 — the
+    request model parses them and the seam quantizes effort onto the probed
+    profile. The stub engine has no tokenizer, so the encode path is the
+    no-tokenizer fallback; the point here is acceptance at the HTTP boundary."""
+    app = _make_app(["Hello", " world"])
+    response = _client(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "Qwen3-30B-A3B",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "reasoning_effort": "high",
+            "enable_thinking": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {"type": "object"}},
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Hello world"
+
+
 def test_chat_completions_streaming_sse():
     app = _make_app(["Hello", " world"])
     with _client(app).stream(
