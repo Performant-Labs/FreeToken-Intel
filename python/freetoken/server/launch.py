@@ -30,7 +30,7 @@ import argparse
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TextIO
+from typing import Any, TextIO
 
 from freetoken._stub import NotYetImplemented
 from freetoken.utils.arch import device_report_line, is_xpu_available
@@ -285,9 +285,13 @@ def _build_engine_holder(server_args):
     from freetoken.engine.engine import Engine
     from freetoken.utils.arch import is_xpu_available
 
+    engine_ref: dict[str, Any] = {}
+
     def engine_holder():
         import torch
 
+        if "engine" in engine_ref:
+            return engine_ref["engine"]
         engine_config = EngineConfig(
             model_path=server_args.model,
             tp_info=DistributedInfo(0, 1),
@@ -309,6 +313,20 @@ def _build_engine_holder(server_args):
             # keeps its full-context pool.
             num_page_override=2048,
         )
-        return Engine(engine_config)
+        engine = Engine(engine_config)
+        # Attach the message frontend (#95) to the engine so the per-request
+        # encode / decode path resolves it directly. Loading the tokenizer is
+        # torch-free (AutoTokenizer) and happens once, here, at first request.
+        engine.frontend_tokenizer = _frontend_tokenizer(server_args)
+        engine_ref["engine"] = engine
+        return engine
 
     return engine_holder
+
+
+def _frontend_tokenizer(server_args):
+    """The model's message frontend, loaded once (torch-free ``AutoTokenizer``)."""
+    from freetoken.tokenizer.tokenize import TokenizeManager
+    from freetoken.utils import load_tokenizer
+
+    return TokenizeManager(load_tokenizer(server_args.model_path))

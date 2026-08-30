@@ -31,12 +31,13 @@ import tests.test_qwen35_offload_xpu as _offload
 
 from tests.test_qwen35_offload_xpu import XPU
 
-# The offload suite defines `qwen35_xpu_ckpt` as a *module*-scoped fixture. This
-# suite builds a fresh engine per test (each installs its own global context +
-# offload cache), so a module-scoped checkpoint shared across tests would let
-# two engines collide on the global ctx. Re-expose it at the default (function)
-# scope so every test gets an isolated checkpoint dir.
-qwen35_xpu_ckpt = pytest.fixture(_offload.qwen35_xpu_ckpt.__wrapped__)
+# The offload suite defines `qwen35_xpu_serve_ckpt` (the serve-seam checkpoint:
+# vocab 50257 = the real GPT-2 tokenizer the seam renders through) as a *module*-
+# scoped fixture. This suite builds a fresh engine per test (each installs its own
+# global context + offload cache), so a module-scoped checkpoint shared across
+# tests would let two engines collide on the global ctx. Re-expose it at the default
+# (function) scope so every test gets an isolated checkpoint dir.
+qwen35_xpu_ckpt = pytest.fixture(_offload.qwen35_xpu_serve_ckpt.__wrapped__)
 
 from freetoken.core import reset_global_ctx
 from freetoken.distributed import DistributedInfo
@@ -45,12 +46,13 @@ from freetoken.engine.engine import Engine
 from freetoken.server.api_server import create_app
 from freetoken.server.args import parse_args
 from freetoken.server.generation import stream_chat
+from freetoken.server.launch import _frontend_tokenizer
 
-# The generation fallback encoder emits exactly one prompt token (the tokenizer
-# seam is still a stub), so the request never overflows a small pool. The
-# decode budget stays tiny so the test is fast and the offload LRU is exercised
-# without heavy churn.
-_PROMPT_TOKENS = 1
+# The real message frontend (``#95``) renders the chat through the model's
+# template, so the prompt is a handful of tokens (not the stub's single token).
+# The budget stays tiny so the test is fast and the offload LRU is exercised
+# without heavy churn; the KV pool below has headroom for the templated prompt.
+_PROMPT_TOKENS = 32
 _DECODE_TOKENS = 4
 # KV pool sizing. Must be large enough that the identity-mapped page table
 # (slots 0..max_seq_len-1) gathers stay in-bounds across the *whole* prompt +
@@ -102,9 +104,10 @@ def test_serve_chat_completions_streams_real_engine_tokens(qwen35_xpu_ckpt):
     (``stream_chat`` -> ``_stream_tokens`` -> ``engine.add_request`` +
     ``engine.generate``). The pre-fix seam called ``engine.generate(prompt,
     model=, max_tokens=)`` — a signature the real ``Engine`` does not have — so
-    the route raised ``EngineNotReady`` and the HTTP layer answered 503. After
-    the fix the same seam yields real generated token ids (here as the
-    tokenizer's placeholder, since the tokenizer seam is still a stub).
+    the route raised ``EngineNotReady`` and the HTTP layer answered 503. With
+    the real message frontend (``#95``) the same seam now yields *readable* text:
+    the chat is rendered through the model's template and the generated ids are
+    decoded back to characters, not placeholders.
 
     The engine is built and driven on the *main* thread (see module docstring):
     the offload path's per-token D2H sync faults off-thread on the XPU, and
@@ -114,26 +117,25 @@ def test_serve_chat_completions_streams_real_engine_tokens(qwen35_xpu_ckpt):
     import torch
 
     dev = torch.device("xpu")
-    vocab = qwen35_xpu_ckpt_vocab(qwen35_xpu_ckpt)
     engine = _serve_engine(qwen35_xpu_ckpt, dev)
+    # Attach the real message frontend the way the live holder does, so the
+    # seam under test resolves the tokenizer directly from the engine.
+    engine.frontend_tokenizer = _frontend_tokenizer(parse_args([qwen35_xpu_ckpt]))
     server_args = parse_args([qwen35_xpu_ckpt])
 
     # The seam the /v1/chat/completions route calls, driven on the main thread.
     deltas = list(stream_chat(engine, _MESSAGES, model=server_args.resolved_model_name, max_tokens=_DECODE_TOKENS))
     content = "".join(content_delta for _reasoning, content_delta in deltas)
 
-    # A real (non-503) token stream came back.
+    # A real (non-503) token stream came back, now as readable text (the #95
+    # tokenizer seam is live: no <tok-N> placeholders, no raw token-id runs).
     assert content, "the stream must be non-empty — the engine generated tokens"
-    # The tokenizer seam is still a stub, so each token decodes to a
-    # "<tok-<id>>" placeholder with no separating whitespace — the stream is one
-    # concatenated run of them. Pull the ids back out with a pattern match and
-    # confirm every one is a valid embedding-row index (the whole point of the
-    # in-vocab prompt-encoder fix: an out-of-vocab id would have aborted the
-    # XPU gather).
-    ids = [int(match) for match in re.findall(r"<tok-(\d+)>", content)]
-    assert ids, content
-    for token_id in ids:
-        assert 0 <= token_id < vocab, f"token id outside vocab: {token_id} (content={content!r})"
+    assert "<tok-" not in content, f"decoder still emits placeholders: {content!r}"
+    # The decoded stream must be plain, printable text (the whole point of the
+    # tokenizer seam landing: the client gets characters, not id placeholders).
+    assert content.isprintable() or content.strip() == "", f"undecoded binary leaked into the stream: {content!r}"
+    # And it must look like generated prose, not an id blob (no long digit runs).
+    assert not re.search(r"\d{4,}", content), f"decoded stream looks like raw ids: {content!r}"
 
 
 @XPU

@@ -14,10 +14,14 @@ the ``ft serve`` spine's pre-load holder), which raises
 :class:`EngineNotReady` (a ``NotYetImplemented``) that the routes map to a clean
 503 — the server stays up and ``/v1/models`` keeps answering.
 
-Token-id <-> text: the message frontend (chat-template encode / decode) is still
-a stub (``server-openai`` tokenizer seam), so :func:`_prompt_token_ids` falls
-back to a deterministic hash mapping and :func:`_decode_token` falls back to a
-readable placeholder until the real tokenizer path lands.
+Token-id <-> text: the message frontend is now real (``#95``) — prompts are
+rendered through the model's chat template (:class:`TokenizeManager`) and
+generated ids are decoded incrementally (:class:`DetokenizeManager`), both
+attached lazily via ``frontend_tokenizer()`` so building the app and importing
+this module stay torch-free; the tokenizer loads on the first request. If no
+tokenizer is attached (e.g. the pre-load spine holder) the prompt encoder falls
+back to a single in-vocab id and the decoder to a readable ``<tok-<id>>``
+placeholder, so the seam stays exercisable end to end.
 """
 from __future__ import annotations
 
@@ -25,8 +29,11 @@ import hashlib
 import time
 import uuid
 from collections.abc import Iterator
+from typing import Any
 
 from freetoken._stub import NotYetImplemented
+from freetoken.tokenizer.detokenize import DetokenizeManager
+from freetoken.tokenizer.tokenize import TokenizeManager
 
 # The reference engine's sampler stops on eos_token_id=-1, so a request never
 # hits an end-of-sequence id; the decode budget comes from max_tokens (or the
@@ -40,9 +47,47 @@ _FALLBACK_MAX_TOKENS = 64
 # is < vocab_size).
 _FALLBACK_ID_SPACE_MAX = 4096
 
+# App-level resolver for the message frontend (chat-template encode / decode),
+# installed by api_server.create_app. The per-request path prefers the loaded
+# engine's own ``frontend_tokenizer`` (attached by the launch holder); this
+# hook is the fallback for route tests that drive ``stream_chat`` with a plain
+# engine object that never gets the attribute. A zero-arg callable returning a
+# ``TokenizeManager`` or ``None`` (not loaded yet / no model path); ``None``
+# when no app is installed (pure CPU unit tests of this module).
+_frontend_tokenizer_hook: "Any" = None
+
 
 class EngineNotReady(NotYetImplemented):
     """The HTTP surface is wired but the generation backend is still a stub."""
+
+
+def set_frontend_tokenizer_hook(hook: "Any") -> None:
+    """Install the app-level message-frontend resolver (called by create_app).
+
+    ``hook`` is a zero-arg callable returning a :class:`TokenizeManager`
+    (or ``None`` when no model path is configured / not loaded yet). Passing
+    ``None`` clears the hook (module reset for tests). The per-request encode /
+    decode path prefers the loaded engine's own ``frontend_tokenizer`` and only
+    falls back to this hook.
+    """
+    global _frontend_tokenizer_hook
+    _frontend_tokenizer_hook = hook
+
+
+def _resolve_tokenize_manager(engine) -> Any:
+    """The message frontend for this request.
+
+    Prefers the loaded engine's own ``frontend_tokenizer`` (attached by the
+    launch holder); falls back to the app-level hook (for route tests that drive
+    ``stream_chat`` with a plain engine); returns ``None`` when neither exists
+    (tokenizer-less fallback path).
+    """
+    mgr = getattr(engine, "frontend_tokenizer", None)
+    if mgr is not None:
+        return mgr
+    if _frontend_tokenizer_hook is not None:
+        return _frontend_tokenizer_hook()
+    return None
 
 
 def _chat_completion_id() -> str:
@@ -82,45 +127,72 @@ def _fallback_id_space(engine) -> int:
     return max(2, min(int(vocab), _FALLBACK_ID_SPACE_MAX))
 
 
-def _prompt_token_ids(engine, prompt: str) -> list[int]:
-    """Encode ``prompt`` to the token ids the engine consumes.
+def _prompt_token_ids(engine, prompt: str, messages: list[dict] | None = None) -> list[int]:
+    """Encode the request to the token ids the engine consumes.
 
-    Uses the model's real tokenizer / chat template when the engine exposes one
-    (``tokenizer`` with ``encode``/``apply_chat_template``); until the message
-    frontend (``server-openai`` tokenizer seam) lands, it falls back to a
-    deterministic hash of the prompt bound to the model's own vocab, so the
-    request stays well-formed (a single in-vocab id) and the engine's prefill +
-    embedding / KV math is exercised end to end without a tokenizer on the seam.
+    With the real message frontend (``#95``) the prompt is the chat rendered
+    through the model's chat template, so the ids come from
+    :class:`TokenizeManager.encode` (the same template the model was trained
+    with) — not from re-tokenizing a flattened string, which would not match the
+    template's exact boundaries. The caller passes ``messages`` so the chat is
+    re-rendered here; ``prompt`` is kept only as the no-tokenizer fallback input.
     """
-    tokenizer = getattr(engine, "tokenizer", None)
-    if tokenizer is not None and hasattr(tokenizer, "encode"):
-        return list(tokenizer.encode(prompt))
+    tokenize_mgr = _resolve_tokenize_manager(engine)
+    if tokenize_mgr is not None and hasattr(tokenize_mgr, "encode"):
+        return tokenize_mgr.encode(messages if messages is not None else [{"role": "user", "content": prompt}])
+    # No tokenizer attached (pre-load holder): keep the seam exercisable with a
+    # single in-vocab id so the engine's prefill + embedding / KV math still run.
+    vocab = getattr(getattr(getattr(engine, "config", None), "model_config", None), "vocab_size", None)
+    space = max(2, min(int(vocab), _FALLBACK_ID_SPACE_MAX)) if vocab else _FALLBACK_ID_SPACE_MAX
     digest = hashlib.sha256(prompt.encode("utf-8")).digest()
-    return [int.from_bytes(digest[:4], "big") % _fallback_id_space(engine)]
+    return [int.from_bytes(digest[:4], "big") % space]
 
 
-def _decode_token(engine, token_id: int) -> str:
-    """Decode one generated token id to text (or a readable placeholder).
+def _decode_stream(engine, token_ids: list[int]) -> Iterator[str]:
+    """Yield printable text deltas for a generated id sequence.
 
-    Mirrors :func:`_prompt_token_ids`: a real ``tokenizer.decode`` when one is
-    attached, else a stable ``<tok-<id>>`` placeholder so the stream is
-    non-empty and the HTTP seam is exercisable before the tokenizer lands.
+    With the real tokenizer (``#95``) the ids feed a per-request
+    :class:`DetokenizeManager`: each id is folded in and the newly *stable* text
+    is yielded, so the concatenated deltas equal a single greedy decode (the
+    trailing-token rollback holds back whatever might still change). Without a
+    tokenizer (pre-load holder) each id yields a ``<tok-<id>>`` placeholder so
+    the HTTP seam stays exercisable end to end.
     """
-    tokenizer = getattr(engine, "tokenizer", None)
-    if tokenizer is not None and hasattr(tokenizer, "decode"):
-        return tokenizer.decode([token_id])
-    return f"<tok-{token_id}>"
+    tokenize_mgr = _resolve_tokenize_manager(engine)
+    if tokenize_mgr is not None and hasattr(tokenize_mgr, "tokenizer"):
+        stop_strs = getattr(tokenize_mgr, "stop_strs", None)
+        detok = DetokenizeManager(tokenize_mgr.tokenizer, stop_strs=stop_strs)
+        uid = uuid.uuid4().hex[:16]
+        detok.create(uid)
+        try:
+            for token_id in token_ids:
+                delta = detok.update(uid, [token_id])
+                if delta:
+                    yield delta
+        finally:
+            detok.delete(uid)
+        return
+    for token_id in token_ids:
+        yield f"<tok-{token_id}>"
 
 
-def _stream_tokens(engine, prompt: str, *, model: str, max_tokens: int | None) -> Iterator[str]:
+def _stream_tokens(
+    engine,
+    prompt: str,
+    *,
+    model: str,
+    max_tokens: int | None,
+    messages: list[dict] | None = None,
+) -> Iterator[str]:
     """Admit ``prompt`` to the engine and yield each generated token's text.
 
     Two engine shapes are supported, selected by what the engine exposes:
 
     * A real :class:`~freetoken.engine.engine.Engine` (``#14`` / ``#93``)
       exposes ``add_request`` + a no-arg ``generate``. It is driven by the id
-      path: encode the prompt to ids, admit it with the requested decode budget,
-      run ``generate``, and decode each emitted id.
+      path: render the chat through the model's template to ids, admit it with
+      the requested decode budget, run ``generate``, and decode the emitted ids
+      incrementally (``#95``).
 
     * A lighter engine (the CPU route-test stub) exposes only
       ``generate(prompt, *, model, max_tokens)`` and yields token *text*. It is
@@ -149,7 +221,7 @@ def _stream_tokens(engine, prompt: str, *, model: str, max_tokens: int | None) -
     budget = max_tokens if max_tokens and max_tokens > 0 else _FALLBACK_MAX_TOKENS
     engine.add_request(
         Req(
-            input_ids=_prompt_token_ids(engine, prompt),
+            input_ids=_prompt_token_ids(engine, prompt, messages),
             table_idx=0,  # add_request reassigns the real slot index
             cached_len=0,
             output_len=budget,
@@ -159,8 +231,8 @@ def _stream_tokens(engine, prompt: str, *, model: str, max_tokens: int | None) -
         )
     )
     token_lists = generate()
-    for token_id in token_lists[0] if token_lists else []:
-        yield _decode_token(engine, token_id)
+    emitted = token_lists[0] if token_lists else []
+    yield from _decode_stream(engine, list(emitted))
 
 
 def stream_chat(
@@ -179,10 +251,10 @@ def stream_chat(
     """
     prompt = _prompt_from_messages(messages)
     if reasoning_parser is None:
-        for token in _stream_tokens(engine, prompt, model=model, max_tokens=max_tokens):
+        for token in _stream_tokens(engine, prompt, model=model, max_tokens=max_tokens, messages=messages):
             yield "", token
         return
-    for token in _stream_tokens(engine, prompt, model=model, max_tokens=max_tokens):
+    for token in _stream_tokens(engine, prompt, model=model, max_tokens=max_tokens, messages=messages):
         for reasoning_delta, content_delta in reasoning_parser.parse([token]):
             if reasoning_delta or content_delta:
                 yield reasoning_delta, content_delta
