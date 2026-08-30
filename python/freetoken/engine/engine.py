@@ -87,8 +87,15 @@ class Engine:
 
         # Size the paged KV pool. The pool is indexed by token slot
         # (page_size==1 in the reference path), one row per (request, position).
+        # The override is a *floor*, not a cap: it raises the pool for small
+        # test models (which otherwise get a 1-row pool for a 1-row page table
+        # and overrun the gather on decode) but never shrinks a large model's
+        # ``max_running_req * max_seq_len`` pool below what its context needs.
         max_seq_len = config.max_seq_len
-        num_pages = config.num_page_override or (config.max_running_req * max_seq_len)
+        default_num_pages = config.max_running_req * max_seq_len
+        num_pages = (
+            max(config.num_page_override, default_num_pages) if config.num_page_override else default_num_pages
+        )
         self.page_size = config.page_size
         self.max_seq_len = max_seq_len
         self.max_running_req = config.max_running_req
