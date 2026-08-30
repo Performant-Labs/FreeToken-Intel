@@ -173,11 +173,13 @@ def _check_server(_args: argparse.Namespace) -> None:
     # feed the full argv back through parse_args.
     server_args = parse_args(_SERVE_ARGV, prog="ft serve")
 
-    def _engine_holder():
-        raise NotYetImplemented("engine loop is a stub — implement under `engine-loop` (#14)")
-
+    # Real wiring (serve-live-engine #93): the server layer must build the app
+    # against the *same* engine holder the live path uses, so a wiring break in
+    # holder -> create_app -> routes is caught here, not at request time.
+    # The holder is lazy (engine_holder() is only called per request), so
+    # create_app stays cheap and network-free.
     try:
-        create_app(server_args, _engine_holder)
+        create_app(server_args, _build_engine_holder(server_args))
     except NotYetImplemented as exc:
         raise NotYetImplemented(f"server: {exc}") from exc
 
@@ -261,16 +263,52 @@ def launch_server(argv: list[str] | None = None, prog: str = "ft serve", out: Te
     from freetoken.server.api_server import run_api_server
 
     server_args = parse_args(_SERVE_ARGV, prog=prog)
+    return run_api_server(server_args, _build_engine_holder(server_args))
 
-    def _engine_holder():
-        # Real wiring: load the model onto the XPU host banks and wrap it in
-        # the engine loop. Both land under #17/#14; until then the spine
-        # never reaches this line.
-        from freetoken.engine.engine import Engine
-        from freetoken.models import create_model
-        from freetoken.models.config import ModelConfig
 
-        create_model(ModelConfig())
-        Engine()
+def _build_engine_holder(server_args):
+    """Zero-arg callable returning the live ``Engine`` the server routes drive.
 
-    return run_api_server(server_args, _engine_holder)
+    Real wiring since serve-live-engine (#93): the holder is *lazy* — it is only
+    invoked per request by the routes, never at app-build time — so ``create_app``
+    stays cheap and the spine's wiring check never loads a checkpoint. On first
+    invocation it builds an :class:`EngineConfig` from the serve args (the model
+    path, the XPU device, and a conservative single-request KV budget) and lets
+    ``Engine`` load the weights + build the KV pool / sampler. For a MoE on a B70
+    ``moe_backend="auto"`` resolves to host-RAM offload (ADR 0002), so a 35B
+    hero is served without OOM-ing the 32 GB. A genuinely unloaded / not-ready
+    engine still raises :class:`NotYetImplemented`, which the routes map to a
+    clean 503.
+    """
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import Engine
+    from freetoken.utils.arch import is_xpu_available
+
+    def engine_holder():
+        import torch
+
+        engine_config = EngineConfig(
+            model_path=server_args.model,
+            tp_info=DistributedInfo(0, 1),
+            # The engine defaults to XPU when present; pin it explicitly so the
+            # serve path never silently runs on CPU on a B70 box.
+            device="xpu" if is_xpu_available() else "cpu",
+            dtype=torch.float32,
+            moe_backend="auto",
+            # A single in-flight request per server: keeps the paged KV pool
+            # small and the serve path trivially correct. (Batching is #13.)
+            max_running_req=1,
+            # The pool defaults to ``max_running_req * max_seq_len`` rows and the
+            # page table maps slot ``pos`` -> pool row ``pos``, so ``read_kv``
+            # gathers ``k_buffer[0..max_seq_len-1]`` — zero headroom, so a
+            # request decoding to the very last position overruns the pool by one
+            # row (an out-of-bounds gather the XPU runtime aborts on). The
+            # override is a *floor* (the engine takes max(override, default)), so
+            # 2048 gives small test models a safe margin while a large hero model
+            # keeps its full-context pool.
+            num_page_override=2048,
+        )
+        return Engine(engine_config)
+
+    return engine_holder
