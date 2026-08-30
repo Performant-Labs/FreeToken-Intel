@@ -92,17 +92,22 @@ def _qwen35_text_config() -> dict:
     }
 
 
-def _qwen35_weights() -> dict:
+def _qwen35_weights(vocab_size: int = V) -> dict:
     """The full hybrid text-tower weight set (every layer), plus a vision tower.
 
     Layer 0 is linear-attention (linear_attn.* + conv1d), layer 1 is full-
     attention (self_attn.*); both carry a MoE mlp (experts.* + shared_expert.*).
+
+    ``vocab_size`` overrides the embedding / lm_head row count when the caller
+    fabricates a checkpoint whose tokenizer is larger than the reference ``V``
+    (the serve suite's byte-prefixed GPT-2 tokenizer). The attention
+    and MoE shapes are unchanged.
     """
     w = {
         "model.visual.blocks.0.attn.q.weight": torch.randn(8, 8),
-        "model.language_model.embed_tokens.weight": torch.randn(V, H),
+        "model.language_model.embed_tokens.weight": torch.randn(vocab_size, H),
         "model.language_model.norm.weight": torch.randn(H),
-        "lm_head.weight": torch.randn(V, H),
+        "lm_head.weight": torch.randn(vocab_size, H),
     }
     for layer in range(L):
         if layer % 2 == 0:  # linear-attention (Gated DeltaNet) layer

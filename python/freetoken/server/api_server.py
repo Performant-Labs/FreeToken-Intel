@@ -12,15 +12,43 @@ engine are live.
 from __future__ import annotations
 
 import logging
+import threading
 
 from fastapi import FastAPI
 
 from freetoken.version import __version__
+from freetoken.server import generation
 from freetoken.server.args import ServerArgs
 from freetoken.server.anthropic_api import register_anthropic_routes
 from freetoken.server.openai_api import register_openai_routes
 
 logger = logging.getLogger(__name__)
+
+
+def _build_frontend_tokenizer_hook(server_args: ServerArgs):
+    """A thread-safe, lazy resolver for the message frontend (``#95``).
+
+    Returns a zero-arg callable that loads the model's tokenizer exactly once
+    (``AutoTokenizer`` — no torch, no XPU) and wraps it in a
+    :class:`TokenizeManager`, caching the result for the process lifetime. The
+    tokenizer is loaded on first call (the first chat request), never at app-build
+    time, so ``create_app`` and ``import freetoken.server.api_server`` stay
+    cheap and torch-free on a CPU box. ``server_args.model_path`` is the HF repo
+    id / local checkpoint path the loader already keys on.
+    """
+    lock = threading.Lock()
+    state = {"mgr": None}
+
+    def resolve():
+        with lock:
+            if state["mgr"] is None:
+                from freetoken.tokenizer.tokenize import TokenizeManager
+                from freetoken.utils import load_tokenizer
+
+                state["mgr"] = TokenizeManager(load_tokenizer(server_args.model_path))
+            return state["mgr"]
+
+    return resolve
 
 
 def create_app(server_args: ServerArgs, engine_holder) -> FastAPI:
@@ -40,6 +68,13 @@ def create_app(server_args: ServerArgs, engine_holder) -> FastAPI:
     )
     app.state.server_args = server_args
     app.state.engine_holder = engine_holder
+    # The message frontend (chat-template encode / incremental decode, #95) is
+    # resolved lazily per request. Installing the hook here (not loading the
+    # tokenizer) keeps app-build cheap and torch-free; the tokenizer loads on
+    # the first chat request. The launch holder also attaches the same manager
+    # to the engine, so a loaded engine resolves directly and this hook is the
+    # fallback for the route surface.
+    generation.set_frontend_tokenizer_hook(_build_frontend_tokenizer_hook(server_args))
     register_openai_routes(app, engine_holder)
     register_anthropic_routes(app, engine_holder)
     return app

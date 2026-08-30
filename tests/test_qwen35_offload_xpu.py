@@ -27,6 +27,7 @@ runs under the B70 nightly.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -50,26 +51,130 @@ from tests.test_models_qwen35_loader import (
 XPU = pytest.mark.skipif(not torch.xpu.is_available(), reason="no XPU available")
 
 
-@pytest.fixture(scope="module")
-def qwen35_xpu_ckpt(tmp_path_factory):
+# A Qwen-style chat template over the real GPT-2 vocab. Each message renders as
+# ``<|role|>content<|end|>\\n`` (role in system|user|assistant); the special markers
+# are multi-token in the GPT-2 vocab (so ``decode`` renders them as their literal
+# text) and the body words are normal GPT-2 tokens, keeping the rendered prompt
+# and the decoded stream printable.
+_QWEN_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}<|system|>{{ message['content'] }}<|end|>\n"
+    "{% elif message['role'] == 'user' %}<|user|>{{ message['content'] }}<|end|>\n"
+    "{% elif message['role'] == 'assistant' %}<|assistant|>{{ message['content'] }}<|end|>\n"
+    "{% else %}{{ message['content'] }}{% endif %}{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+)
+
+
+def _gpt2_tokenizer_dir() -> str:
+    """The local HF-cache snapshot for the real GPT-2 tokenizer (offline).
+
+    A hand-fabricated GPT-2 vocab cannot be made both *order-correct* for BPE
+    (it must start with the 256 byte tokens) and *small enough* to fit inside the
+    fabricated embedding table, because GPT-2's byte->id map is derived from the
+    vocab file's ordering and its single-byte tokens do not round-trip through
+    ``decode``. The real GPT-2 tokenizer is already in the HF cache on the B70,
+    so we copy its vocab/merges into the fabricated checkpoint and override just
+    the ``chat_template``.
+    """
+    import os
+
+    from huggingface_hub import try_to_load_from_cache
+
+    cached = try_to_load_from_cache("gpt2", "vocab.json")
+    if cached is None:
+        cached = try_to_load_from_cache("gpt2", "merges.txt")
+    if cached is None:
+        pytest.skip("real GPT-2 tokenizer is not in the local HF cache (offline)")
+    return os.path.dirname(cached)
+
+
+def write_gpt2_tokenizer(path, vocab_size: int) -> None:
+    """Ship the real GPT-2 tokenizer (with a Qwen-style chat template) in the
+    fabricated checkpoint so the serve seam's message frontend (#95) can render
+    the chat through the model's template and decode the generated ids to text.
+
+    ``config.json``'s model_type is ``qwen3_5_moe`` (not ``gpt2``), so
+    ``AutoTokenizer`` builds the tokenizer from the checkpoint's tokenizer files
+    with no download; we point those files at the cached GPT-2 vocab and set the
+    chat template. The model's embedding vocab (``vocab_size``) must be a
+    superset of the tokenizer's (50257) so the template's ids and the engine's
+    greedy output ids both index into the embedding table.
+    """
+    import shutil
+
+    gpt2_dir = _gpt2_tokenizer_dir()
+    for name in os.listdir(gpt2_dir):
+        src = os.path.join(gpt2_dir, name)
+        if os.path.isfile(src):
+            shutil.copy(src, str(path / name))
+    tc_path = path / "tokenizer_config.json"
+    tc = json.loads(tc_path.read_text())
+    tc["chat_template"] = _QWEN_CHAT_TEMPLATE
+    tc_path.write_text(json.dumps(tc))
+    assert vocab_size >= 50257, (
+        f"the serve embedding vocab ({vocab_size}) must be >= the GPT-2 tokenizer "
+        "vocab (50257) so the template's and the engine's ids stay in-bounds"
+    )
+
+
+def _fabricate_qwen35_ckpt(tmp_path_factory, *, embed_vocab: int | None) -> str:
+    """Fabricate a Qwen3.5 MoE checkpoint (proven-correct weights) at a given vocab.
+
+    ``embed_vocab=None`` -> the loader suite's ``V=64`` (the math-reference tests
+    compare the XPU offload against an independent CPU reference that also builds
+    its weights at ``V=64``, so the vocab must match for the greedy ids to line up).
+    ``embed_vocab=N`` -> a model sized for a tokenizer with N ids (the serve seam).
+    """
     from safetensors.torch import save_file
 
     path = tmp_path_factory.mktemp("qwen35-xpu")
+    torch.manual_seed(2024)  # order-independent fabricated weights
+    text_config = _qwen35_text_config()
+    vocab = _V if embed_vocab is None else embed_vocab if embed_vocab is not None else _V
+    text_config["vocab_size"] = vocab
     config = {
         "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         "model_type": "qwen3_5_moe",
         "tie_word_embeddings": True,
         "vision_config": {"hidden_size": 8, "num_chunks": 2},
-        "text_config": _qwen35_text_config(),
+        "text_config": text_config,
     }
-    torch.manual_seed(2024)  # order-independent fabricated weights
-    weights = _qwen35_weights()
-    (path / "config.json").write_text(json.dumps(config))
+    weights = _qwen35_weights(vocab_size=vocab)
+    if embed_vocab is not None:
+        # The tokenizer files are copied first (they include their own
+        # tokenizer_config.json); the model config is written *after* so the real
+        # GPT-2 tokenizer_config's "architectures"/"model_type" cannot clobber the
+        # qwen3_5_moe config that the engine's loader reads.
+        write_gpt2_tokenizer(path, vocab)
+        (path / "config.json").write_text(json.dumps(config))
+    else:
+        (path / "config.json").write_text(json.dumps(config))
     save_file({k: v.contiguous() for k, v in weights.items()}, str(path / "model.safetensors"))
     (path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {k: "model.safetensors" for k in weights}})
     )
     return str(path)
+
+
+@pytest.fixture(scope="module")
+def qwen35_xpu_ckpt(tmp_path_factory) -> str:
+    """The math-reference checkpoint (V=64, no tokenizer): the offload-vs-reference
+    tests compare greedy ids against a CPU reference built at the same vocab, so the
+    vocab must stay the loader suite's ``V=64``."""
+    return _fabricate_qwen35_ckpt(tmp_path_factory, embed_vocab=None)
+
+
+@pytest.fixture(scope="module")
+def qwen35_xpu_serve_ckpt(tmp_path_factory) -> str:
+    """The serve-seam checkpoint (vocab 50257 = the real GPT-2 tokenizer).
+
+    The live serve test renders the chat through the model's tokenizer chat template
+    and decodes the generated ids to text, so the embedding / lm_head vocab must be a
+    superset of the tokenizer's id space (50257). This checkpoint is NOT comparable
+    to the loader suite's V=64 reference -- it exists only to feed the live serve seam.
+    """
+    return _fabricate_qwen35_ckpt(tmp_path_factory, embed_vocab=50257)
 
 
 @pytest.fixture(autouse=True)
