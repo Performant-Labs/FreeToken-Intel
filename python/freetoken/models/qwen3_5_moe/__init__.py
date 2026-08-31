@@ -611,12 +611,23 @@ class _GatedDeltaNet:
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads, device=device, dtype=dtype))
         self.A_log = nn.Parameter(torch.empty(self.num_v_heads, device=device, dtype=dtype))
         self.norm = _RMSNormGated(self.head_v_dim, eps=eps, device=device, dtype=dtype)
-        self.out_proj = nn.Linear(self.value_dim, hidden, bias=False, device=device, dtype=dtype)
-        # Separate projections (qwen3_5_moe spelling).
-        self.in_proj_qkv = nn.Linear(hidden, self.key_dim * 2 + self.value_dim, bias=False, device=device, dtype=dtype)
-        self.in_proj_z = nn.Linear(hidden, self.value_dim, bias=False, device=device, dtype=dtype)
-        self.in_proj_b = nn.Linear(hidden, self.num_v_heads, bias=False, device=device, dtype=dtype)
-        self.in_proj_a = nn.Linear(hidden, self.num_v_heads, bias=False, device=device, dtype=dtype)
+        # Pure-torch tensor-parallel Linear port (issue-24 WP6), not ``nn.Linear``.
+        # On the B70 (TP=1) each reduces to a plain ``x @ w.T`` -- the identical
+        # math ``nn.Linear`` runs -- while as ``nn.Parameter``-backed ``BaseOP``s
+        # they stay drop-in for the checkpoint loader (``named_parameters()`` +
+        # ``param.copy_()``) and drop the CUDA JIT / NCCL deps upstream carries.
+        # Weights are allocated CPU-side here and moved by the model's ``.to(device)``
+        # (see Qwen3_5MoEForCausalLM.__init__), matching every other dense module.
+        # ``out_proj`` folds the recurrent core output back to the hidden dim -- the
+        # row-parallel output projection -- so it maps to LinearOProj; the input-side
+        # projections (qkv / z gate / b beta / a decay) are replicated.
+        from freetoken.layers import LinearOProj, LinearReplicated
+
+        self.out_proj = LinearOProj(self.value_dim, hidden, has_bias=False, dtype=dtype)
+        self.in_proj_qkv = LinearReplicated(hidden, self.key_dim * 2 + self.value_dim, has_bias=False, dtype=dtype)
+        self.in_proj_z = LinearReplicated(hidden, self.value_dim, has_bias=False, dtype=dtype)
+        self.in_proj_b = LinearReplicated(hidden, self.num_v_heads, has_bias=False, dtype=dtype)
+        self.in_proj_a = LinearReplicated(hidden, self.num_v_heads, has_bias=False, dtype=dtype)
 
     def _conv(self, mixed_qkv: torch.Tensor, slot, hidden_dtype) -> torch.Tensor:
         """Causal depthwise conv over the mixed qkv; updates the conv ring.
@@ -772,10 +783,21 @@ class _Qwen35Attention:
         # Only this fraction of the head is rotated (Qwen3.6 partial rotary).
         self.head_dim_rot = int(head_dim * (partial_rotary_factor or 1.0))
         theta = float(rope_theta)
-        self.q_proj = nn.Linear(self.hidden, num_heads * head_dim * 2, bias=False, device=device, dtype=dtype)
-        self.k_proj = nn.Linear(self.hidden, num_kv_heads * head_dim, bias=False, device=device, dtype=dtype)
-        self.v_proj = nn.Linear(num_kv_heads * head_dim, self.hidden, bias=False, device=device, dtype=dtype)
-        self.o_proj = nn.Linear(num_heads * head_dim, self.hidden, bias=False, device=device, dtype=dtype)
+        # Pure-torch tensor-parallel Linear port (issue-24 WP6), not ``nn.Linear``
+        # (CPU-allocated here, moved by the model's ``.to(device)``; see above).
+        # Qwen3.5's full-attention q_proj fuses the query and the output gate into
+        # one [num_heads, 2*head_dim] projection (split in forward), so its output
+        # size is num_heads*head_dim*2 -- a single replicated weight the checkpoint
+        # stores as ``q_proj.weight``. (It is NOT the q+k+v merged projection, so it
+        # maps to LinearReplicated, not LinearQKVMerged, whose output size would be
+        # (num_heads + 2*num_kv_heads)*head_dim.) o_proj is the row-parallel output
+        # projection; k/v are plain replicated projections.
+        from freetoken.layers import LinearOProj, LinearReplicated
+
+        self.q_proj = LinearReplicated(self.hidden, num_heads * head_dim * 2, has_bias=False, dtype=dtype)
+        self.k_proj = LinearReplicated(self.hidden, num_kv_heads * head_dim, has_bias=False, dtype=dtype)
+        self.v_proj = LinearReplicated(self.hidden, num_kv_heads * head_dim, has_bias=False, dtype=dtype)
+        self.o_proj = LinearOProj(num_heads * head_dim, self.hidden, has_bias=False, dtype=dtype)
         self.q_norm = _RMSNorm(head_dim, eps=eps, device=device, dtype=dtype)
         self.k_norm = _RMSNorm(head_dim, eps=eps, device=device, dtype=dtype)
         # Partial-RoPE inverse frequencies: theta ** (-2i / rotary_dim).
@@ -869,7 +891,11 @@ class _Qwen35MoE:
         self.use_offload = bool(getattr(config, "use_offload_moe", False))
         self.expert_inter = config.moe_intermediate_size
         self.shared_inter = int(config.attrs.get("text_config", {}).get("shared_expert_intermediate_size", config.moe_intermediate_size))
-        self.gate = nn.Linear(self.hidden, self.num_experts, bias=False, device=device, dtype=dtype)
+        # Router: pure-torch replicated Linear (issue-24 WP6) -- ``num_experts``
+        # is small and fully replicated.
+        from freetoken.layers import LinearReplicated
+
+        self.gate = LinearReplicated(self.hidden, self.num_experts, has_bias=False, dtype=dtype)
         if self.use_offload:
             self.experts = None
         else:
@@ -877,7 +903,9 @@ class _Qwen35MoE:
         self.shared_expert = _Qwen35Expert(
             _make_shared_config(config, self.shared_inter), device, dtype
         )
-        self.shared_expert_gate = nn.Linear(self.hidden, 1, bias=False, device=device, dtype=dtype)
+        # Shared-expert router: a single scalar gate (the shared expert is always
+        # on, so the router is a 1-way linear), on the pure-torch Linear port.
+        self.shared_expert_gate = LinearReplicated(self.hidden, 1, has_bias=False, dtype=dtype)
 
     def forward(self, hidden_states, table_idx, ctx, batch) -> torch.Tensor:
         in_shape = hidden_states.shape
@@ -1005,9 +1033,14 @@ class _Qwen35Expert:
 
     def __init__(self, config: ModelConfig, device, dtype) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False, device=device, dtype=dtype)
-        self.up_proj = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False, device=device, dtype=dtype)
-        self.down_proj = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False, device=device, dtype=dtype)
+        # Pure-torch replicated Linear port (issue-24 WP6); each SwiGLU projection
+        # is an independent replicated Linear (the in-VRAM path reads each
+        # projection's own checkpoint weight, so we do not fuse them).
+        from freetoken.layers import LinearReplicated
+
+        self.gate_proj = LinearReplicated(config.hidden_size, config.moe_intermediate_size, has_bias=False, dtype=dtype)
+        self.up_proj = LinearReplicated(config.hidden_size, config.moe_intermediate_size, has_bias=False, dtype=dtype)
+        self.down_proj = LinearReplicated(config.moe_intermediate_size, config.hidden_size, has_bias=False, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -1136,7 +1169,11 @@ class Qwen3_5MoEForCausalLM:
             for i in range(num_layers)
         )
         self.norm = _RMSNorm(hidden_size, eps=self.rms_norm_eps, device=device, dtype=dtype)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False, device=device, dtype=dtype)
+        # Pure-torch replicated Linear (issue-24 WP6); weight [vocab, hidden],
+        # the same shape the checkpoint's ``lm_head.weight`` carries.
+        from freetoken.layers import LinearReplicated
+
+        self.lm_head = LinearReplicated(hidden_size, vocab_size, has_bias=False, dtype=dtype)
 
         # The MoE offload wiring (ADR 0002): when offload is on the routed experts
         # are never device-resident and are read from the LRU slot pool the loader

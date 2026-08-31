@@ -125,10 +125,20 @@ class _Qwen3Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads or config.num_attention_heads
         self.head_dim = config.hidden_size // self.num_heads
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
+        # The q/k/v/o projections are the pure-torch tensor-parallel Linear port
+        # (issue-24 WP6), not ``nn.Linear``. On the B70 (TP=1) the TP-aware classes
+        # reduce to a plain ``x @ w.T`` matmul -- the identical math ``nn.Linear``
+        # runs -- but as ``nn.Parameter``-backed ``BaseOP``s they stay drop-in for
+        # the checkpoint loader (``named_parameters()`` + ``.to(device)``) and drop
+        # the CUDA JIT / NCCL dependencies upstream's Linear carries. Shapes match
+        # ``nn.Linear`` exactly: q is ``[heads*head_dim, hidden]``, k/v
+        # ``[kv*head_dim, hidden]`` (``[out, in]``), o ``[heads*head_dim, hidden]``.
+        from freetoken.layers import LinearOProj, LinearReplicated
+
+        self.q_proj = LinearReplicated(config.hidden_size, self.num_heads * self.head_dim, has_bias=False)
+        self.k_proj = LinearReplicated(config.hidden_size, self.num_kv_heads * self.head_dim, has_bias=False)
+        self.v_proj = LinearReplicated(config.hidden_size, self.num_kv_heads * self.head_dim, has_bias=False)
+        self.o_proj = LinearOProj(self.num_heads * self.head_dim, config.hidden_size, has_bias=False)
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
         # Precompute the RoPE inverse frequencies (theta = rope_theta).
@@ -250,7 +260,11 @@ class _Qwen3MoE(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.use_offload = bool(getattr(config, "use_offload_moe", False))
-        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        # Router: pure-torch replicated Linear (issue-24 WP6). ``num_experts`` is
+        # small and fully replicated, so ``LinearReplicated`` is the right class.
+        from freetoken.layers import LinearReplicated
+
+        self.gate = LinearReplicated(config.hidden_size, self.num_experts, has_bias=False)
         if self.use_offload:
             # ADR 0002: no XPU-resident expert params. The routed experts are
             # read from the LRU slot pool the loader attaches to the model
@@ -414,7 +428,11 @@ class Qwen3MoeForCausalLM(nn.Module):
             _Qwen3DecoderLayer(config, device, dtype, layer_id=i) for i in range(num_layers)
         )
         self.norm = nn.RMSNorm(hidden_size)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        # Pure-torch replicated Linear (issue-24 WP6); weight ``[vocab, hidden]``,
+        # the same shape the checkpoint's ``lm_head.weight`` carries.
+        from freetoken.layers import LinearReplicated
+
+        self.lm_head = LinearReplicated(hidden_size, vocab_size, has_bias=False)
 
         # ADR 0002: when the engine picks the host-offload MoE backend the
         # experts are never XPU-resident. The MoE blocks then hold *only* the
@@ -427,8 +445,9 @@ class Qwen3MoeForCausalLM(nn.Module):
             self.moe_offload = False
         self.moe_cache = None
         self.moe_layer_id = None
-        # The modules above (nn.Linear / nn.RMSNorm) are registered on the CPU,
-        # and the loader fills them in place without moving them -- so without
+        # The modules above (pure-torch Linear / nn.RMSNorm) are registered on
+        # the CPU, and the loader fills them in place without moving them -- so
+        # without
         # this the dense weights (norms, projections, lm_head) would stay on the
         # CPU while the engine feeds XPU activations, and the first forward would
         # hit a device mismatch. Move the whole module to its target device here
