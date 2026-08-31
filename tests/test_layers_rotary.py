@@ -196,7 +196,8 @@ def test_proportional_inv_freq_shape():
     head_size, rotary_dim, max_pos, base = 128, 64, 16, 10000.0
     rope = RotaryEmbedding(head_size, rotary_dim, max_pos, base, proportional=True)
     # proportional spans the full head (head_size/2 = 64 freqs)
-    assert rope.inv_freq.shape[0] == head_size // 2, f
+    got = rope.inv_freq.shape[0]
+    assert got == head_size // 2, f"inv_freq[0] {got} != head_size//2 {head_size // 2}"
     # dims beyond rotary_dim are masked to 0.0
     assert (rope.inv_freq[rotary_dim // 2 :] == 0.0).all().item()
 
