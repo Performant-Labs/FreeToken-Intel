@@ -77,13 +77,22 @@ def _seed(op, seed: int):
     as ``x`` -- a CPU reference would raise a cross-device mm error on the XPU.
     """
     g = torch.Generator(device="cpu").manual_seed(seed)
-    op.weight = (
-        torch.randn(op.weight.shape, device="cpu", generator=g) * 0.5
-    ).to(device=DEVICE, dtype=op.weight.dtype)
+    # The Linear is a real nn.Module (issue-24 WP6), so nn.Module.__setattr__ only
+    # accepts a Parameter/None for a name already in _parameters. Move the tensor to
+    # device/dtype FIRST (Tensor.to returns a plain Tensor), then wrap the result in a
+    # Parameter -- Parameter.to() would itself return a plain Tensor and trip the same
+    # check. requires_grad=False: a test weight, not an optimizer-tracked one.
+    op.weight = torch.nn.Parameter(
+        torch.randn(op.weight.shape, device="cpu", generator=g)
+        .to(device=DEVICE, dtype=op.weight.dtype)
+        .clone()
+    )
     if op.bias is not None:
-        op.bias = (
-            torch.randn(op.bias.shape, device="cpu", generator=g) * 0.5
-        ).to(device=DEVICE, dtype=op.bias.dtype)
+        op.bias = torch.nn.Parameter(
+            torch.randn(op.bias.shape, device="cpu", generator=g)
+            .to(device=DEVICE, dtype=op.bias.dtype)
+            .clone()
+        )
     return op.weight, op.bias
 
 
@@ -212,7 +221,8 @@ def test_linear_bf16_input_stays_bf16():
     # Seed in bf16 so the reference is the same bf16 matmul (ulp-scale residual).
     g = torch.Generator(device="cpu").manual_seed(18)
     w = torch.randn(op.weight.shape, device="cpu", generator=g) * 0.5
-    op.weight = w.to(device=DEVICE, dtype=torch.bfloat16)
+    # .to() returns a plain Tensor, so wrap AFTER the move (see _seed).
+    op.weight = torch.nn.Parameter(w.to(device=DEVICE, dtype=torch.bfloat16).clone())
     x = torch.randn(4, isz, device=DEVICE, dtype=torch.bfloat16)
     got = op.forward(x)
     assert got.dtype == torch.bfloat16, "output dtype must match input dtype"
