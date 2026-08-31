@@ -262,3 +262,39 @@ def test_gemma_plus_one_forward_and_inplace():
     layer2.forward_inplace(x2)
     err2 = _max_abs_err(x2, _rmsnorm_ref(snap, w2, eps, one_plus=True))
     assert err2 < 5e-2, f"gemma+1 inplace: max abs err {err2:.5f}"
+
+
+@pytest.mark.xpu
+def test_gemma_rmsnorm_forward_add_residual():
+    from freetoken.layers.norm import GemmaRMSNorm
+
+    H, N, eps = 128, 5, 1e-6
+    x, w = _mk(DEV, torch.bfloat16, H, N, seed=10)
+    residual = torch.randn(N, H, device=DEV, dtype=torch.bfloat16)
+    layer = GemmaRMSNorm(H, eps=eps)
+    layer.weight = w
+    x_snap, res_snap = x.clone(), residual.clone()
+    normed, residual = layer.forward_add_residual(x, residual)
+    want, want_res = _fused_add_ref(x_snap, res_snap, w, eps, one_plus=True)
+    res_err = _max_abs_err(residual, want_res)
+    assert res_err < 5e-2, f"gemma add-residual residual: max abs err {res_err:.5f}"
+    n_err = _max_abs_err(normed, want)
+    assert n_err < 5e-2, f"gemma add-residual norm: max abs err {n_err:.5f}"
+    # The method mutates x in place (x.copy_(norm)) and returns (x, residual).
+    assert normed is x, "forward_add_residual must return the (in-place) normed x"
+
+
+@pytest.mark.xpu
+def test_gemma_plus_one_fused_no_residual_is_plain_one_plus_norm():
+    from freetoken.layers.norm import GemmaPlusOneRMSNormFused
+
+    H, N, eps = 128, 5, 1e-6
+    x, w = _mk(DEV, torch.bfloat16, H, N, seed=11)
+    layer = GemmaPlusOneRMSNormFused(H, eps=eps)
+    layer.weight = w
+    normed, residual = layer.forward(x)
+    want = _rmsnorm_ref(x, w, eps, one_plus=True)
+    err = _max_abs_err(normed, want)
+    assert err < 5e-2, f"gemma-fused(no-res): max abs err {err:.5f}"
+    # With no residual the residual out is the *same* tensor object x (untouched).
+    assert residual is x, "residual must be x (untouched) when no residual is passed"
