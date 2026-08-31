@@ -86,7 +86,9 @@ class GemmaRMSNorm(BaseOP):
     def forward_add_residual(self, x: torch.Tensor, residual: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         import torch
 
-        residual = residual + x
+        # In-place on *both* streams (the fused seam): residual += x, then x := (1+w)-norm(residual).
+        # The caller's residual buffer is mutated; it is not a fresh tensor (matches the docstring contract).
+        residual.add_(x)
         w = 1.0 + self._kernel_weight(residual)
         x.copy_(torch.rms_norm(residual, (residual.shape[-1],), w, self.eps))
         return x, residual
@@ -149,7 +151,8 @@ class GemmaPlusOneRMSNormFused(BaseOP):
         if residual is None:
             w = 1.0 + self.weight
             return torch.rms_norm(x, (x.shape[-1],), w, self.eps), x
-        residual = residual + x
+        # In-place on both streams (the fused seam): residual += x, then x := (1+w)-norm(residual).
+        residual.add_(x)
         w = 1.0 + self.weight
         x.copy_(torch.rms_norm(residual, (residual.shape[-1],), w, self.eps))
         return x, residual
@@ -169,6 +172,7 @@ class RMSNormFused(BaseOP):
 
         if residual is None:
             return torch.rms_norm(x, (x.shape[-1],), self.weight, self.eps), x
-        residual = residual + x
+        # In-place on both streams (the fused seam): residual += x, then x := norm(residual).
+        residual.add_(x)
         x.copy_(torch.rms_norm(residual, (residual.shape[-1],), self.weight, self.eps))
         return x, residual

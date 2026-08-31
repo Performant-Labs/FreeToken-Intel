@@ -64,9 +64,11 @@ def _rmsnorm_ref(x: "torch.Tensor", w: "torch.Tensor", eps: float, one_plus: boo
 
 
 def _fused_add_ref(x: "torch.Tensor", residual: "torch.Tensor", w: "torch.Tensor", eps: float, one_plus: bool = False):
-    # Residual is formed with the same dtype the layer uses (bf16 add), then normed
-    # via the same ``torch.rms_norm`` call the layer makes. Returns (normed, residual).
-    residual = residual + x
+    # Mirror the layer's fused seam on *separate* buffers: the layer does the residual
+    # add in place (``residual.add_(x)``) and returns the same residual object; doing the
+    # add in place here on the caller's (already-cloned) ``residual`` keeps this reference
+    # buffer-identical so the test can also assert the layer mutated its own buffer.
+    residual.add_(x)
     return _rmsnorm_ref(residual, w, eps, one_plus), residual
 
 
@@ -216,12 +218,16 @@ def test_rmsnorm_fused_residual_updates_both_inplace():
     layer = RMSNormFused(H, eps=eps)
     layer.weight = w
     x_snap, res_snap = x.clone(), residual.clone()
+    res_id_before = id(residual)
     normed, residual = layer.forward(x, residual)
     want, want_res = _fused_add_ref(x_snap, res_snap, w, eps, one_plus=False)
     res_err = _max_abs_err(residual, want_res)
     assert res_err < 5e-2, f"fused-res residual: max abs err {res_err:.5f}"
     n_err = _max_abs_err(normed, want)
     assert n_err < 5e-2, f"fused-res norm: max abs err {n_err:.5f}"
+    # Fused seam is in-place on *both* streams: the returned residual is the same buffer
+    # object that was passed in (mutated), not a fresh tensor (the point of a fused seam).
+    assert id(residual) == res_id_before, "fused seam must update the residual buffer in place"
 
 
 @pytest.mark.xpu
@@ -234,12 +240,14 @@ def test_gemma_plus_one_fused_residual():
     layer = GemmaPlusOneRMSNormFused(H, eps=eps)
     layer.weight = w
     x_snap, res_snap = x.clone(), residual.clone()
+    res_id_before = id(residual)
     normed, residual = layer.forward(x, residual)
     want, want_res = _fused_add_ref(x_snap, res_snap, w, eps, one_plus=True)
     res_err = _max_abs_err(residual, want_res)
     assert res_err < 5e-2, f"gemma-fused residual: max abs err {res_err:.5f}"
     n_err = _max_abs_err(normed, want)
     assert n_err < 5e-2, f"gemma-fused norm: max abs err {n_err:.5f}"
+    assert id(residual) == res_id_before, "fused seam must update the residual buffer in place"
 
 
 @pytest.mark.xpu
@@ -274,14 +282,16 @@ def test_gemma_rmsnorm_forward_add_residual():
     layer = GemmaRMSNorm(H, eps=eps)
     layer.weight = w
     x_snap, res_snap = x.clone(), residual.clone()
+    res_id_before = id(residual)
     normed, residual = layer.forward_add_residual(x, residual)
     want, want_res = _fused_add_ref(x_snap, res_snap, w, eps, one_plus=True)
     res_err = _max_abs_err(residual, want_res)
     assert res_err < 5e-2, f"gemma add-residual residual: max abs err {res_err:.5f}"
     n_err = _max_abs_err(normed, want)
     assert n_err < 5e-2, f"gemma add-residual norm: max abs err {n_err:.5f}"
-    # The method mutates x in place (x.copy_(norm)) and returns (x, residual).
+    # forward_add_residual mutates x in place (x.copy_(norm)) and updates residual in place.
     assert normed is x, "forward_add_residual must return the (in-place) normed x"
+    assert id(residual) == res_id_before, "forward_add_residual must update residual in place"
 
 
 @pytest.mark.xpu
