@@ -17,6 +17,23 @@ from typing import List, Optional
 
 from .base import BaseOP
 
+# TP info is a lazily-set global (see freetoken.distributed.info). The engine sets
+# it when a process is launched in a distributed group; a standalone model build
+# (``load_model`` in a unit test, the CPU reference path, or a single-device serve)
+# never does. Rather than hard-require it, these layers fall back to rank 0 / TP
+# size 1 -- the B70's single-device reality -- so the classes are always
+# constructible and the TP>1 all_reduce branch (dead on TP=1) simply stays dormant.
+from freetoken.distributed import try_get_tp_info
+
+
+def _tp_rank_size():
+    """Return ``(rank, tp_size)``: the set global if present, else the TP=1 default."""
+    info = try_get_tp_info()
+    if info is None:
+        return 0, 1
+    return info.rank, info.size
+
+
 __all__ = [
     "LinearReplicated",
     "LinearColParallelMerged",
@@ -30,10 +47,11 @@ class _LinearTPImpl(BaseOP):
     """Base tensor-parallel linear layer (weights sharded per the TP layout).
 
     Mirrors the upstream class: holds ``weight`` (``[local_osize, local_isize]``)
-    and an optional ``bias`` (``[local_osize]``) as plain tensors so the
-    torch-free ``BaseOP.state_dict`` / ``load_state_dict`` machinery can fill
-    them in. ``forward`` is overridden by the parallel subclasses that need a
-    TP>1 all_reduce.
+    and an optional ``bias`` (``[local_osize]``) as ``nn.Parameter`` so the layers
+    stay drop-in for an ``nn.Module`` parent -- the checkpoint loader fills them
+    via ``named_parameters()`` + ``param.copy_()`` and moves them with the model's
+    ``.to(device)`` (a plain tensor would be invisible to both). ``forward`` is
+    overridden by the row-parallel subclasses that add a TP>1 all_reduce.
     """
 
     def __init__(
@@ -49,11 +67,28 @@ class _LinearTPImpl(BaseOP):
         self.local_input_size = local_isize
         self.local_output_size = local_osize
         self.has_bias = has_bias
-        # Lazy import: torch is only needed to allocate the buffers.
+        # Lazy import: torch is only needed to allocate the buffers. Registering
+        # the weights as ``nn.Parameter`` (not plain tensors) keeps the layers
+        # drop-in for an ``nn.Module`` parent: the checkpoint loader fills them
+        # via ``named_parameters()`` + ``param.copy_()`` and moves them with the
+        # model's ``.to(device)`` -- a plain tensor would be invisible to
+        # ``named_parameters()`` (leaving weights at random init) and would not
+        # be moved by ``.to``. ``register_parameter`` lives on ``nn.Module``
+        # (reached through ``super()``), so torch is only imported here.
         import torch
+        import torch.nn as nn
 
-        self.weight = torch.empty(local_osize, local_isize)
-        self.bias = torch.empty(local_osize) if has_bias else None
+        self.weight = nn.Parameter(torch.empty(local_osize, local_isize))
+        self.bias = nn.Parameter(torch.empty(local_osize)) if has_bias else None
+
+    def __call__(self, x, out: Optional[object] = None):
+        # ``nn.Module.__call__`` is what a parent module relies on when the model
+        # invokes a layer positionally (e.g. ``self.q_proj(hidden)``). ``BaseOP``
+        # exposes only ``forward`` (the pure-torch unit tests call ``.forward()``
+        # directly), so without this the layers are not callable and the model's
+        # attention/FFN call sites raise ``TypeError: ... not callable``. Delegates
+        # to ``forward`` (which subclasses override), so TP>1 all_reduce still runs.
+        return self.forward(x, out)
 
     def forward(self, x, out: Optional[object] = None):
         import torch.nn.functional as F
@@ -91,13 +126,12 @@ class LinearColParallelMerged(_LinearTPImpl):
     """
 
     def __init__(self, input_size: int, output_sizes: List[int], has_bias: bool) -> None:
-        # TP plumbing (get_tp_info / div_even) is torch-free; only the buffer
+        # TP plumbing (try_get_tp_info / div_even) is torch-free; only the buffer
         # allocation in the base __init__ needs torch.
-        from freetoken.distributed import get_tp_info
         from freetoken.utils import div_even
 
-        tp_info = get_tp_info()
-        tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        _, tp_size = _tp_rank_size()
+        tp_output_sizes = [div_even(size, tp_size) for size in output_sizes]
         output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
         super().__init__(input_size, output_size, input_size, tp_output_size, has_bias)
@@ -114,12 +148,11 @@ class LinearQKVMerged(_LinearTPImpl):
         num_kv_heads: int,
         has_bias: bool,
     ) -> None:
-        from freetoken.distributed import get_tp_info
         from freetoken.utils import div_even
 
-        tp_info = get_tp_info()
-        local_num_qo = div_even(num_qo_heads, tp_info.size)
-        local_num_kv = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        _, tp_size = _tp_rank_size()
+        local_num_qo = div_even(num_qo_heads, tp_size)
+        local_num_kv = div_even(num_kv_heads, tp_size, allow_replicate=True)
         full_isize = hidden_size
         full_osize = (num_qo_heads + 2 * num_kv_heads) * head_dim
         local_isize = hidden_size
@@ -136,12 +169,11 @@ class LinearOProj(_LinearTPImpl):
     """
 
     def __init__(self, input_size: int, output_size: int, has_bias: bool) -> None:
-        from freetoken.distributed import get_tp_info
         from freetoken.utils import div_even
 
-        tp_info = get_tp_info()
-        self._tp_size = tp_info.size
-        super().__init__(input_size, output_size, div_even(input_size, tp_info.size), output_size, has_bias)
+        _, tp_size = _tp_rank_size()
+        self._tp_size = tp_size
+        super().__init__(input_size, output_size, div_even(input_size, tp_size), output_size, has_bias)
 
     def forward(self, x, out: Optional[object] = None):
         import torch.nn.functional as F
@@ -165,12 +197,11 @@ class LinearRowParallel(_LinearTPImpl):
     """
 
     def __init__(self, input_size: int, output_size: int, has_bias: bool) -> None:
-        from freetoken.distributed import get_tp_info
         from freetoken.utils import div_even
 
-        tp_info = get_tp_info()
-        self._tp_size = tp_info.size
-        super().__init__(input_size, output_size, div_even(input_size, tp_info.size), output_size, has_bias)
+        _, tp_size = _tp_rank_size()
+        self._tp_size = tp_size
+        super().__init__(input_size, output_size, div_even(input_size, tp_size), output_size, has_bias)
 
     def forward(self, x, out: Optional[object] = None):
         import torch.nn.functional as F
