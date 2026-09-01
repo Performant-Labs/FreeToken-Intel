@@ -839,7 +839,7 @@ class _Qwen35Attention:
         v = v.transpose(1, 2)[0]
         # Append this request's K/V to the pool at its positions (identity table:
         # out_loc == position under the identity page table, as in qwen3_moe).
-        ctx.kv_cache.write_kv(k, v, positions)
+        ctx.kv_cache.write_kv(k, v, positions, self.layer_id)
         out = ctx.attn_backend.forward(q, k, v, self.layer_id, batch, table_idx=table_idx)
         # Gated output: sigmoid(gate) elementwise over the attention output.
         # out is head-major [heads, T, head_dim]; make the gate head-major to match.
@@ -949,11 +949,25 @@ class _Qwen35MoE:
         model = ctx.model
         layer_id = model.moe_layer_id[self.layer_id]
         cache = model.moe_cache
-        is_prefill = (batch is not None and batch.is_prefill) or flat.shape[0] > 1
+        # is_prefill must come from the batch's *phase flag*, not from flat.shape[0]:
+        # in a mixed step (decode reqs with 1 token each, or a decode req alongside a
+        # prefill req) flat.shape[0] > 1 even though every token is a 1-token decode.
+        # The offload path then calls materialize_layer (whole layer) instead of
+        # ensure_experts (routed experts only). Routing itself is host-side and
+        # phase-independent: we snapshot the routed *expert* ids and map them to
+        # slots from the cache's slot_for_id, so the phase only decides *which*
+        # experts to make resident (the whole layer, or just the routed ones).
+        is_prefill = bool(batch is not None and batch.is_prefill)
         is_xpu = bool(getattr(cache, "is_xpu", False))
         B, k = top_idx.shape
-        # 1) Snapshot the routed *expert* ids on the host (the topk output is a
-        #    fresh tensor; reading it back here is a clean D2H of its final value).
+        # 1) Snapshot the routed *expert* ids on the host BEFORE the LRU call.
+        #    top_idx holds *expert* ids (the topk output) and the cache never
+        #    rewrites it (issue #7): the old code rewrote top_idx in place to
+        #    *slot* ids, so a repeat routing that skipped the rewrite left the
+        #    previous step's slot ids in place and the next step read them as if
+        #    they were expert ids -> out-of-bounds (XPU IndexError) / a wrong
+        #    expert gather on CPU. Routing is fully determined by this snapshot +
+        #    the cache's slot map, so top_idx may keep holding expert ids.
         expert_ids = top_idx.to("cpu")
         # 2) Let the LRU pool decide residency (prefill: whole layer; decode:
         #    only the routed experts), staging the host->XPU copy plan.
@@ -1005,9 +1019,8 @@ class _Qwen35MoE:
                 if bool(valid_cpu[i, j]):
                     by_slot.setdefault(int(routed_cpu[i, j]), []).append(i)
             groups.extend((j, s_i, rows) for s_i, rows in by_slot.items())
-        # 5) Push the routing to the XPU (one op). Validity is already encoded in
-        #    which rows appear in `groups`, so no separate valid tensor is pushed.
-        routed_dev = routed_cpu.to(dev)
+        # 5) (No device-side push needed: validity is encoded in which rows appear
+        #    in `groups`, and the gather below uses host-built index tensors.)
         # 6) Gather per slot on the XPU using host-computed INTEGER indices:
         #    static shapes, no nonzero(), no implicit D2H anywhere in the loop.
         #    index_add_ accumulates exactly as `out[sub] += ...` did (and handles
@@ -1021,9 +1034,17 @@ class _Qwen35MoE:
                 flat.index_select(0, idx),
             )
             out.index_add_(0, idx, y)
-        # 7) Leave top_idx in the slot-id contract (harmless; nothing downstream
-        #    reads it, but keeps the "top_idx holds slot ids" invariant true).
-        top_idx.copy_(routed_dev)
+        # NB: we do NOT write the slot ids back into top_idx here (the old code did
+        # `top_idx.copy_(routed_dev)`). top_idx is a *fresh* topk tensor each call,
+        # and routing is done host-side from the `expert_ids` snapshot + the cache's
+        # slot map, so nothing downstream reads top_idx after we return. On the XPU
+        # the in-place write raced the next step's fresh topk: the host snapshot of
+        # top_idx then read *stale slot ids* (0..S-1, e.g. 5 >= num_experts 4)
+        # instead of the just-computed expert ids -- an out-of-bounds slots[] read
+        # (XPU IndexError / kernel abort) and, on CPU, a wrong expert gather that
+        # silently corrupts the logits (offload no longer matches the in-VRAM
+        # reference). The routing is fully determined by the host snapshot, so the
+        # device-side top_idx may keep holding expert ids; leave it untouched.
         return out
 
 

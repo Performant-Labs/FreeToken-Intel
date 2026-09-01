@@ -106,12 +106,32 @@ class TritonAttentionBackend(BaseAttnBackend):
         if table_idx is not None:
             req = next((r for r in batch.reqs if r.table_idx == table_idx), batch.reqs[0])
             ext = q.shape[1]
-            # Per-request phase (NOT the batch-level flag -- a batch can mix
-            # phases): a request is decoding once a token has been generated.
-            is_decode = req.device_len != len(req.input_ids)
-            written = req.device_len if is_decode else ext
+            # Phase comes from the scheduler's per-step flag ``batch.phase``
+            # ("prefill" for any step that extends the prompt -- first chunk or a
+            # chunked continuation -- "decode" otherwise), which is uniform within
+            # a step: the scheduler emits a prefill step or a decode step, never a
+            # mix, so one flag sizes every request's slice this step. This matches
+            # the engine, which appends/samples and keys its token bookkeeping off
+            # batch.phase. (NOT req.can_decode -- that is a per-request token-BUDGET
+            # flag (remain_len > 0): it is False for a finished decode req, and it
+            # is the chunked-prefill "do not sample this chunk" signal, NOT the
+            # attention phase. The old shape checks (device_len != / > len(input_ids))
+            # misfire under chunked prefill, where a continuation has device_len >
+            # len(input_ids) and a full prefill has device_len == len(input_ids).)
+            is_decode = batch.phase == "decode"
+            # Decode steps read the full KV history (prompt + every generated
+            # token). A prefill step reads the prompt prefix already resident
+            # in the pool plus the tokens this chunk carries: for the first
+            # chunk (cached_len 0) that is the whole prompt; for a
+            # continuation the pool holds [0, device_len) and ext == the
+            # chunk, so cached_len + ext == device_len == the full attended
+            # prefix. The old "written = device_len" under-counted a
+            # continuation (device_len was the pre-bump), so the kernel read pool slots that
+            # had not been written yet (torch.empty garbage, which differs per
+            # process -- the original nondeterminism).
+            written = req.device_len if is_decode else req.cached_len + ext
             q_pos = self._request_positions(batch, table_idx, ext)
-            out[:] = self._attend_one(req, q, q_pos, written, repeat, scale, window)
+            out[:] = self._attend_one(req, q, q_pos, written, repeat, scale, window, layer_id)
             return out
 
         # Whole-batch call (table_idx is None): q/k/v span all requests, so walk
@@ -119,21 +139,31 @@ class TritonAttentionBackend(BaseAttnBackend):
         # Each request's phase is decided per-request (a batch can mix phases).
         token_idx = 0
         for req in batch.reqs:
-            is_decode = req.device_len != len(req.input_ids)
+            # Uniform phase from the scheduler's per-step flag (see the
+            # per-request call above): one flag sizes every request's slice.
+            is_decode = batch.phase == "decode"
+            # A decode step always contributes exactly one new token per request,
+            # independent of req.extend_len (which is device_len - cached_len and
+            # can be larger when a request was framed/overridden with a stale
+            # cached_len -- e.g. a test that overrides device_len but leaves
+            # cached_len at 0). Pref pattern of upstream: decode -> 1 new token,
+            # prefill -> the whole chunk (req.extend_len).
             ext = 1 if is_decode else req.extend_len
-            written = req.device_len if is_decode else req.extend_len
+            # Decode reads the full history; prefill reads the resident prompt
+            # prefix + this chunk (see the per-request path above).
+            written = req.device_len if is_decode else req.cached_len + ext
             qh = q[:, token_idx : token_idx + ext, :]
             q_pos = batch.positions[token_idx : token_idx + ext]
-            out[:, token_idx : token_idx + ext, :] = self._attend_one(req, qh, q_pos, written, repeat, scale, window)
+            out[:, token_idx : token_idx + ext, :] = self._attend_one(req, qh, q_pos, written, repeat, scale, window, layer_id)
             token_idx += ext
         return out
 
-    def _attend_one(self, req, qh, q_pos, written, repeat, scale, window: int = 0) -> torch.Tensor:
+    def _attend_one(self, req, qh, q_pos, written, repeat, scale, window: int = 0, layer_id: int = 0) -> torch.Tensor:
         """Attend a block of query rows against one request's KV history."""
         ctx = _get_ctx()
         kv_cache = ctx.kv_cache
         dev = qh.device
-        k_tok, v_tok = kv_cache.read_kv(req.table_idx, torch.arange(written, device=dev))
+        k_tok, v_tok = kv_cache.read_kv(req.table_idx, torch.arange(written, device=dev), layer_id)
         k_all = k_tok.transpose(0, 1).contiguous()  # [kv, written, D]
         v_all = v_tok.transpose(0, 1).contiguous()  # [kv, written, D]
         if repeat != 1:
@@ -171,9 +201,12 @@ class TritonAttentionBackend(BaseAttnBackend):
         for r in batch.reqs:
             if r.table_idx == table_idx:
                 break
-            # Per-request phase: a request that has generated a token is in
-            # decode (one new token this step); otherwise it is prefilling.
-            offset += 1 if (r.device_len != len(r.input_ids)) else r.extend_len
+            # A decoding request contributes one new token this step; a
+            # prefilling one (first chunk or chunked continuation) contributes
+            # its extend length. The phase is the scheduler's uniform per-step
+            # flag (not a per-request device_len shape test, which misfires for
+            # a full prefill / chunked continuation).
+            offset += 1 if batch.phase == "decode" else r.extend_len
         return batch.positions[offset : offset + ext]
 
 

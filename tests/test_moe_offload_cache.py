@@ -107,8 +107,10 @@ def test_decode_hit_bumps_usage_no_copy():
     # With S > E (the default 8 > 4), after materializing layer 0 then layer 1
     # the pool is NOT full: layer 0 keeps 4 resident slots and layer 1's 4 experts
     # land in the 4 free slots. Routing a layer-1 expert is therefore a pure HIT
-    # (already resident -> no new miss, no scheduled copy, slot id rewritten in
-    # place) -- the hit bookkeeping path under the global-LRU scheme.
+    # (already resident -> no new miss, no scheduled copy) -- the hit bookkeeping
+    # path under the global-LRU scheme. (The routed tensor is NOT rewritten in
+    # place: the forward maps expert -> slot on the host, so the expert id is
+    # preserved -- see test_decode_repeat_routing_is_in_bounds for issue #7.)
     c = OffloadMoeCache(L, E, S, DEVICE, prefill_overlap=False)
     c.set_bank_sources(_bank_sources())
     c.materialize_layer(0)
@@ -121,8 +123,10 @@ def test_decode_hit_bumps_usage_no_copy():
     # Expert 1 is already resident -> a hit: no new miss, no scheduled copy.
     assert c.stat_missing.item() == before_missing
     assert c.num_indices.item() == 0
-    # The routed position was rewritten to the expert's (hit) slot.
-    assert ids[0].item() == c.slot_for_id[1, 1].item()
+    # The routed expert id is preserved (not rewritten to a slot id); the expert
+    # is resident in the (hit) slot the map points to.
+    assert ids[0].item() == 1, "expert id must not be rewritten in place (issue #7)"
+    assert c.slot_for_id[1, 1].item() != -1, "hit expert must be resident"
     # Its slot's usage was bumped to the newest step (the LRU key moved).
     assert c.usage[c.slot_for_id[1, 1].item()].item() == c.step.item()
 
