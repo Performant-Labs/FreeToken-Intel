@@ -54,6 +54,17 @@ class ServerArgs:
     reasoning_parser: str | None = "auto"
     max_output_tokens: int | None = None
     shell_mode: bool = False
+    # MoE backend selection (issue #8 / ADR 0002). "auto" is the default: the
+    # engine resolves it (host-RAM offload on a B70 MoE). Explicit "cpu" runs the
+    # routed-expert GEMM on the host CPU instead of streaming experts to the XPU;
+    # "offload" is the in-VRAM / host-pinned-streaming default; "hybrid" (#9) will
+    # split hot experts to the XPU and the tail to the CPU.
+    moe_backend: str = "auto"
+    # Host CPU threads for the CPU MoE GEMM (issue #8); 0 = torch default.
+    moe_cpu_threads: int = 0
+    # Comma-separated MoE layer indices to run on the CPU (issue #8); None = all
+    # MoE layers when the backend is cpu/hybrid.
+    moe_cpu_layers: str | None = None
 
     def __post_init__(self) -> None:
         if self.server_port < 0 or self.server_port > 65535:
@@ -138,6 +149,30 @@ def parse_args(args: list[str] | None = None, prog: str | None = None) -> Server
     parser.add_argument("--reasoning-parser", dest="reasoning_parser", default="auto", choices=REASONING_PARSER_CHOICES, help="Split chain-of-thought into reasoning_content. 'off' disables.")
     parser.add_argument("--max-output-tokens", dest="max_output_tokens", type=int, default=None, help="Default max decode tokens for requests that omit one.")
     parser.add_argument("--shell-mode", dest="shell_mode", action="store_true", help="Run the server attached to a terminal shell (ft shell).")
+    parser.add_argument(
+        "--moe-backend",
+        dest="moe_backend",
+        default="auto",
+        choices=("auto", "cpu", "offload", "hybrid"),
+        help="MoE backend. 'auto' (default) picks host-RAM offload on a B70 MoE; "
+        "'cpu' runs routed-expert GEMMs on the host CPU (issue #8); 'offload' streams "
+        "activated experts to the XPU; 'hybrid' (issue #9) splits hot experts to XPU "
+        "and the tail to CPU.",
+    )
+    parser.add_argument(
+        "--moe-cpu-threads",
+        dest="moe_cpu_threads",
+        type=int,
+        default=0,
+        help="Host CPU threads for the CPU MoE GEMM (issue #8). 0 = torch default.",
+    )
+    parser.add_argument(
+        "--moe-cpu-layers",
+        dest="moe_cpu_layers",
+        default=None,
+        help="Comma-separated MoE layer indices to run on the CPU (issue #8). "
+        "Empty/omitted = all MoE layers when the backend is cpu/hybrid.",
+    )
 
     ns = parser.parse_args(args)
     kwargs = {f.name: getattr(ns, f.name) for f in fields(ServerArgs)}

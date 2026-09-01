@@ -202,6 +202,17 @@ def _parse_args(argv: list[str], prog: str) -> argparse.Namespace:
     parser.add_argument("model", help="model reference (HF repo id, FTW path, or registered name)")
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")
+    # MoE backend selection (ADR 0002 / issue #8). Accepted here (and in the
+    # server/args.py re-parse) so ``ft serve --moe-backend cpu`` does not trip the
+    # outer parser's "unrecognized arguments" before the real server args are read.
+    parser.add_argument(
+        "--moe-backend",
+        default="auto",
+        choices=("auto", "cpu", "offload", "hybrid"),
+        help="MoE backend: 'auto' (default) / 'cpu' (issue #8) / 'offload' / 'hybrid' (issue #9).",
+    )
+    parser.add_argument("--moe-cpu-threads", type=int, default=0, help="Host CPU threads for the CPU MoE GEMM (issue #8). 0 = torch default.")
+    parser.add_argument("--moe-cpu-layers", default=None, help="Comma-separated MoE layer indices to run on the CPU (issue #8). Omitted = all MoE layers when the backend is cpu/hybrid.")
     return parser.parse_args(argv)
 
 
@@ -299,7 +310,13 @@ def _build_engine_holder(server_args):
             # serve path never silently runs on CPU on a B70 box.
             device="xpu" if is_xpu_available() else "cpu",
             dtype=torch.float32,
-            moe_backend="auto",
+            # The MoE backend is a serve flag (--moe-backend): "auto" is the
+            # default and the engine resolves it to host-RAM offload (ADR 0002)
+            # on a B70 MoE; "cpu" runs routed-expert GEMMs on the host CPU
+            # (issue #8); "hybrid" (issue #9) splits hot experts to XPU.
+            moe_backend=server_args.moe_backend,
+            moe_cpu_threads=server_args.moe_cpu_threads,
+            moe_cpu_layers=server_args.moe_cpu_layers,
             # A single in-flight request per server: keeps the paged KV pool
             # small and the serve path trivially correct. (Batching is #13.)
             max_running_req=1,

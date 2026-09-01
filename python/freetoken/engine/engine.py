@@ -102,6 +102,7 @@ class Engine:
             dtype=dtype,
             dummy=bool(getattr(config, "use_dummy_weight", False)),
             moe_backend=getattr(config, "moe_backend", None),
+            moe_cpu_layers=getattr(config, "moe_cpu_layers", None),
         )
 
         # Size the paged KV pool. The pool is indexed by token slot

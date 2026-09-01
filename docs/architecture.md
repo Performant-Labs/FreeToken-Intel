@@ -80,7 +80,7 @@ Stub modules mention the slug in `unimplemented(..., "<slug>")`.
 | `attn-sycl` | [#5](https://github.com/Performant-Labs/FreeToken-Intel/issues/5) |
 | `moe-fused` | [#6](https://github.com/Performant-Labs/FreeToken-Intel/issues/6) |
 | `moe-offload` | [#7](https://github.com/Performant-Labs/FreeToken-Intel/issues/7) |
-| `moe-cpu` | [#8](https://github.com/Performant-Labs/FreeToken-Intel/issues/8) |
+| `moe-cpu` | [#8](https://github.com/Performant-Labs/FreeToken-Intel/issues/8) — done: `--moe-backend cpu` runs the routed-expert GEMM on the host from the pinned banks (pure-PyTorch single-thread `CpuMoeExecutor`, ADR 0002), and `--moe-cpu-layers` partitions MoE layers between the CPU executor and the XPU offload slot pool (`parse_moe_cpu_layers`, pure-Python). The AVX-512/AMX thread-pool GEMM (`kernel/csrc/cpu_moe/placeholder.cpp`) is a deferred kernel follow-up, not part of this slice. |
 | `moe-hybrid` | [#9](https://github.com/Performant-Labs/FreeToken-Intel/issues/9) |
 | `quant-xpu` | [#10](https://github.com/Performant-Labs/FreeToken-Intel/issues/10) |
 | `ftw-checkpoint` | [#11](https://github.com/Performant-Labs/FreeToken-Intel/issues/11) |

@@ -43,6 +43,21 @@ class ModelConfig:
     # LRU slot pool (OffloadMoeCache) inside the forward pass. The loader sets
     # this from the engine's moe_backend choice (it is NOT a checkpoint field).
     use_offload_moe: bool = False
+    # Issue #8 (moe-cpu): when True the routed experts run on the host CPU (the
+    # expert GEMM runs in host RAM, not streamed to the device). The loader sets
+    # this from the engine's moe_backend choice. Distinct from use_offload_moe,
+    # which streams activated experts to the device -- the CPU backend computes
+    # in place. (Thread-pool / AVX-512/AMX threading is a follow-up; 0 = auto.)
+    use_cpu_moe: bool = False
+    moe_cpu_threads: int = 0
+    # Issue #8 (moe-cpu): the --moe-cpu-layers spec as passed to the engine
+    # (None / "auto" / "0" / a count / a fraction / an id list). Resolved to the
+    # concrete MoE-layer indices at model-build time by
+    # freetoken.moe.parse_moe_cpu_layers; the model stores that list on
+    # ``model.moe_cpu_moe_layers`` (None == every MoE layer on the CPU) and the
+    # block dispatches per-layer off it. Distinct from use_cpu_moe, which is the
+    # boolean "the cpu backend is selected" flag the loader sets from moe_backend.
+    moe_cpu_layers: Any = None
     dtype: Any = None
     max_position_embeddings: int | None = None
     tie_word_embeddings: bool = False

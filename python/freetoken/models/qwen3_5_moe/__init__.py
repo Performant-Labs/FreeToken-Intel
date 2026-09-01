@@ -107,7 +107,13 @@ def _rope_theta(text_config: dict) -> float:
     return float(theta) if theta is not None else 10000.0
 
 
-def parse_config(hf_config: Any, *, use_offload_moe: bool = False) -> ModelConfig:
+def parse_config(
+    hf_config: Any,
+    *,
+    use_offload_moe: bool = False,
+    use_cpu_moe: bool = False,
+    moe_cpu_layers: str | None = None,
+) -> ModelConfig:
     """Build a :class:`ModelConfig` from a (multimodal) Qwen3.5/3.6 HF config.
 
     Torch-free. The language tower is nested under ``text_config`` (the config is
@@ -177,6 +183,13 @@ def parse_config(hf_config: Any, *, use_offload_moe: bool = False) -> ModelConfi
         cfg.num_experts_per_tok = int(_first(text_config, "num_experts_per_tok", default=0))
         cfg.num_moe_layers = num_layers - first_k_dense_replace
     cfg.use_offload_moe = bool(use_offload_moe)
+    # The CPU backend (issue #8) also keeps experts non-device-resident, so it
+    # flags use_offload_moe as well (the model's moe_offload gate + the loader's
+    # host-bank build key off it); use_cpu_moe is the *distinct* flag the block
+    # reads to run the routed-expert GEMM on the host instead of the LRU slots.
+    cfg.use_cpu_moe = bool(use_cpu_moe)
+    # Issue #8: store the --moe-cpu-layers spec verbatim (resolved at build time).
+    cfg.moe_cpu_layers = moe_cpu_layers
 
     # rope_theta is a first-class ModelConfig field (the rope builder reads it);
     # resolve it (it may live under rope_parameters.rope_theta) and set the field.
@@ -889,6 +902,22 @@ class _Qwen35MoE:
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.use_offload = bool(getattr(config, "use_offload_moe", False))
+        # The CPU backend (issue #8) keeps the experts non-device-resident like
+        # the XPU offload backend, so it also sets use_offload_moe; use_cpu_moe is
+        # the *distinct* flag that switches the routed-expert GEMM to the host.
+        # The forward dispatches off these block-local flags (set from the
+        # loader-resolved config at construction) rather than reading
+        # ``ctx.model.moe_backend`` -- the test harness (and any non-engine caller)
+        # builds a ``Context`` that never sets ``.model``, so reading it would
+        # crash the forward on every path.
+        self.use_cpu = bool(getattr(config, "use_cpu_moe", False))
+        # Issue #8: this block's decoder-layer index (== self.layer_id). The
+        # per-layer CPU/offload partition (--moe-cpu-layers) is keyed by
+        # MoE-layer index, so the forward resolves the index the same way the
+        # forwards resolve the bank rows: model.moe_layer_id[self.layer_id].
+        # (The block keeps a copy here so a test-harness Context -- which never
+        # sets .model -- can still be distinguished from the no-CPU-layers case.)
+        self.moe_layer_id = layer_id
         self.expert_inter = config.moe_intermediate_size
         self.shared_inter = int(config.attrs.get("text_config", {}).get("shared_expert_intermediate_size", config.moe_intermediate_size))
         # Router: pure-torch replicated Linear (issue-24 WP6) -- ``num_experts``
@@ -896,7 +925,7 @@ class _Qwen35MoE:
         from freetoken.layers import LinearReplicated
 
         self.gate = LinearReplicated(self.hidden, self.num_experts, has_bias=False, dtype=dtype)
-        if self.use_offload:
+        if self.use_offload or self.use_cpu:
             self.experts = None
         else:
             self.experts = nn.ModuleList(_Qwen35Expert(config, device, dtype) for _ in range(self.num_experts))
@@ -916,12 +945,91 @@ class _Qwen35MoE:
         top_w = (top_w / top_w.sum(dim=-1, keepdim=True)).to(flat.dtype)
         # The always-on shared expert (dense, on the device), gated per-token.
         shared_out = F.sigmoid(self.shared_expert_gate(flat)) * self.shared_expert(flat)
-        # Routed experts: in-VRAM modules, or the host-offload LRU slot pool.
-        if self.use_offload:
+        # Routed experts: the host-side expert GEMM (CPU backend, issue #8), the
+        # host-offload LRU slot pool (XPU offload, ADR 0002), or the in-VRAM
+        # modules. When the model carries a ``moe_cpu_moe_layers`` partition
+        # (issue #8, --moe-cpu-layers) the per-layer decision reads it through
+        # ``ctx.model`` (a cpu/hybrid backend can mix CPU + XPU-offload MoE
+        # layers); when it does not (a test harness's Context never sets .model)
+        # the block falls back to its block-local use_cpu flag, so existing
+        # harnesses are unaffected.
+        if self._is_cpu_layer(ctx):
+            routed_out = self._forward_cpu(flat, top_idx, top_w, ctx, batch)
+        elif self.use_offload:
             routed_out = self._forward_offload(flat, top_idx, top_w, ctx, batch)
         else:
             routed_out = self._forward_inram(flat, top_idx, top_w)
         return (routed_out + shared_out).view(in_shape)
+
+    def _is_cpu_layer(self, ctx) -> bool:
+        """Whether this block's routed experts compute on the CPU (issue #8).
+
+        True when the resolved MoE backend is a CPU variant (``cpu`` / ``hybrid``)
+        AND the model's ``moe_cpu_moe_layers`` partition names this block. The
+        partition (resolved from ``--moe-cpu-layers`` by the loader) is a concrete
+        list of MoE-layer indices: ``[]`` means no layer is steered to the CPU
+        (the serve default ``--moe-backend auto`` -> ``offload``, so this block
+        stays on the XPU slot pool), and a full list means every MoE layer on the
+        CPU (the ``--moe-backend cpu`` / explicit ``"auto"`` spec). The MoE index
+        is resolved the *same way* the forwards resolve the bank rows
+        (``model.moe_layer_id[self.layer_id]``), so the partition decision can
+        never diverge from the expert weights this block actually reads. When
+        ``ctx.model`` is unset (a test harness), fall back to the block-local
+        ``use_cpu`` flag so non-engine callers keep their existing behavior.
+        """
+        model = getattr(ctx, "model", None)
+        if model is None:
+            return self.use_cpu
+        moe_backend = getattr(model, "moe_backend", None)
+        if moe_backend not in ("cpu", "hybrid"):
+            # In-VRAM (fused/None) or pure offload: no CPU layers.
+            return False
+        cpu_layers = getattr(model, "moe_cpu_moe_layers", None)
+        if cpu_layers is None:
+            # Defensive: the loader always sets moe_cpu_moe_layers for the
+            # cpu/hybrid backends; None here means "all on CPU" (legacy harness).
+            return True
+        moe_layer_id_map = getattr(model, "moe_layer_id", None)
+        if moe_layer_id_map is None:
+            return bool(cpu_layers)
+        # Resolve the MoE-layer index exactly the way the forwards resolve the
+        # bank rows (moe_layer_id[self.layer_id]) so the partition decision and
+        # the expert weights this block reads can never diverge.
+        moe_idx = moe_layer_id_map[self.layer_id]
+        return moe_idx in cpu_layers
+
+    def _forward_cpu(self, flat, top_idx, top_w, ctx, batch):
+        """Run the routed experts on the host (issue #8, ADR 0002).
+
+        Same contract as ``_Qwen3MoE._forward_cpu``: read this layer's pinned
+        host banks straight off the loader-built ``cpu_expert_sources`` (no device
+        round-trip -- the host is the source of truth) and run the expert GEMM on
+        the CPU, shipping only the resulting activations back. The accumulated
+        order is expert-major-then-top-k-column, so the CPU path matches the
+        in-VRAM reference's greedy tokens exactly.
+        """
+        model = ctx.model
+        moe_idx = model.moe_layer_id[self.layer_id]
+        # The host banks are the source of truth (ADR 0002) and live in the moe
+        # cache the loader attached (``set_bank_sources`` keeps the raw per-layer
+        # [E, ...] host tensors, already unwrapped from any _PlainBank). Read
+        # this layer's gate_up / down straight off the host -- no device
+        # round-trip, no PCIe stream, no LRU slot juggling.
+        sources = model.moe_cache.bank_sources
+        gate_up = sources["gate_up"][moe_idx]
+        down = sources["down"][moe_idx]
+        from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+        executor = getattr(model, "_moe_cpu_executor", None)
+        if executor is None:
+            threads = int(getattr(model.config, "moe_cpu_threads", 0) or 0)
+            executor = CpuMoeExecutor(
+                num_experts=int(model.config.num_experts),
+                intermediate=int(model.config.moe_intermediate_size),
+                threads=threads,
+            )
+            model._moe_cpu_executor = executor
+        return executor.forward(flat, top_idx, top_w, gate_up, down)
 
     def _forward_inram(self, flat, top_idx, top_w):
         out = torch.zeros_like(flat)
@@ -1213,11 +1321,17 @@ class Qwen3_5MoEForCausalLM:
 
         self.lm_head = LinearReplicated(hidden_size, vocab_size, has_bias=False, dtype=dtype)
 
-        # The MoE offload wiring (ADR 0002): when offload is on the routed experts
-        # are never device-resident and are read from the LRU slot pool the loader
-        # attaches (self.moe_cache / self.moe_layer_id); the linear layers read
-        # their per-request state from the linear-state pool (self.linear_state_pool).
-        self.moe_offload = bool(getattr(config, "use_offload_moe", False)) and bool(getattr(config, "is_moe", False))
+        # The MoE offload wiring (ADR 0002, issue #8): when offload OR the CPU
+        # backend is on, the routed experts are never device-resident and are read
+        # from the host banks the loader attaches (self.moe_cache / self.moe_layer_id);
+        # the linear layers read their per-request state from the linear-state pool
+        # (self.linear_state_pool). The CPU backend (use_cpu_moe) is additionally
+        # flagged so the block's forward runs the expert GEMM on the host instead of
+        # streaming experts to the XPU.
+        self.moe_offload = (
+            (bool(getattr(config, "use_offload_moe", False)) or bool(getattr(config, "use_cpu_moe", False)))
+            and bool(getattr(config, "is_moe", False))
+        )
         self.moe_cache = None
         self.moe_layer_id = None
         # The linear-state pool: one recurrent + conv state per request slot, per

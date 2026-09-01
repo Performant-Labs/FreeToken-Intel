@@ -26,6 +26,18 @@ from freetoken.models.weight import load_moe_expert_sources, load_weight
 from freetoken.utils import cached_load_hf_config
 from freetoken.utils.arch import is_xpu_available
 
+# Architectures whose parse_config accepts the ``use_offload_moe`` /
+# ``use_cpu_moe`` kwargs (ADR 0002, issue #8). These are the only ones that
+# build router-only MoE blocks (non-device-resident experts) when offloaded or
+# run the routed-expert GEMM on the host CPU when the backend is ``cpu``. Every
+# other architecture's parse_config is a no-op ``(*args, **kwargs)`` stub that
+# raises unimplemented() on any kwarg, so load_model must only re-parse for these.
+_CPU_MOE_CAPABLE_ARCHS = {
+    "Qwen3MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+}
+
 
 def load_model(
     model_path: str,
@@ -34,6 +46,7 @@ def load_model(
     dtype: torch.dtype | None = None,
     dummy: bool = False,
     moe_backend: str | None = None,
+    moe_cpu_layers: str | None = None,
 ) -> tuple:
     """Load a checkpoint onto ``device`` (defaults to the XPU when available).
 
@@ -64,7 +77,7 @@ def load_model(
     # only if the resolution flips the flag (the common ``auto``-on-XPU path).
     parse_config = _load_attr(spec.module, spec.parse_config)
     model_config = parse_config(hf_config, use_offload_moe=False)
-    from freetoken.moe import resolve_moe_backend
+    from freetoken.moe import parse_moe_cpu_layers, resolve_moe_backend
 
     is_moe_early = bool(getattr(model_config, "is_moe", False))
     # Only an explicit "auto" (the EngineConfig default) is resolved here; an
@@ -72,9 +85,40 @@ def load_model(
     # None for the in-VRAM path are unaffected.
     if moe_backend == "auto":
         moe_backend = resolve_moe_backend(moe_backend, is_moe=is_moe_early)
+    # "offload" streams activated experts to the device; "cpu" runs the expert
+    # GEMM on the host (issue #8). Both keep the experts non-device-resident, so
+    # both flag use_offload_moe (the block's "no resident experts" gate); the
+    # CPU path is additionally flagged use_cpu_moe so the block dispatches to
+    # the host GEMM instead of the LRU slot pool.
     use_offload = moe_backend in ("offload", "cpu", "hybrid")
-    if use_offload != bool(getattr(model_config, "use_offload_moe", False)):
-        model_config = parse_config(hf_config, use_offload_moe=use_offload)
+    use_cpu = moe_backend == "cpu"
+    # Issue #8: the --moe-cpu-layers spec is resolved to the concrete MoE-layer
+    # indices that compute on the CPU (None == all MoE layers on the CPU, the
+    # --moe-backend=cpu default; an explicit list/carve-out is a subset). It is
+    # stored on the model (model.moe_cpu_moe_layers) and read per-layer by the
+    # block's forward, so a cpu/offload/hybrid backend can mix CPU + XPU-offload
+    # MoE layers in one model. (The spec is parsed here -- torch-free -- so the
+    # CPU venv resolves it without importing torch.) num_moe_layers is derived in
+    # ModelConfig.__post_init__ only for is_moe configs; the first parse (before
+    # is_moe is set) can leave it None, in which case the partition is "no CPU
+    # layers" (a dense model has none).
+    moe_cpu_moe_layers = parse_moe_cpu_layers(
+        moe_cpu_layers, int(getattr(model_config, "num_moe_layers", 0) or 0)
+    )
+    # Re-parse only for architectures whose parse_config takes the offload / cpu
+    # MoE flags (the Qwen3 MoE family). Every other architecture's parse_config is
+    # a no-op (*args, **kwargs) stub that raises unimplemented() the moment it is
+    # handed kwargs, and non-MoE models never flip these flags anyway -- so the
+    # re-parse must not fire for them, or load_model crashes on every dense model.
+    _arch = hf_config.architectures[0] if getattr(hf_config, "architectures", None) else None
+    if _arch in _CPU_MOE_CAPABLE_ARCHS and (
+        use_offload != bool(getattr(model_config, "use_offload_moe", False))
+        or use_cpu != bool(getattr(model_config, "use_cpu_moe", False))
+        or moe_cpu_layers != getattr(model_config, "moe_cpu_layers", None)
+    ):
+        model_config = parse_config(
+            hf_config, use_offload_moe=use_offload, use_cpu_moe=use_cpu, moe_cpu_layers=moe_cpu_layers
+        )
     # Build the model *on this device* (the loader already resolved it): an
     # explicit device wins, and only a None device lets the model default to
     # the XPU. Without this the model would re-default to the XPU and ignore
@@ -98,6 +142,15 @@ def load_model(
     model = get_model_class(hf_config.architectures[0], model_config, device=device)
 
     is_moe = bool(getattr(model_config, "is_moe", False))
+    # Issue #8: record the per-layer CPU/offload partition on the model (read by
+    # the block's forward). Set unconditionally -- even the in-VRAM path gets it
+    # (None == "no CPU layers"), so the forward's getattr is always safe.
+    model.moe_cpu_moe_layers = moe_cpu_moe_layers if is_moe else None
+    # The resolved MoE backend, recorded on the model for the block's forward
+    # (``_is_cpu_layer`` gates on it) and the engine. Set unconditionally -- the
+    # in-VRAM path (moe_backend None / "fused") gets it too -- so a block that
+    # never sees _attach_offload_cache still has a valid gate value.
+    model.moe_backend = moe_backend
     offload = is_moe and use_offload and moe_backend in ("offload", "cpu", "hybrid")
     if dummy:
         # Offline path: no checkpoint is read, so the model's MoE experts must
@@ -122,7 +175,9 @@ def load_model(
             _seed_dummy_experts(model)
             gate_up_banks, down_banks = load_moe_expert_sources(model_path, dtype=dtype, dummy=True)
             if offload:
-                _attach_offload_cache(model, model_config, device, gate_up_banks, down_banks)
+                _attach_offload_cache(
+                    model, model_config, device, gate_up_banks, down_banks, moe_backend=moe_backend
+                )
             else:
                 _place_expert_weights(model, gate_up_banks, down_banks)
             expert_sources = (gate_up_banks, down_banks)
@@ -145,7 +200,9 @@ def load_model(
         if is_moe:
             gate_up_banks, down_banks = load_moe_expert_sources(model_path, dtype=dtype)
             if offload:
-                _attach_offload_cache(model, model_config, device, gate_up_banks, down_banks)
+                _attach_offload_cache(
+                    model, model_config, device, gate_up_banks, down_banks, moe_backend=moe_backend
+                )
             else:
                 _place_expert_weights(model, gate_up_banks, down_banks)
             expert_sources = (gate_up_banks, down_banks)
@@ -250,6 +307,7 @@ def _attach_offload_cache(
     device: torch.device,
     gate_up_banks,
     down_banks,
+    moe_backend: str = "offload",
 ) -> None:
     """Build the LRU slot pool and wire it into the offload model (ADR 0002).
 
@@ -292,6 +350,12 @@ def _attach_offload_cache(
     cache.set_bank_sources({"gate_up": gu, "down": dn})
 
     model.moe_cache = cache
+    # Record the resolved backend on the model. The block's MoE forward reads
+    # this (``_Qwen3MoE.forward``) to route the routed experts through the
+    # right path: "cpu" runs the GEMM on the host (issue #8), "offload" streams
+    # activated experts to the device. The engine reads the model back, so the
+    # loader is the one place that knows which backend it materialized.
+    model.moe_backend = moe_backend
     model.moe_layer_id = [0] * len(model.layers)
     for moe_idx, layer_id in enumerate(moe_layers):
         model.moe_layer_id[layer_id] = moe_idx
