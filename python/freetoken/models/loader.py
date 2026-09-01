@@ -78,20 +78,37 @@ def load_model(
     parse_config = _load_attr(spec.module, spec.parse_config)
     model_config = parse_config(hf_config, use_offload_moe=False)
     from freetoken.moe import parse_moe_cpu_layers, resolve_moe_backend
+    from freetoken.moe.bench_profile import quant_format_for_dtype
 
     is_moe_early = bool(getattr(model_config, "is_moe", False))
     # Only an explicit "auto" (the EngineConfig default) is resolved here; an
     # explicit name or None is honored as-is so existing call sites that pass
     # None for the in-VRAM path are unaffected.
     if moe_backend == "auto":
-        moe_backend = resolve_moe_backend(moe_backend, is_moe=is_moe_early)
+        # Issue #9: pass the model's expert format so ``auto`` can consult the
+        # ``ft bench bw`` profile and upgrade the offload default to hybrid when
+        # the box's measured bandwidths say the CPU beats PCIe. Quantized
+        # checkpoints expose ``quant_format``; a bf16 checkpoint has none, so fall
+        # back to the dtype-derived format (bfloat16 -> "bf16") -- otherwise a
+        # bf16 hero would never resolve the profile and ``auto`` would stay on
+        # offload even when hybrid is benched-better. A None result keeps the
+        # resolve's safe default (offload).
+        moe_backend = resolve_moe_backend(
+            moe_backend,
+            is_moe=is_moe_early,
+            quant_format=getattr(model_config, "quant_format", None)
+            or quant_format_for_dtype(getattr(model_config, "dtype", None)),
+        )
     # "offload" streams activated experts to the device; "cpu" runs the expert
-    # GEMM on the host (issue #8). Both keep the experts non-device-resident, so
-    # both flag use_offload_moe (the block's "no resident experts" gate); the
-    # CPU path is additionally flagged use_cpu_moe so the block dispatches to
-    # the host GEMM instead of the LRU slot pool.
+    # GEMM on the host (issue #8); "hybrid" splits each decode step's misses
+    # between the two halves by the bench profile's fetch fraction (issue #9).
+    # All three keep the experts non-device-resident, so all flag use_offload_moe
+    # (the block's "no resident experts" gate); the CPU path is additionally
+    # flagged use_cpu_moe (whole-layer CPU) and the hybrid path use_hybrid, so
+    # the block dispatches each to the right forward.
     use_offload = moe_backend in ("offload", "cpu", "hybrid")
     use_cpu = moe_backend == "cpu"
+    use_hybrid = moe_backend == "hybrid"
     # Issue #8: the --moe-cpu-layers spec is resolved to the concrete MoE-layer
     # indices that compute on the CPU (None == all MoE layers on the CPU, the
     # --moe-backend=cpu default; an explicit list/carve-out is a subset). It is
@@ -114,10 +131,15 @@ def load_model(
     if _arch in _CPU_MOE_CAPABLE_ARCHS and (
         use_offload != bool(getattr(model_config, "use_offload_moe", False))
         or use_cpu != bool(getattr(model_config, "use_cpu_moe", False))
+        or use_hybrid != bool(getattr(model_config, "use_hybrid", False))
         or moe_cpu_layers != getattr(model_config, "moe_cpu_layers", None)
     ):
         model_config = parse_config(
-            hf_config, use_offload_moe=use_offload, use_cpu_moe=use_cpu, moe_cpu_layers=moe_cpu_layers
+            hf_config,
+            use_offload_moe=use_offload,
+            use_cpu_moe=use_cpu,
+            use_hybrid=use_hybrid,
+            moe_cpu_layers=moe_cpu_layers,
         )
     # Build the model *on this device* (the loader already resolved it): an
     # explicit device wins, and only a None device lets the model default to
@@ -151,6 +173,26 @@ def load_model(
     # in-VRAM path (moe_backend None / "fused") gets it too -- so a block that
     # never sees _attach_offload_cache still has a valid gate value.
     model.moe_backend = moe_backend
+    # Issue #9 (moe-hybrid): the per-step fetch fraction (share of a decode step's
+    # expert misses PCIe-fetched vs computed on the host CPU). Read from the
+    # ``ft bench bw`` profile for this expert format; 0.0 (pure offload) when no
+    # usable profile exists, so a box that never benched degrades cleanly. Set
+    # unconditionally so the block's forward getattr is always safe.
+    from freetoken.moe.bench_profile import load_hybrid_fetch_fraction, quant_format_for_dtype
+
+    # The expert format to key the bench profile on. Quantized checkpoints expose
+    # it as ``model_config.quant_format``; a bf16 checkpoint has none, so derive
+    # the expert format from the effective dtype (the bench profile is keyed by
+    # dtype, and a bf16 model's experts are bf16). Without this the fraction
+    # resolves to ``None`` and a bf16 hybrid model silently fetches 0.0 (never
+    # fetches). ``quant_format_for_dtype`` maps the long torch dtype spellings to
+    # the short bench keys (bfloat16 -> bf16) and folds in the fp8/mxfp4 aliases.
+    _qf = getattr(model_config, "quant_format", None) or quant_format_for_dtype(
+        getattr(model_config, "dtype", None)
+    )
+    model.moe_hybrid_fetch_fraction = (
+        float(load_hybrid_fetch_fraction(_qf) or 0.0) if use_hybrid else 0.0
+    )
     offload = is_moe and use_offload and moe_backend in ("offload", "cpu", "hybrid")
     if dummy:
         # Offline path: no checkpoint is read, so the model's MoE experts must

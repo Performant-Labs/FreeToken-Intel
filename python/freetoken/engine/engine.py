@@ -105,6 +105,15 @@ class Engine:
             moe_cpu_layers=getattr(config, "moe_cpu_layers", None),
         )
 
+        # Issue #9 (moe-hybrid): the operator's per-step PCIe-fetch cap (the
+        # --moe-hybrid-max-fetch serve flag, EngineConfig.moe_hybrid_max_fetch).
+        # -1 (default) = fully profile-driven via the fetch fraction; a
+        # non-negative int caps the routed experts fetched to the XPU each decode
+        # step (the rest compute on the host CPU). Stashed on the model after
+        # load so the block's _forward_hybrid reads it (it is a no-op on the
+        # in-VRAM / cpu / offload backends, which never call _forward_hybrid).
+        self.model.moe_hybrid_max_fetch = int(getattr(config, "moe_hybrid_max_fetch", -1) or -1)
+
         # Size the paged KV pool. The pool is indexed by token slot
         # (page_size==1 in the reference path), one row per (request, position).
         # The override is a *floor*, not a cap: it raises the pool for small

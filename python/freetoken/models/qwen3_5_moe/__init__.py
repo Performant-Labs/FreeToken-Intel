@@ -112,6 +112,7 @@ def parse_config(
     *,
     use_offload_moe: bool = False,
     use_cpu_moe: bool = False,
+    use_hybrid: bool = False,
     moe_cpu_layers: str | None = None,
 ) -> ModelConfig:
     """Build a :class:`ModelConfig` from a (multimodal) Qwen3.5/3.6 HF config.
@@ -188,6 +189,11 @@ def parse_config(
     # host-bank build key off it); use_cpu_moe is the *distinct* flag the block
     # reads to run the routed-expert GEMM on the host instead of the LRU slots.
     cfg.use_cpu_moe = bool(use_cpu_moe)
+    # Issue #9 (moe-hybrid): the per-step split also keeps experts non-device-
+    # resident (so use_offload_moe, set above, is the gate); use_hybrid is the
+    # distinct flag the block reads to split each decode step's misses between
+    # the PCIe-fetch (XPU) and host-CPU halves by the profile's fetch fraction.
+    cfg.use_hybrid = bool(use_hybrid)
     # Issue #8: store the --moe-cpu-layers spec verbatim (resolved at build time).
     cfg.moe_cpu_layers = moe_cpu_layers
 
@@ -911,6 +917,11 @@ class _Qwen35MoE:
         # builds a ``Context`` that never sets ``.model``, so reading it would
         # crash the forward on every path.
         self.use_cpu = bool(getattr(config, "use_cpu_moe", False))
+        # Issue #9 (moe-hybrid): the distinct flag for the per-step split. Set
+        # from the loader-resolved config at construction (the forward dispatches
+        # off block-local flags, not ctx.model, so a test-harness Context that
+        # never sets .model still behaves correctly).
+        self.use_hybrid = bool(getattr(config, "use_hybrid", False))
         # Issue #8: this block's decoder-layer index (== self.layer_id). The
         # per-layer CPU/offload partition (--moe-cpu-layers) is keyed by
         # MoE-layer index, so the forward resolves the index the same way the
@@ -925,7 +936,7 @@ class _Qwen35MoE:
         from freetoken.layers import LinearReplicated
 
         self.gate = LinearReplicated(self.hidden, self.num_experts, has_bias=False, dtype=dtype)
-        if self.use_offload or self.use_cpu:
+        if self.use_offload or self.use_cpu or self.use_hybrid:
             self.experts = None
         else:
             self.experts = nn.ModuleList(_Qwen35Expert(config, device, dtype) for _ in range(self.num_experts))
@@ -955,6 +966,14 @@ class _Qwen35MoE:
         # harnesses are unaffected.
         if self._is_cpu_layer(ctx):
             routed_out = self._forward_cpu(flat, top_idx, top_w, ctx, batch)
+        elif self.use_hybrid:
+            # Issue #9: the per-step split. A layer the partition steers to the
+            # CPU computes fully there (as the cpu backend does); the rest split
+            # each step's misses between the PCIe-fetch/XPU half and the host-CPU
+            # half by the profile's fetch fraction. The split is *intra-layer*
+            # (per decode step), which is where the parent's q* policy lives --
+            # not the whole-layer partition the cpu backend uses.
+            routed_out = self._forward_hybrid(flat, top_idx, top_w, ctx, batch)
         elif self.use_offload:
             routed_out = self._forward_offload(flat, top_idx, top_w, ctx, batch)
         else:
@@ -979,6 +998,10 @@ class _Qwen35MoE:
         """
         model = getattr(ctx, "model", None)
         if model is None:
+            # A test-harness Context never sets .model. For the cpu backend that
+            # means "compute on the CPU" (use_cpu); for hybrid it means "no CPU
+            # layers" -> the block's use_hybrid flag routes to _forward_hybrid
+            # with the (default 0.0) fetch fraction, i.e. pure offload.
             return self.use_cpu
         moe_backend = getattr(model, "moe_backend", None)
         if moe_backend not in ("cpu", "hybrid"):
@@ -986,9 +1009,12 @@ class _Qwen35MoE:
             return False
         cpu_layers = getattr(model, "moe_cpu_moe_layers", None)
         if cpu_layers is None:
-            # Defensive: the loader always sets moe_cpu_moe_layers for the
-            # cpu/hybrid backends; None here means "all on CPU" (legacy harness).
-            return True
+            # For the cpu backend a None partition means "every MoE layer on the
+            # CPU" (the --moe-backend cpu default). For the hybrid backend a None
+            # partition means "no whole layer is carved out to the CPU" -- the
+            # per-step q* split in _forward_hybrid is the hybrid mechanism, so the
+            # CPU half is governed by the fetch fraction, not a layer partition.
+            return moe_backend == "cpu"
         moe_layer_id_map = getattr(model, "moe_layer_id", None)
         if moe_layer_id_map is None:
             return bool(cpu_layers)
@@ -1054,6 +1080,139 @@ class _Qwen35MoE:
         that takes down the whole GPU. Host-driven routing makes the ids
         deterministic and in-bounds by construction.
         """
+        return self._forward_offload_core(
+            flat, top_idx, top_w, ctx, batch,
+            exclude=set(),
+        )
+
+    def _forward_hybrid(self, flat, top_idx, top_w, ctx, batch):
+        """Serve the routed experts by splitting each step's misses (issue #9).
+
+        The host-offload and host-CPU halves share the same pinned expert banks
+        (ADR 0002), so a decode step's routed-expert misses can be *partitioned*:
+        a fraction f PCIe-fetched into the XPU LRU slot pool and computed there,
+        the rest (1 - f) computed on the host CPU from the same host banks. f is
+        the ``ft bench bw`` profile's fetch fraction for this expert format
+        (``q*``: pcie/(pcie+cpu) -- of the two halves' combined bandwidth, the
+        share carried by PCIe), and is what balances the two halves' completion
+        times.
+
+        Correctness: the two halves are *disjoint* expert sets (the CPU set and
+        the XPU set never overlap and together cover exactly the routed experts),
+        and each half uses the *same* math + accumulation order as the pure
+        backend it mirrors -- so hybrid's output is numerically identical to
+        offload's (the q* split changes *which* experts ride each transport, not
+        the arithmetic). The XPU side gathers only the fetched experts' slots
+        (``exclude`` = the CPU-computed experts); the CPU side computes only the
+        rest. The two contributions are summed per-row.
+
+        Prefill (a whole layer, or a layer the partition steers to the CPU) has
+        no miss-split -- every routed expert is made resident -- so it degrades
+        cleanly to the offload path there. The split applies to the routed-expert
+        decode step, where the q* balance lives.
+        """
+        model = ctx.model
+        # Per-layer CPU carve-out (issue #8 --moe-cpu-layers): a layer named
+        # there computes its routed experts fully on the CPU, even under the
+        # hybrid backend (the partition is the coarse whole-layer split; the q*
+        # fraction is the fine per-step split for the layers it does not name).
+        if self._is_cpu_layer(ctx):
+            return self._forward_cpu(flat, top_idx, top_w, ctx, batch)
+        # The fetch fraction f (share of misses PCIe-fetched, the rest on CPU).
+        # Read through ctx.model (the loader stores it there); a test-harness
+        # Context that sets none falls back to the block-local 0.0 (pure offload),
+        # which is the correct no-split default.
+        fetch_frac = float(getattr(model, "moe_hybrid_fetch_fraction", 0.0) or 0.0)
+        if fetch_frac <= 0.0:
+            # No usable profile -> every miss rides PCIe (pure offload).
+            return self._forward_offload(flat, top_idx, top_w, ctx, batch)
+        if fetch_frac >= 1.0:
+            # 100% fetch -> no CPU misses (pure offload); avoid a degenerate CPU
+            # call with an empty expert set.
+            return self._forward_offload(flat, top_idx, top_w, ctx, batch)
+        # Split the routed-expert *ids* into the two disjoint halves. The XPU half
+        # (fetched) gets the top round(n*f) ids; the CPU half the rest. The split
+        # is over the *unique* routed ids of this step (a miss is per-expert, not
+        # per-token-column), computed host-side from the topk snapshot so it is
+        # deterministic and never triggers a device->host sync.
+        expert_ids_cpu = top_idx.to("cpu")
+        seen: list[int] = []
+        for eid in expert_ids_cpu.reshape(-1).tolist():
+            if eid not in seen:
+                seen.append(eid)
+        n = len(seen)
+        n_fetch = int(round(n * fetch_frac))
+        # --moe-hybrid-max-fetch (issue #9): a non-negative int caps the per-step
+        # PCIe-fetched expert count -- the operator's override of the profile's
+        # q* fraction (a hard ceiling, not a ratio). -1 / unset = fully
+        # profile-driven (no cap). The cap only ever *shrinks* the XPU half (and
+        # thus grows the CPU half): it is a floor on the CPU share, so the
+        # disjoint-cover invariant (XPU set + CPU set == routed set) still holds
+        # and the output stays numerically identical to pure offload.
+        max_fetch = int(getattr(model, "moe_hybrid_max_fetch", -1) or -1)
+        if 0 <= max_fetch < n_fetch:
+            n_fetch = max_fetch
+        # Clamp the split to a sane range (never empty the XPU or CPU half unless
+        # the fraction truly is 0 / 1, handled above).
+        n_fetch = max(1, min(n - 1, n_fetch))
+        seen_sorted = sorted(seen)
+        cpu_experts = set(seen_sorted[: n - n_fetch])  # (1 - f) share -> CPU
+        # The CPU half computes its share from the pinned host banks.
+        cpu_top_w = torch.ones(expert_ids_cpu.shape, dtype=top_w.dtype, device=flat.device)
+        out = self._forward_offload_core(
+            flat, top_idx, top_w, ctx, batch,
+            exclude=cpu_experts,
+        )
+        # The host-CPU half computes its (disjoint) share.
+        out += self._forward_cpu_subset(flat, top_idx, cpu_top_w, ctx, batch, cpu_experts)
+        return out
+
+    def _forward_cpu_subset(self, flat, top_idx, cpu_top_w, ctx, batch, cpu_experts):
+        """The host-CPU half of the hybrid split: compute *only* the routed
+        experts in ``cpu_experts`` on the CPU (from the pinned host banks) and
+        return their per-row contribution. A row that routes to an expert *not*
+        in the CPU set contributes nothing (that row is served by the XPU half).
+
+        Accumulation is expert-major then top-k-column (matching
+        ``_forward_cpu`` / the in-VRAM reference), so the per-row result the
+        hybrid path sums is numerically identical to what the pure CPU backend
+        would produce for that subset.
+        """
+        model = ctx.model
+        moe_idx = model.moe_layer_id[self.layer_id]
+        sources = model.moe_cache.bank_sources
+        gate_up = sources["gate_up"][moe_idx]
+        down = sources["down"][moe_idx]
+        dev = flat.device
+        expert_ids = top_idx.to("cpu")
+        B, k = expert_ids.shape
+        num_experts = self.num_experts
+        out = torch.zeros_like(flat)
+        for e in range(num_experts):
+            if e not in cpu_experts:
+                continue
+            for j in range(k):
+                sel = expert_ids[:, j] == e
+                if not bool(sel.any()):
+                    continue
+                idx = torch.nonzero(sel, as_tuple=False).view(-1)
+                idx_dev = idx.to(dev)
+                x_cpu = flat.index_select(0, idx_dev).to("cpu")
+                y = self._expert_compute_cpu(gate_up, down, e, x_cpu)
+                y_dev = y.to(dev)
+                w = cpu_top_w.index_select(0, idx_dev)[:, j, None]
+                out.index_add_(0, idx_dev, w * y_dev)
+        return out
+
+    @staticmethod
+    def _expert_compute_cpu(gate_up, down, e, x_cpu):
+        """One expert on the host from the bank row (the CPU half's GEMM)."""
+        I = gate_up.shape[1] // 2
+        gate = x_cpu @ gate_up[e, 0:I].t()
+        up = x_cpu @ gate_up[e, I : 2 * I].t()
+        return (F.silu(gate) * up) @ down[e].t()
+
+    def _forward_offload_core(self, flat, top_idx, top_w, ctx, batch, *, exclude):
         model = ctx.model
         layer_id = model.moe_layer_id[self.layer_id]
         cache = model.moe_cache
@@ -1140,6 +1299,12 @@ class _Qwen35MoE:
                     expert_to_col.setdefault(e_id, []).append((j, i))
         groups: list[tuple[int, int, list[int]]] = []
         for e in range(num_experts):
+            # Issue #9 hybrid: an expert the host-CPU half serves this step is
+            # excluded from the XPU gather (its slot was left at -1 above, so the
+            # `0 <= s_i < S` check already drops it; this is the belt-and-
+            # suspenders guard against a stale positive slot entry).
+            if e in exclude:
+                continue
             s_i = expert_slots[e]
             if not (0 <= s_i < S):
                 continue
@@ -1329,7 +1494,11 @@ class Qwen3_5MoEForCausalLM:
         # flagged so the block's forward runs the expert GEMM on the host instead of
         # streaming experts to the XPU.
         self.moe_offload = (
-            (bool(getattr(config, "use_offload_moe", False)) or bool(getattr(config, "use_cpu_moe", False)))
+            (
+                bool(getattr(config, "use_offload_moe", False))
+                or bool(getattr(config, "use_cpu_moe", False))
+                or bool(getattr(config, "use_hybrid", False))
+            )
             and bool(getattr(config, "is_moe", False))
         )
         self.moe_cache = None

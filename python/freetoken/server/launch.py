@@ -213,6 +213,7 @@ def _parse_args(argv: list[str], prog: str) -> argparse.Namespace:
     )
     parser.add_argument("--moe-cpu-threads", type=int, default=0, help="Host CPU threads for the CPU MoE GEMM (issue #8). 0 = torch default.")
     parser.add_argument("--moe-cpu-layers", default=None, help="Comma-separated MoE layer indices to run on the CPU (issue #8). Omitted = all MoE layers when the backend is cpu/hybrid.")
+    parser.add_argument("--moe-hybrid-max-fetch", type=int, default=-1, help="Issue #9: cap on the per-step PCIe-fetched expert count. -1 (default) = fully profile-driven via the `ft bench bw` fetch fraction; a non-negative int caps the routed experts fetched to the XPU each decode step (the rest compute on the host CPU).")
     return parser.parse_args(argv)
 
 
@@ -317,6 +318,7 @@ def _build_engine_holder(server_args):
             moe_backend=server_args.moe_backend,
             moe_cpu_threads=server_args.moe_cpu_threads,
             moe_cpu_layers=server_args.moe_cpu_layers,
+            moe_hybrid_max_fetch=server_args.moe_hybrid_max_fetch,
             # A single in-flight request per server: keeps the paged KV pool
             # small and the serve path trivially correct. (Batching is #13.)
             max_running_req=1,

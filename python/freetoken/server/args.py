@@ -65,6 +65,11 @@ class ServerArgs:
     # Comma-separated MoE layer indices to run on the CPU (issue #8); None = all
     # MoE layers when the backend is cpu/hybrid.
     moe_cpu_layers: str | None = None
+    # Issue #9 (moe-hybrid): cap on the per-step PCIe-fetched expert count. -1 (the
+    # default) = fully profile-driven (the fetch fraction from `ft bench bw`); a
+    # non-negative int caps the number of routed experts fetched to the XPU each
+    # decode step (the rest compute on the host CPU). Threads into EngineConfig.
+    moe_hybrid_max_fetch: int = -1
 
     def __post_init__(self) -> None:
         if self.server_port < 0 or self.server_port > 65535:
@@ -172,6 +177,16 @@ def parse_args(args: list[str] | None = None, prog: str | None = None) -> Server
         default=None,
         help="Comma-separated MoE layer indices to run on the CPU (issue #8). "
         "Empty/omitted = all MoE layers when the backend is cpu/hybrid.",
+    )
+    parser.add_argument(
+        "--moe-hybrid-max-fetch",
+        dest="moe_hybrid_max_fetch",
+        type=int,
+        default=-1,
+        help="Issue #9 (moe-hybrid): cap on the per-step PCIe-fetched expert count. "
+        "-1 (default) = fully profile-driven via the `ft bench bw` fetch fraction; "
+        "a non-negative int caps the routed experts fetched to the XPU each decode "
+        "step (the rest compute on the host CPU).",
     )
 
     ns = parser.parse_args(args)

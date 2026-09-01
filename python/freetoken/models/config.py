@@ -49,6 +49,13 @@ class ModelConfig:
     # which streams activated experts to the device -- the CPU backend computes
     # in place. (Thread-pool / AVX-512/AMX threading is a follow-up; 0 = auto.)
     use_cpu_moe: bool = False
+    # Issue #9 (moe-hybrid): when True the routed-expert misses are split
+    # per-decode-step between the two offload halves -- a fraction PCIe-fetched to
+    # the XPU slot pool (computed on the XPU) and the rest computed on the host
+    # CPU -- rather than all one or the other. Distinct from use_offload_moe /
+    # use_cpu_moe: hybrid is the per-step bandwidth-matched split the profile's
+    # fetch fraction tunes. The block's forward reads this to gate _forward_hybrid.
+    use_hybrid: bool = False
     moe_cpu_threads: int = 0
     # Issue #8 (moe-cpu): the --moe-cpu-layers spec as passed to the engine
     # (None / "auto" / "0" / a count / a fraction / an id list). Resolved to the

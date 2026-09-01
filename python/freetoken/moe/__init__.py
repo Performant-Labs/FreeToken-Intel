@@ -21,24 +21,33 @@ def is_offload_moe_backend(backend: str) -> bool:
     return backend in OFFLOAD_MOE_BACKENDS
 
 
-def resolve_moe_backend(backend, *, is_moe: bool) -> str | None:
+def resolve_moe_backend(
+    backend, *, is_moe: bool, quant_format: str | None = None
+) -> str | None:
     """Resolve the ``"auto"`` MoE backend to a concrete one.
 
-    Only ``"auto"`` is resolved: it picks the host-offload backend when the model
-    is a MoE and an XPU is available (the B70 cannot hold a 35B-class expert set
-    in 32 GB VRAM alongside the KV pool), otherwise the in-VRAM fused backend.
+    Only ``"auto"`` is resolved: it picks a host-offload backend when the model is
+    a MoE and an XPU is available (the B70 cannot hold a 35B-class expert set in
+    32 GB VRAM alongside the KV pool), otherwise the in-VRAM fused backend.
     An explicit backend name -- or ``None`` (the legacy default, which the loader
     treats as "in-VRAM / whatever the model built") -- is returned unchanged, so
     callers that already pass ``"fused"`` / ``"offload"`` (or ``None``) are
     unaffected by the resolution.
+
+    The offload-family default is ``offload`` (the ADR 0002 LRU slot pool). Issue
+    #9 (moe-hybrid) refines this: when the model is MoE and an XPU is available,
+    ``auto`` additionally consults the ``ft bench bw`` profile (the per-XPU
+    bandwidth calibration) via ``bench_profile.resolve_backend`` -- if that box's
+    profile measured the CPU MoE bandwidth beating the PCIe gather by the
+    threshold, ``auto`` upgrades to ``hybrid`` (per-step CPU/PCIe split); a
+    missing or mismatched profile leaves the ``offload`` default untouched, so a
+    box that never benched is unchanged.
     """
     if backend != "auto":
         return backend
-    if is_moe:
-        from freetoken.utils.arch import is_xpu_available
+    from freetoken.moe.bench_profile import resolve_backend
 
-        return "offload" if is_xpu_available() else "fused"
-    return "fused"
+    return resolve_backend(backend, is_moe=is_moe, quant_format=quant_format)
 
 
 def parse_moe_cpu_layers(spec: str | None, num_moe_layers: int) -> list[int] | None:
