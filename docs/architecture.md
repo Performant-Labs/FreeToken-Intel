@@ -84,7 +84,7 @@ Stub modules mention the slug in `unimplemented(..., "<slug>")`.
 | `moe-hybrid` | [#9](https://github.com/Performant-Labs/FreeToken-Intel/issues/9) |
 | `quant-xpu` | [#10](https://github.com/Performant-Labs/FreeToken-Intel/issues/10) |
 | `ftw-checkpoint` | [#11](https://github.com/Performant-Labs/FreeToken-Intel/issues/11) |
-| `kvcache` | [#12](https://github.com/Performant-Labs/FreeToken-Intel/issues/12) |
+| `kvcache` | [#12](https://github.com/Performant-Labs/FreeToken-Intel/issues/12) — done: paged MHA/GQA pool (`allocate`/`free` + `[L,S,H,D]` buffer) and radix prefix match/insert/evict (`_compare.py` pure-torch key fallback). `hybrid_swa_pool.py` (M5) and `scheduler/cache.py` (engine wiring, #14) remain stubs. |
 | `scheduler` | [#13](https://github.com/Performant-Labs/FreeToken-Intel/issues/13) |
 | `engine-loop` | [#14](https://github.com/Performant-Labs/FreeToken-Intel/issues/14) |
 | `engine-graph` | [#15](https://github.com/Performant-Labs/FreeToken-Intel/issues/15) |

@@ -12,12 +12,104 @@ radix/hybrid pools are separate issues.
 """
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from typing import NamedTuple
+
 import torch
 
 
-class BaseCacheHandle:
-    def __init__(self, *args, **kwargs) -> None:
-        pass
+class CacheRebuildRejected(Exception):
+    """A runtime cache rebuild was rejected before any destructive free. The
+    old caches are intact and serving continues -- recoverable, unlike a
+    failure after the free."""
+
+
+class BaseCacheHandle(ABC):
+    """A token handle into a prefix cache: how many leading tokens matched
+    (``cached_len``) plus, via :meth:`get_matched_indices`, the pool slot
+    indices of that matched prefix. Subclasses add a back-reference to the
+    tree node / pool row that backs the handle. Handles are immutable value
+    objects; each concrete handle is a ``@dataclass(frozen=True)`` that
+    declares ``cached_len`` as its *first* field (no default, so it sorts
+    first in the generated ``__init__``) followed by its back-reference
+    fields. The base is a plain ABC (not a dataclass) so that the concrete
+    frozen-dataclass ``__init__`` is generated from a clean field set rather
+    than inheriting a field through the dataclass mechanism -- the latter
+    produces a broken ``__init__`` on some Python builds."""
+
+    cached_len: int
+
+    @abstractmethod
+    def get_matched_indices(self) -> torch.Tensor:
+        """Slot indices (int32/64, one per matched token) of the cached prefix."""
+
+
+class SizeInfo(NamedTuple):
+    evictable_size: int
+    protected_size: int
+
+    @property
+    def total_size(self) -> int:
+        return self.evictable_size + self.protected_size
+
+
+class InsertResult(NamedTuple):
+    # Plain NamedTuple (already immutable). Must NOT also be @dataclass: a
+    # frozen dataclass over a NamedTuple generates an __init__ that calls
+    # object.__setattr__, which collides with the NamedTuple's property
+    # descriptors over the tuple fields and raises
+    # AttributeError("can't set attribute") on every construction.
+    cached_len: int  # length already in cache before insertion (can be freed)
+    handle: "BaseCacheHandle"  # cache handle for the inserted prefix
+
+
+class MatchResult(NamedTuple):
+    # Plain NamedTuple; see :class:`InsertResult` for why not @dataclass.
+    cached_len: int
+    handle: "BaseCacheHandle"
+
+
+class BasePrefixCache(ABC):
+    """Interface for a prefix cache keyed on token ids and backed by a paged
+    KV pool. The Intel engine loop's flat pool does not use this; the radix
+    family (issue `kvcache`) does. See ``radix_cache.py``."""
+
+    @abstractmethod
+    def lock_handle(self, handle: "BaseCacheHandle", unlock: bool = False) -> None:
+        """Lock (protect from eviction) or unlock a handle. Does not modify the
+        cache's contents, only the ref counts / size accounting. Handles must be
+        locked before their matched indices are consumed, or ``evict`` may free
+        the backing pages first."""
+
+    @abstractmethod
+    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
+        """Return the length of the cached prefix of ``input_ids`` and a handle to
+        it. Does not modify the cache."""
+
+    @abstractmethod
+    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
+        """Insert ``input_ids`` (backed by slot ``indices``) into the cache. May
+        split an existing node at the divergence point. Returns how much was
+        already cached plus a handle to the full inserted span."""
+
+    @abstractmethod
+    def evict(self, size: int) -> torch.Tensor:
+        """Free at least ``size`` tokens worth of least-recently-used, unlocked
+        pages. Returns the slot indices freed (concatenated). ``evict(0)`` is a
+        no-op. Raises if the evictable size is smaller than ``size``."""
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Clear the cache and all accounting."""
+
+    @property
+    @abstractmethod
+    def size_info(self) -> SizeInfo:
+        """Current evictable / protected token counts."""
+
+    @abstractmethod
+    def check_integrity(self) -> None:
+        """Assert the cache's invariants hold; raise on corruption."""
 
 
 class BaseKVCachePool:
