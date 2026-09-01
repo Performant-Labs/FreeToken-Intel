@@ -149,10 +149,8 @@ class Engine:
         # Attention backend (reference pure-torch GQA under "auto").
         self.attn_backend = create_attention_backend(config.attention_backend, config)
 
-        # Sampler. The reference path has no single eos id to stop on, so we
-        # stop purely on max_tokens (eos_token_id=-1 never matches); a request
-        # can still opt out via ignore_eos.
-        self.sampler = self._build_sampler(model_config, device)
+        # Sampler.
+        self.sampler = self._build_sampler(config, model_config, device)
 
         # Global context the model's forward reads. The model also resolves its
         # own reference (ctx.model) so the MoE blocks can reach the offload
@@ -190,11 +188,27 @@ class Engine:
             config = SchedulerConfig(**field_values)
         self.scheduler = Scheduler(config, max_pages=num_pages, cache_budget=self._pool_budget)
 
-    def _build_sampler(self, model_config, device) -> "object":
+    def _build_sampler(self, config, model_config, device) -> "object":
         from freetoken.engine.sample import Sampler
 
-        # No eos id in the reference path; -1 is outside any real vocab.
-        return Sampler(eos_token_id=-1, device=device)
+        # The reference path previously never stopped a request early: the
+        # sampler was hardcoded to eos_token_id=-1 (outside any real vocab),
+        # so every request ran to the full max_tokens budget regardless of the
+        # model's own stop signal. That silently forces decoding well past a
+        # response's natural end -- exactly where small / merged models tend
+        # to collapse into repetition loops, which looked like a decode-quality
+        # problem but was actually the engine ignoring EOS entirely. Read the
+        # checkpoint's real eos_token_id (top-level, or nested under
+        # ``text_config`` for the multimodal Qwen3.5/3.6-MoE config shape) and
+        # fall back to -1 (unreachable, i.e. the old always-run-to-budget
+        # behavior) only when the checkpoint truly doesn't declare one.
+        hf_config = config.hf_config
+        eos_token_id = getattr(hf_config, "eos_token_id", None)
+        if eos_token_id is None:
+            eos_token_id = getattr(getattr(hf_config, "text_config", None), "eos_token_id", None)
+        if isinstance(eos_token_id, list):
+            eos_token_id = eos_token_id[0] if eos_token_id else None
+        return Sampler(eos_token_id=eos_token_id if eos_token_id is not None else -1, device=device)
 
     # -- request admission ---------------------------------------------------
 

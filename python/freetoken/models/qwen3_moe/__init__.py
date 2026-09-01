@@ -23,16 +23,67 @@ Design:
 """
 from __future__ import annotations
 
+import glob
+import json
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors import safe_open
 
 from freetoken.models.config import ModelConfig
 from freetoken.models.weight import iter_safetensors
+from freetoken.utils import cached_load_hf_config
 
 # --------------------------------------------------------------------------- #
 # Checkpoint side (loader contract, from `#17`)
 # --------------------------------------------------------------------------- #
+
+
+def _probe_head_dim(model_path: str, num_heads) -> int | None:
+    """Recover the per-head dim from the checkpoint's first ``o_proj`` shape.
+
+    The attention projections store ``q_proj`` as ``[heads*head_dim, hidden]``
+    and ``o_proj`` as ``[hidden, heads*head_dim]`` (both ``[out, in]``), so
+    ``o_proj``'s *second* dim is ``heads*head_dim`` -- divided by the head count
+    that is the true per-head dim. (Reading ``o_proj``'s first dim would give
+    ``hidden``, which is ``heads*head_dim`` only when head_dim == hidden/heads.)
+    This is the one source that is always right for extended-head MoEs (Qwen3.6/
+    3.8), whose ``head_dim`` != ``hidden // heads`` -- and whose config may or
+    may not set ``head_dim`` explicitly. Returns ``None`` when it can't resolve a
+    shape (the caller then falls back to the config field, then to deriving).
+    """
+    if not num_heads or not isinstance(model_path, str) or not os.path.isdir(model_path):
+        return None
+    try:
+        folder = model_path
+        index = os.path.join(folder, "model.safetensors.index.json")
+        target = None
+        if os.path.isfile(index):
+            with open(index, encoding="utf-8") as f:
+                weight_map = json.load(f)["weight_map"]
+            for name in sorted(weight_map):
+                if name.endswith(".self_attn.o_proj.weight"):
+                    target = (name, weight_map[name]); break
+        if target is None:
+            for path in sorted(glob.glob(os.path.join(folder, "*.safetensors"))):
+                if path.endswith("consolidated.safetensors"):
+                    continue
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    if "model.layers.0.self_attn.o_proj.weight" in f.keys():
+                        target = ("model.layers.0.self_attn.o_proj.weight", path); break
+        if target is None:
+            return None
+        name, path = target
+        with safe_open(path, framework="pt", device="cpu") as f:
+            # o_proj is [hidden, heads*head_dim]; the head-agg axis is dim 1.
+            heads_times_head_dim = f.get_slice(name).get_shape()[1]
+        if heads_times_head_dim % num_heads:
+            return None
+        return heads_times_head_dim // num_heads
+    except Exception:
+        return None
 
 
 def parse_config(
@@ -41,6 +92,7 @@ def parse_config(
     use_cpu_moe: bool = False,
     moe_cpu_layers: str | None = None,
     use_hybrid: bool = False,
+    model_path: str | None = None,
 ) -> ModelConfig:
     """Build a :class:`ModelConfig` from a HF Qwen3-MoE config.
 
@@ -56,7 +108,9 @@ def parse_config(
     its routed-expert misses between PCIe-fetch (XPU GEMM) and host-CPU GEMM by
     the ``ft bench bw`` profile's per-format fetch fraction. ``moe_cpu_layers``
     (issue #8) is the ``--moe-cpu-layers`` spec, stored verbatim on the config
-    and resolved to concrete layer indices at build time.
+    and resolved to concrete layer indices at build time. ``model_path`` is the
+    local checkpoint dir (or ``None``); it lets the probe above recover the real
+    per-head dim from the checkpoint's ``o_proj`` shape.
     """
     src = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
     # transformers' Qwen3MoeConfig stores the expert count under
@@ -70,6 +124,16 @@ def parse_config(
         num_experts=src.get("num_local_experts") or src.get("num_experts"),
         num_attention_heads=src.get("num_attention_heads"),
         num_key_value_heads=src.get("num_key_value_heads"),
+        # Per-head dim. Recovered from the checkpoint's real o_proj shape (the
+        # only trustworthy source -- see _probe_head_dim), else the config's
+        # explicit ``head_dim``, else ``None`` ("derive": hidden // heads, which
+        # is correct for the standard Qwen3-30B family). Extended-head MoEs
+        # (Qwen3.6/3.8) carry head_dim != hidden//heads, so the derive alone
+        # mis-sizes q/o_proj.
+        head_dim=(
+            _probe_head_dim(model_path, src.get("num_attention_heads"))
+            or (int(src.get("head_dim")) if src.get("head_dim") else None)
+        ),
         intermediate_size=src.get("intermediate_size"),
         moe_intermediate_size=src.get("moe_intermediate_size"),
         num_experts_per_tok=src.get("num_experts_per_tok"),
@@ -111,7 +175,20 @@ def iter_weights(
     MoE expert tensors (``...mlp.experts...``) stay on **host** memory -- the XPU
     holds dense weights and serves experts from host offload banks on demand. Every other
     (dense) tensor is yielded on ``device`` (the XPU).
+
+    A ``tie_word_embeddings: true`` checkpoint (common on smaller / merged
+    Qwen3-MoE models) ships no separate ``lm_head.weight`` key -- HF ties it to
+    ``model.embed_tokens.weight`` at load time. Without replicating that tie
+    here, ``lm_head.weight`` never receives a placed tensor and is left at its
+    constructor-time ``torch.empty`` value (observed as all-zero in practice),
+    which makes every logit zero and every decode step argmax to token 0 (a
+    silent, checkpoint-shaped repeat-the-same-token failure, not a crash). When
+    ``include_non_moe`` is requested and the stream never yields a
+    ``lm_head.weight``, synthesize one from ``embed_tokens.weight`` for a
+    checkpoint that declares the tie.
     """
+    embed_tokens_weight = None
+    saw_lm_head = False
     for name, tensor in iter_safetensors(model_path, device):
         is_expert = ".experts." in name
         if is_expert and not include_moe_experts:
@@ -120,7 +197,17 @@ def iter_weights(
             continue
         # Dense -> destination device; experts -> host offload banks.
         dest = torch.device("cpu") if is_expert else device
-        yield name, tensor.to(dest)
+        placed = tensor.to(dest)
+        if name == "model.embed_tokens.weight":
+            embed_tokens_weight = placed
+        elif name == "lm_head.weight":
+            saw_lm_head = True
+        yield name, placed
+
+    if include_non_moe and not saw_lm_head and embed_tokens_weight is not None:
+        hf_config = cached_load_hf_config(model_path)
+        if bool(getattr(hf_config, "tie_word_embeddings", False)):
+            yield "lm_head.weight", embed_tokens_weight
 
 
 # --------------------------------------------------------------------------- #
@@ -143,7 +230,11 @@ class _Qwen3Attention(nn.Module):
         self.layer_id = layer_id
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads or config.num_attention_heads
-        self.head_dim = config.hidden_size // self.num_heads
+        # Per-head dim: the checkpoint's explicit ``head_dim`` when it is one
+        # (extended-head MoEs like Qwen3.6, where head_dim != hidden//heads),
+        # else derive it. Both the projection shapes and the RoPE inv_freq key
+        # off this, so it must match the checkpoint's real per-head size.
+        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
         # The q/k/v/o projections are the pure-torch tensor-parallel Linear port
         # (issue-24 WP6), not ``nn.Linear``. On the B70 (TP=1) the TP-aware classes
         # reduce to a plain ``x @ w.T`` matmul -- the identical math ``nn.Linear``

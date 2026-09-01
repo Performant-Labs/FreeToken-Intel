@@ -130,14 +130,29 @@ def load_moe_expert_sources(
     dtype: torch.dtype,
     dummy: bool = False,
     layer_sink=None,
+    moe_backend: Optional[str] = None,
 ) -> Tuple[list, list]:
     """Per-layer MoE expert source banks: ``(gate_up_banks, down_banks)``.
 
     Each bank is a per-layer ``[num_experts, ...]`` tensor exposing ``.tensor`` /
     ``.pin()`` (see :class:`_PlainBank`). ``dummy=True`` fabricates the banks
     from the parsed config without reading the checkpoint.
+
+    ``moe_backend`` is the engine's routing choice; it re-parses the model config
+    so the banks land on the device that backend needs (host for offload/hybrid/
+    cpu, XPU only for a hypothetical in-VRAM backend). See the body for why the
+    XPU placement would otherwise hang engine construction.
     """
-    config, spec = _spec_for_model_path(model_path)
+    # Re-parse with the engine's MoE routing flags so the banks land on the
+    # device the *engine* wants, not parse_config's defaults. Without this the
+    # loader would build the per-layer banks on the XPU (offload off) and
+    # _finalize_per_expert_banks would fuse them with XPU 3-D cats that the
+    # Level Zero driver serializes and hangs on -- the first request then blocks
+    # in engine construction forever. The offload / hybrid / cpu backends all
+    # keep the banks on host (the cache fetches them to the XPU per step).
+    effective_backend = moe_backend if moe_backend else "auto"
+    offload = effective_backend in ("offload", "hybrid", "cpu")
+    config, spec = _spec_for_model_path(model_path, use_offload_moe=offload)
     if not config.is_moe:
         raise ValueError(f"{config.architectures[0]} does not provide MoE expert source loading")
     if dummy:
@@ -152,11 +167,11 @@ def load_moe_expert_sources(
     return stream_moe_expert_sources(src, config, dtype=dtype, layer_sink=layer_sink)
 
 
-def _spec_for_model_path(model_path: str):
+def _spec_for_model_path(model_path: str, use_offload_moe: bool = False):
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     parse_config = _load_attr(spec.module, spec.parse_config)
-    return parse_config(hf_config), spec
+    return parse_config(hf_config, use_offload_moe=use_offload_moe), spec
 
 
 def _num_moe_layers(config) -> int:
@@ -244,9 +259,17 @@ def stream_moe_expert_sources(
                 dtype=dtype,
             )
         else:
-            # Per-expert: buffer this one row; the bank is fused at the end.
+            # Per-expert: buffer this one row and try to fuse it right away.
+            # Finalizing per layer as soon as that layer's rows are complete
+            # (rather than only once at the very end of the stream) keeps at
+            # most a handful of layers' raw per-expert rows resident at once
+            # instead of the whole checkpoint's -- deferring to end-of-stream
+            # meant the buffered rows (~the full expert bank) and the finalized
+            # banks (~the full expert bank again) were resident simultaneously,
+            # roughly doubling peak host RAM during load.
             _buffer_expert_row(per_expert, row_shape, bank_name, packed_name, tensor.to(dtype=dtype), layer, expert_id, config)
             seen[bank_name].add(layer)
+            _maybe_finalize_layer(banks, per_expert, config, layer)
 
     missing = {
         name: sorted(set(range(config.num_layers)) - seen)
@@ -280,8 +303,8 @@ def _expert_source_info(key: str) -> Tuple[int, str, Optional[int]] | None:
     # A MoE expert key is anchored on the trailing ``.experts.`` group. The layer
     # id is the integer token immediately before the ``mlp`` token that precedes
     # ``experts`` (``...layers.{L}.mlp.experts...``), which is not a fixed offset
-    # from the end (the per-expert form appends ``.{e}.{proj}``), so locate ``mlp``
-    # first and take the integer that directly precedes it.
+    # from the end (the per-expert form appends ``.{e}.{proj}...``), so locate
+    # ``mlp`` first and take the integer that directly precedes it.
     if "mlp" not in parts or "experts" not in parts:
         return None
     try:
@@ -291,21 +314,34 @@ def _expert_source_info(key: str) -> Tuple[int, str, Optional[int]] | None:
         return None
     if parts[mlp_pos + 1] != "experts":
         return None
-    last = parts[-1]
-    # Packed form: the experts key is TERMINAL -- ``...experts.{gate_up_proj|
-    # down_proj}`` (the tensor is already stacked to [num_experts, ...]). A
-    # trailing ``.{e}.{proj}`` group would mean the per-expert form, so those
-    # tokens are only accepted when nothing follows ``experts``.
     e_pos = parts.index("experts")
-    if last in {"gate_up_proj", "down_proj"} and len(parts) == e_pos + 2:
-        return layer, last, None
-    # Per-expert form: ``...experts.{e}.{proj}`` -- parts[-2] is the expert index.
-    if last in {"gate_proj", "up_proj", "down_proj"}:
+    tail = parts[e_pos + 1 :]
+    # Real HF safetensors keys carry a trailing ``.weight`` (``...experts.{e}.{
+    # gate|up|down}_proj.weight``); the FTW-normalized packed form (ADR 0002) may
+    # omit it (``...experts.{gate_up_proj|down_proj}``). A ``.bias`` trailing token
+    # likewise exists on some checkpoints. Strip one terminal ``.weight``/``.bias``
+    # (and nothing else) so both spellings resolve to the same projection token.
+    if tail and tail[-1] in {"weight", "bias"}:
+        tail = tail[:-1]
+    # Packed form: the experts group holds exactly one (non-numeric) token -- the
+    # projection name. A packed ``gate_up_proj``/``down_proj`` key is terminal
+    # (``len(tail) == 1``); a per-expert key always appends ``.{e}.{proj}``
+    # (``len(tail) >= 2``). The two are distinguished by that length, not by a
+    # specific name (``down_proj`` exists in both forms).
+    if len(tail) == 1:
+        if tail[0] in {"gate_up_proj", "down_proj"}:
+            return layer, tail[0], None
+        return None
+    # Per-expert form: ``...experts.{e}.{proj}`` -- tail[0] is the expert index and
+    # the projection is the next token (parts[-1] after the optional weight strip
+    # would be ``weight``; parts[-2] is the real projection name).
+    proj = tail[1] if len(tail) >= 2 else None
+    if proj in {"gate_proj", "up_proj", "down_proj"}:
         try:
-            expert_id = int(parts[-2])
+            expert_id = int(tail[0])
         except ValueError:
             return None
-        return layer, last, expert_id
+        return layer, proj, expert_id
     return None
 
 
@@ -370,8 +406,8 @@ def _buffer_expert_row(
     bucket_by_layer[layer][expert_id] = tensor
 
 
-def _finalize_per_expert_banks(banks: dict[str, list], per_expert, config) -> None:
-    """Fuse the buffered per-expert rows into the packed per-layer banks.
+def _maybe_finalize_layer(banks: dict[str, list], per_expert, config, layer: int) -> None:
+    """Fuse one layer's buffered per-expert rows into its packed banks, if complete.
 
     ``gate_up`` is ``[E, 2I, H]`` (gate then up, matching the ``dummy=True``
     fabricator and the upstream ``_BANK_SCHEMAS``); ``down`` is ``[E, H, I]``.
@@ -387,24 +423,41 @@ def _finalize_per_expert_banks(banks: dict[str, list], per_expert, config) -> No
     the 2-D per-expert rows are all mishandled by that build (they drop or
     misplace the expert dimension), whereas ``cat(dim=1)`` + ``permute`` on 3-D
     tensors are correct.
+
+    Called as soon as a layer's rows complete (per-tensor, during the stream) so
+    at most a few in-flight layers' raw rows are resident at once, rather than
+    the whole checkpoint's -- see the call site in :func:`stream_moe_expert_sources`.
+    The buffered rows for a finalized layer are dropped immediately so their
+    memory doesn't coexist with the packed bank it was fused into.
     """
-    num_layers = config.num_layers
+    if banks["gate_up"][layer] is not None and banks["down"][layer] is not None:
+        return  # already produced (packed source, or finalized earlier)
+    gate = per_expert["gate"][layer]
+    up = per_expert["up"][layer]
+    down = per_expert["down"][layer]
     num_experts = config.num_experts
-    for layer in range(num_layers):
-        if banks["gate_up"][layer] is not None and banks["down"][layer] is not None:
-            continue  # already produced by a packed source; per-expert rows (if any) unused
-        gate = per_expert["gate"][layer]
-        up = per_expert["up"][layer]
-        down = per_expert["down"][layer]
-        # Only finalize a layer whose expert coverage is complete.
-        if len(gate) < num_experts or len(up) < num_experts or len(down) < num_experts:
-            continue
-        gate_bank = _stack_expert_rows([gate[e] for e in range(num_experts)])  # [E, I, H]
-        up_bank = _stack_expert_rows([up[e] for e in range(num_experts)])  # [E, I, H]
-        down_bank = _stack_expert_rows([down[e] for e in range(num_experts)])  # [E, H, I]
-        # Fuse gate + up on the inner (dim 1) axis -> [E, 2I, H].
-        banks["gate_up"][layer] = _PlainBank(torch.cat([gate_bank, up_bank], dim=1))
-        banks["down"][layer] = _PlainBank(down_bank)
+    # Only finalize a layer whose expert coverage is complete.
+    if len(gate) < num_experts or len(up) < num_experts or len(down) < num_experts:
+        return
+    gate_bank = _stack_expert_rows([gate[e] for e in range(num_experts)])  # [E, I, H]
+    up_bank = _stack_expert_rows([up[e] for e in range(num_experts)])  # [E, I, H]
+    down_bank = _stack_expert_rows([down[e] for e in range(num_experts)])  # [E, H, I]
+    # Fuse gate + up on the inner (dim 1) axis -> [E, 2I, H].
+    banks["gate_up"][layer] = _PlainBank(torch.cat([gate_bank, up_bank], dim=1))
+    banks["down"][layer] = _PlainBank(down_bank)
+    # Drop this layer's raw rows now that the packed bank owns the data.
+    per_expert["gate"][layer] = {}
+    per_expert["up"][layer] = {}
+    per_expert["down"][layer] = {}
+
+
+def _finalize_per_expert_banks(banks: dict[str, list], per_expert, config) -> None:
+    """End-of-stream safety net: finalize any layer :func:`_maybe_finalize_layer`
+    didn't already catch during streaming (e.g. an unusual checkpoint ordering).
+    A no-op for every layer the incremental path already finalized.
+    """
+    for layer in range(config.num_layers):
+        _maybe_finalize_layer(banks, per_expert, config, layer)
 
 
 def _stack_expert_rows(rows: list) -> torch.Tensor:

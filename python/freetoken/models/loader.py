@@ -76,7 +76,7 @@ def load_model(
     # once without offload, inspect the result, resolve the backend, and re-parse
     # only if the resolution flips the flag (the common ``auto``-on-XPU path).
     parse_config = _load_attr(spec.module, spec.parse_config)
-    model_config = parse_config(hf_config, use_offload_moe=False)
+    model_config = parse_config(hf_config, use_offload_moe=False, model_path=model_path)
     from freetoken.moe import parse_moe_cpu_layers, resolve_moe_backend
     from freetoken.moe.bench_profile import quant_format_for_dtype
 
@@ -140,6 +140,7 @@ def load_model(
             use_cpu_moe=use_cpu,
             use_hybrid=use_hybrid,
             moe_cpu_layers=moe_cpu_layers,
+            model_path=model_path,
         )
     # Build the model *on this device* (the loader already resolved it): an
     # explicit device wins, and only a None device lets the model default to
@@ -240,7 +241,12 @@ def load_model(
         for name, tensor in load_weight(model_path, device, include_moe_experts=False):
             _place_dense(model, name, tensor)
         if is_moe:
-            gate_up_banks, down_banks = load_moe_expert_sources(model_path, dtype=dtype)
+            # Thread the backend so the banks land on the device the engine
+            # wants (host for offload/hybrid/cpu -- see load_moe_expert_sources),
+            # not the XPU that parse_config's defaults would pick.
+            gate_up_banks, down_banks = load_moe_expert_sources(
+                model_path, dtype=dtype, moe_backend=moe_backend
+            )
             if offload:
                 _attach_offload_cache(
                     model, model_config, device, gate_up_banks, down_banks, moe_backend=moe_backend

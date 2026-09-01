@@ -36,6 +36,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     max_tokens: int | None = Field(default=None, alias="max_completion_tokens")
     temperature: float | None = None
+    top_p: float | None = None
     tools: list[dict] | None = None
     # Reasoning-effort dial (issue #97). Free of a static per-family table, the
     # value is quantized onto the checkpoint's probed effort vocabulary at encode
@@ -119,6 +120,8 @@ def register_openai_routes(app: FastAPI, engine_holder) -> None:
             [m.model_dump() for m in request.messages],
             model=model_name,
             max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
             reasoning_parser=reasoning_parser,
             tools=request.tools,
             chat_template_kwargs=chat_template_kwargs,

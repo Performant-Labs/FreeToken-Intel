@@ -56,6 +56,18 @@ class Sampler:
         if bs == 0:
             return torch.empty((0,), device=logits.device, dtype=torch.int64)
 
+        # BatchSamplingArgs builds its tensors device-less (plain torch.tensor(...),
+        # which lands on CPU); the greedy-only path never mixed them with logits in
+        # an op that requires matching devices (mask-indexing tolerates it), so this
+        # went unnoticed until a real temperature > 0 request engaged the stochastic
+        # branch below (`stoch_logits / temp[:, None]`), which does elementwise math
+        # and hard-errors on a device mismatch. Move onto the logits' device once,
+        # up front, so every path (greedy or stochastic) is consistent.
+        device = logits.device
+        sampling_args.temperature = sampling_args.temperature.to(device)
+        sampling_args.top_k = sampling_args.top_k.to(device)
+        sampling_args.top_p = sampling_args.top_p.to(device)
+
         greedy_mask = sampling_args.temperature == 0
         tokens = torch.empty((bs,), device=logits.device, dtype=torch.int64)
 

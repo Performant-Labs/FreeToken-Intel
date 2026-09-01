@@ -35,10 +35,11 @@ from freetoken._stub import NotYetImplemented
 from freetoken.tokenizer.detokenize import DetokenizeManager
 from freetoken.tokenizer.tokenize import TokenizeManager
 
-# The reference engine's sampler stops on eos_token_id=-1, so a request never
-# hits an end-of-sequence id; the decode budget comes from max_tokens (or the
-# engine's per-request cap when max_tokens is None). This cap bounds a
-# tokenizer-less smoke test so a mis-set request cannot spin the decode loop.
+# The engine's sampler now stops on the checkpoint's real eos_token_id
+# (Engine._build_sampler), but a tokenizer-less smoke test (no encode/decode
+# attached) never sees the model's own stop signal either way, so this cap
+# still bounds it -- a mis-set request cannot spin the decode loop out to
+# max_seq_len.
 _FALLBACK_MAX_TOKENS = 64
 # The prompt encoder's fallback hashes the prompt into the model's *own* vocab
 # (see _prompt_token_ids), not a fixed id space: a fixed 4096 would mint ids far
@@ -200,6 +201,8 @@ def _stream_tokens(
     *,
     model: str,
     max_tokens: int | None,
+    temperature: float | None = None,
+    top_p: float | None = None,
     messages: list[dict] | None = None,
     tools: list[dict] | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
@@ -239,6 +242,17 @@ def _stream_tokens(
     from freetoken.core import Req, SamplingParams
 
     budget = max_tokens if max_tokens and max_tokens > 0 else _FALLBACK_MAX_TOKENS
+    # The OpenAI request's temperature/top_p ride straight through to the
+    # sampler (freetoken.engine.sample.Sampler already implements temperature
+    # scaling + top-k/top-p truncation); only the request -> SamplingParams
+    # wiring was missing, so every request silently sampled greedy
+    # (SamplingParams' temperature=0.0 default) regardless of what the client
+    # asked for. None from the client keeps the dataclass defaults.
+    sampling_kwargs: dict[str, Any] = {"max_tokens": budget}
+    if temperature is not None:
+        sampling_kwargs["temperature"] = temperature
+    if top_p is not None:
+        sampling_kwargs["top_p"] = top_p
     engine.add_request(
         Req(
             input_ids=_prompt_token_ids(engine, prompt, messages, tools=tools, chat_template_kwargs=chat_template_kwargs),
@@ -246,7 +260,7 @@ def _stream_tokens(
             cached_len=0,
             output_len=budget,
             uid=0,
-            sampling_params=SamplingParams(max_tokens=budget),
+            sampling_params=SamplingParams(**sampling_kwargs),
             cache_handle=None,
         )
     )
@@ -261,6 +275,8 @@ def stream_chat(
     *,
     model: str,
     max_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
     reasoning_parser=None,
     tools: list[dict] | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
@@ -283,6 +299,8 @@ def stream_chat(
             prompt,
             model=model,
             max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
             messages=messages,
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
@@ -294,6 +312,8 @@ def stream_chat(
         prompt,
         model=model,
         max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
         messages=messages,
         tools=tools,
         chat_template_kwargs=chat_template_kwargs,
