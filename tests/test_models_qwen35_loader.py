@@ -314,14 +314,21 @@ def test_forward_writes_full_attention_kv_into_pool(qwen35_ckpt):
     _, ctx = _drive_prefill(model, seq, T)
     full_layers = [l for l in model.layers if l.self_attn is not None]
     assert full_layers, "the fabricated tower must have a full-attention layer"
-    k = ctx.kv_cache.k_buffer
-    assert k.shape[1] == NKV and k.shape[2] == HD
-    # The rows holding the written K/V (slot == position under the identity
-    # table) are populated: some norm over the first T rows is nonzero.
-    assert (k[:T].float().norm() > 0).item()
-    # And at least one full-attention layer's K was written (the row for position
-    # 0 of that layer is nonzero) -- a no-op write would leave the pool empty.
-    assert bool((k[:T].float().pow(2).sum() > 0).item())
+    # The paged pool is segregated per layer: ``k_buffer`` is
+    # ``[num_layers, num_slots, num_kv_heads, head_dim]``, so each layer
+    # attends to its *own* K/V. The full-attention layers (the linear-attention
+    # ones keep their recurrent state in a separate pool) write into their own
+    # layer slice; inspect that slice's per-token geometry.
+    for l in full_layers:
+        k = ctx.kv_cache.k_buffer[l.layer_id]
+        assert k.shape[1] == NKV and k.shape[2] == HD
+        # The rows holding the written K/V (slot == position under the identity
+        # table) are populated: some norm over the first T rows is nonzero.
+        assert (k[:T].float().norm() > 0).item()
+        # And at least one full-attention layer's K was written (the row for
+        # position 0 of that layer is nonzero) -- a no-op write would leave the
+        # pool empty.
+        assert bool((k[:T].float().pow(2).sum() > 0).item())
 
 
 def test_forward_cross_checked_against_independent_reference(qwen35_ckpt):
