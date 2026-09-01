@@ -386,19 +386,36 @@ class _Qwen3MoE(nn.Module):
                     f"layer {self.layer_id}: offload routed slot id {stale} >= "
                     f"cache_size {S}: stale slot map (ensure_experts desync)"
                 )
-        # 4) Host-side (column j, slot s_i) -> row indices routing to it, built
-        #    from the CPU tensors only: the gather below never asks the device
-        #    "which rows matched?" (a boolean-mask index would call nonzero(),
-        #    whose data-dependent shape forces an implicit D2H sync mid-loop).
-        groups: list[tuple[int, int, list[int]]] = []
+        # 4) Host-side (expert, column j) -> row indices, built in EXPERT-MAJOR
+        #    order (for each expert e ascending, then each column j ascending) so
+        #    the float32 accumulation order into out[i] matches the in-VRAM
+        #    _forward_inram loop (for e in range(num_experts): for slot in
+        #    range(top_k)). The offload transport is a byte-identical weight copy
+        #    (ADR 0002); the only divergence source was the accumulation order
+        #    (slot-major here vs expert-major in-VRAM) -> ~1e-7 ULP drift
+        #    amplified by the recurrent attention over decode steps (issue #18).
+        #    Built from the CPU tensors only: the gather below never asks the
+        #    device "which rows matched?" (a boolean-mask index would call
+        #    nonzero(), whose data-dependent shape forces an implicit D2H sync
+        #    mid-loop).
+        num_experts = model.config.num_experts
+        expert_slots = [int(slots[e]) for e in range(num_experts)]
+        expert_to_col: dict[int, list[tuple[int, int]]] = {}
         for j in range(k):
-            by_slot: dict[int, list[int]] = {}
             for i in range(B):
                 if bool(valid_cpu[i, j]):
-                    by_slot.setdefault(int(routed_cpu[i, j]), []).append(i)
-            groups.extend((j, s_i, rows) for s_i, rows in by_slot.items())
-        # 5) Gather per slot on the device using host-built INTEGER indices
-        #    (static shapes, no nonzero(), no implicit D2H in the loop).
+                    e_id = int(expert_ids[i, j])
+                    expert_to_col.setdefault(e_id, []).append((j, i))
+        groups: list[tuple[int, int, list[int]]] = []
+        for e in range(num_experts):
+            s_i = expert_slots[e]
+            if not (0 <= s_i < S):
+                continue
+            for j, i in expert_to_col.get(e, []):
+                groups.append((j, s_i, [i]))
+        # 5) Gather per (expert, slot, row) on the device using host-built
+        #    INTEGER indices (static shapes, no nonzero(), no implicit D2H in
+        #    the loop).
         for j, s_i, rows in groups:
             idx = torch.tensor(rows, dtype=torch.long, device=dev)
             y = top_w.index_select(0, idx)[:, j, None] * _expert_compute(

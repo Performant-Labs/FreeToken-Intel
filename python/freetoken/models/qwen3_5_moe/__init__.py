@@ -1012,19 +1012,36 @@ class _Qwen35MoE:
         #    sync is what faults: no amount of torch.xpu.synchronize() around the
         #    block helps, because the offending sync is in its middle. Integer
         #    index_select / index_add_ have static shapes and never call nonzero.)
-        groups: list[tuple[int, int, list[int]]] = []
+        # Build the (expert, slot, rows) groups in EXPERT-MAJOR order: for each
+        # expert e (ascending), for each top-k column j (ascending), collect the
+        # rows that route to e's slot in column j. This mirrors the in-VRAM
+        # _forward_inram loop (for e in range(num_experts): for slot in range(top_k))
+        # so the float32 accumulation order into out[i] is identical. The offload
+        # transport is a byte-identical weight copy (ADR 0002); the only remaining
+        # source of divergence was the accumulation *order* (slot-major here vs
+        # expert-major in-VRAM), which produces a ~1e-7 ULP difference that the
+        # chaotic Gated-Delta-Net recurrence amplifies over decode steps until the
+        # greedy argmax flips (issue #18).
+        num_experts = model.config.num_experts
+        expert_slots = [int(slots[e]) for e in range(num_experts)]
+        expert_to_col: dict[int, list[tuple[int, int]]] = {}
         for j in range(k):
-            by_slot: dict[int, list[int]] = {}
             for i in range(B):
                 if bool(valid_cpu[i, j]):
-                    by_slot.setdefault(int(routed_cpu[i, j]), []).append(i)
-            groups.extend((j, s_i, rows) for s_i, rows in by_slot.items())
-        # 5) (No device-side push needed: validity is encoded in which rows appear
-        #    in `groups`, and the gather below uses host-built index tensors.)
-        # 6) Gather per slot on the XPU using host-computed INTEGER indices:
-        #    static shapes, no nonzero(), no implicit D2H anywhere in the loop.
-        #    index_add_ accumulates exactly as `out[sub] += ...` did (and handles
-        #    duplicate indices, though rows are unique within a (j, s_i) group).
+                    e_id = int(expert_ids[i, j])
+                    expert_to_col.setdefault(e_id, []).append((j, i))
+        groups: list[tuple[int, int, list[int]]] = []
+        for e in range(num_experts):
+            s_i = expert_slots[e]
+            if not (0 <= s_i < S):
+                continue
+            for j, i in expert_to_col.get(e, []):
+                groups.append((j, s_i, [i]))
+        # (No device-side push needed: validity is encoded in which rows appear
+        # in `groups`, and the gather below uses host-built index tensors.)
+        # Gather per (expert, slot, row) on the XPU using host-computed INTEGER
+        # indices: static shapes, no nonzero(), no implicit D2H anywhere in the
+        # loop. index_add_ accumulates exactly as `out[sel] += ...` did.
         for j, s_i, rows in groups:
             idx = torch.tensor(rows, dtype=torch.long, device=dev)
             y = top_w.index_select(0, idx)[:, j, None] * _expert_compute(
