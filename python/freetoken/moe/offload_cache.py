@@ -215,10 +215,15 @@ class OffloadMoeCache:
     def materialize_layer(self, layer_id: int, expert_ids: torch.Tensor | None = None) -> None:
         """Place a whole layer into the slot pool for a prefill forward.
 
-        If ``expert_ids`` ([n, k] routed expert ids) is given, it is rewritten
-        in place to *slot* ids (a position whose expert was evicted stays -1),
-        matching the contract :meth:`ensure_experts` establishes for decode --
-        so the offload forward indexes the slot pool identically on both phases.
+        ``expert_ids`` is accepted for signature compatibility only; this method
+        does NOT rewrite it. The offload forward maps routed *expert* ids to slot
+        ids on the host (from :attr:`slot_for_id`) and never reads a device-side
+        slot-id view of the routing tensor. Rewriting ``expert_ids`` in place to
+        slot ids (the old contract) is what leaked stale slot ids: ``torch.topk``
+        reuses that same storage each step, so an unchanged routing skipped the
+        rewrite and the next step read the *prior* step's slot ids as if they were
+        expert ids -- an out-of-bounds slots[] read (XPU IndexError) / a silent
+        wrong-expert gather (CPU logit divergence, issue #7).
 
         This is a *batched timestamp-LRU* pass over the whole layer's experts,
         not a fixed-slot double buffer: the pool is a single global LRU shared by
@@ -303,24 +308,11 @@ class OffloadMoeCache:
         # _resync_slot_for_id). id_of_slot was already set for every touched slot
         # above, so this rebuilds slot_for_id exactly.
         self._resync_slot_for_id()
-        # Rebind the row view (the resync may have reallocated the tensor storage
-        # via fill_); Phase 3 reads this layer's fresh rows.
-        layer_slots = self.slot_for_id[layer_id]
-
-        # Phase 3: rewrite every routed position to its (new) slot id so the
-        # prefill forward indexes the slot pool by slot id, exactly as decode
-        # (ensure_experts Phase 3) does. A position whose expert was evicted
-        # (slot -1) is left -1 (skipped by the forward's routed >= 0 mask).
-        if expert_ids is not None:
-            flat = expert_ids.reshape(-1)
-            for i in range(flat.numel()):
-                flat[i] = int(layer_slots[int(flat[i].item())].item())
 
     # -- decode: timestamp LRU -------------------------------------------------
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
-        """Make this layer's routed experts resident; rewrite ``expert_ids`` to
-        slot ids in place (the downstream gather indexes the slot cache by it).
+        """Make this layer's routed experts resident in the global LRU pool.
 
         The pool is a single **global** timestamp LRU shared by every layer.
         A routed expert that is already resident (in *any* slot, any layer) is a
@@ -402,13 +394,11 @@ class OffloadMoeCache:
         # LRU slot, which another layer may own; the flat clear above only
         # touches the evicting layer's row, so the evicted layer's stale
         # entries would otherwise survive (see _resync_slot_for_id).
+        # (The old Phase-3 in-place rewrite of ``expert_ids`` -> slot ids was
+        # removed: see the class/`materialize_layer` docstrings. The forward
+        # maps expert -> slot on the host; the routing tensor must keep holding
+        # *expert* ids so the next step's topk snapshot is always in-bounds.)
         self._resync_slot_for_id()
-        layer_slots = self.slot_for_id[layer_id]
-
-        # Phase 3: rewrite every position to its (new) slot; a position whose
-        # expert was left non-resident (pool exhausted) stays -1.
-        for i in range(flat.numel()):
-            flat[i] = int(layer_slots[int(flat[i].item())].item())
 
     # -- copy engine -----------------------------------------------------------
 

@@ -178,9 +178,18 @@ class _Qwen3Attention(nn.Module):
         # token slice is the *middle* dim) and it returns the output the same
         # way, letting us fold the heads back into the hidden dim with an
         # identity transpose(1, 2).
-        q = self.q_proj(hidden_states).view(self.num_heads, bsz, self.head_dim)
-        k = self.k_proj(hidden_states).view(self.num_kv_heads, bsz, self.head_dim)
-        v = self.v_proj(hidden_states).view(self.num_kv_heads, bsz, self.head_dim)
+        # The projection output is token-major [bsz, heads*head_dim] (each row
+        # is one token whose columns are the per-head slices concatenated). A
+        # flat ``.view(heads, bsz, head_dim)`` reinterprets memory linearly and
+        # therefore scrambles which token lands in which head -- it is
+        # *bsz-dependent* (only accidentally correct when bsz == num_heads),
+        # which is exactly what made chunked-prefill (bsz>1) diverge from
+        # decode (bsz=1). Lay it out token-major first, then transpose to the
+        # head-major [heads, bsz, head_dim] the rest of the pipeline (RoPE,
+        # write_kv's token-major round-trip) expects.
+        q = self.q_proj(hidden_states).view(bsz, self.num_heads, self.head_dim).transpose(0, 1)
+        k = self.k_proj(hidden_states).view(bsz, self.num_kv_heads, self.head_dim).transpose(0, 1)
+        v = self.v_proj(hidden_states).view(bsz, self.num_kv_heads, self.head_dim).transpose(0, 1)
         q = self._rope(self.q_norm(q), positions)
         k = self._rope(self.k_norm(k), positions)
         # Append this request's K/V to the pool. ``positions`` here is this
@@ -188,7 +197,7 @@ class _Qwen3Attention(nn.Module):
         # positions[token_slice]); the new token's out_loc slot equals its
         # absolute position under the identity page table, so index out_loc by
         # this request's positions rather than the whole-batch out_loc.
-        ctx.kv_cache.write_kv(k, v, positions)
+        ctx.kv_cache.write_kv(k, v, positions, self.layer_id)
         # ``table_idx`` identifies *this* request (the decoder layer runs each
         # request's layers on its own hidden slice, so q/k/v hold only this
         # request's new tokens, not the whole batch's). The backend uses it to
@@ -196,7 +205,22 @@ class _Qwen3Attention(nn.Module):
         # per-request q/k/v; without it a backend cannot tell which request is
         # 'current' when a step mixes multiple requests.
         out = ctx.attn_backend.forward(q, k, v, self.layer_id, batch, table_idx=table_idx)
-        return self.o_proj(out.transpose(1, 2).reshape(bsz, -1))
+        # ``out`` is head-major [heads, bsz, head_dim]: dim 0 is the head axis,
+        # dim 1 is this request's new-token axis, dim 2 the head_dim. To feed
+        # o_proj we need the *token-major* [bsz, heads, head_dim] token vector
+        # (row t = concatenation over heads of head h's head_dim slice at token
+        # t). That is achieved by moving the token axis (1) to the front, i.e.
+        # swapping axes 0 and 1: transpose(0, 1) -> [bsz, heads, head_dim].
+        # (The old transpose(1, 2) moved the *head_dim* axis to the front,
+        # yielding [heads, head_dim, bsz]; on a non-contiguous view .reshape
+        # then copied in raw head-first memory order, so for bsz > 1 each row
+        # interleaved the wrong heads' tokens -- the o_proj input was silently
+        # scrambled. bsz == 1 hid it (single token row, memory order coincides
+        # with the token vector), which is exactly why chunked prefill (bsz==1
+        # per step) matched while a whole-prompt prefill (bsz>1) diverged.)
+        # .contiguous() after the swap materializes the [bsz, heads, head_dim]
+        # layout so the flatten to [bsz, heads*head_dim] is the intended vector.
+        return self.o_proj(out.transpose(0, 1).contiguous().reshape(bsz, -1))
 
 
 def _expert_compute(gate_w: torch.Tensor, up_w: torch.Tensor, down_w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -306,67 +330,84 @@ class _Qwen3MoE(nn.Module):
         (ADR 0002): a prefill materializes the *whole* layer into the pool
         (evicting the LRU-resident experts of other layers), and a decode step
         streams in only the *missed* routed experts, each into an evicted slot.
-        After :meth:`ensure_experts` / :meth:`materialize_layer` the ``top_idx``
-        tensor holds *slot* ids, so each routed token runs the expert the slot
-        currently holds -- which, after ``copy_missing``, is exactly the routed
-        expert (the forward indexes the slot cache, not the layer bank).
+
+        Routing is done **on the host** from a snapshot of the routed *expert*
+        ids (``top_idx``), mapped through the cache's ``slot_for_id``. The cache
+        does NOT rewrite ``top_idx`` in place: it stays the ``torch.topk``
+        expert-id tensor across steps, so a repeat routing never leaves a stale
+        slot id for the next step to misread (issue #7). Nothing downstream
+        reads ``top_idx`` as slot ids after this method returns.
         """
         layer_id = model.moe_layer_id[self.layer_id]
         cache = model.moe_cache
-        # A prefill must materialize the *whole* MoE layer into the LRU pool
-        # (evicting other layers' resident experts); a decode streams in only the
-        # missed routed experts, one at a time. The engine tags the prompt step
-        # ``phase="prefill"`` and later steps ``phase="decode"`` (engine.step),
-        # so ``batch.is_prefill`` is the phase signal; the ``flat.shape[0] > 1``
-        # check is a phase-independent fallback (prefill >1 token, decode == 1).
-        is_prefill = (batch is not None and batch.is_prefill) or flat.shape[0] > 1
+        # The phase flag (not token count) decides prefill vs decode: in a mixed
+        # step (decode reqs with 1 token each, or a decode req alongside a
+        # prefill req) flat.shape[0] > 1 even though every token is a 1-token
+        # decode. Deriving the phase from the token count then calls
+        # materialize_layer (whole layer) instead of ensure_experts (routed
+        # experts only): the LRU pool is shared across layers, so materializing
+        # a layer evicts the other layer's just-resident decode experts and the
+        # next decode step routes them through the wrong slot (or a slot the
+        # pool has re-used) -- a silent logit divergence from the in-VRAM path.
+        is_prefill = bool(batch is not None and batch.is_prefill)
         is_xpu = bool(getattr(cache, "is_xpu", False))
+        B, k = top_idx.shape
+        # 1) Snapshot the routed *expert* ids on the host before the LRU call.
+        expert_ids = top_idx.to("cpu")
+        # 2) Let the LRU pool decide residency and stage the host->device copies.
         if is_prefill:
-            # materialize_layer rewrites top_idx to slot ids in place (same
-            # contract as ensure_experts), so prefill and decode index the
-            # slot pool identically.
-            cache.materialize_layer(layer_id, top_idx)
+            cache.materialize_layer(layer_id)
         else:
-            cache.ensure_experts(layer_id, top_idx)
+            cache.ensure_experts(layer_id, expert_ids)
         cache.copy_missing()
 
-        # bank_views() returns a tuple indexed by bank registration order
-        # ("gate_up" first, "down" second); index the pool (S slots) and pick
-        # the per-slot row by slot id.
+        # 3) Map expert -> slot on the host from the cache's own (Python) map.
+        #    An expert the pool evicted maps to -1 -> clamped to 0, valid=False.
+        slots = cache.slot_for_id[layer_id].to("cpu").tolist()
+        S = cache.cache_size
         gu, dn = cache.bank_views()  # ([S, 2I, H], [S, H, I])
-        S = gu.shape[0]
         intermediate = int(model.config.moe_intermediate_size)
-
+        dev = flat.device
         out = torch.zeros_like(flat)
-        k = top_idx.shape[1]
-        for slot_pos in range(k):
-            routed = top_idx[:, slot_pos]  # [B] slot ids (after ensure_experts)
-            # Mask out-of-range slot ids too (>= S): a stale/recycled id from
-            # ensure_experts/copy_missing would index gu/dn out of bounds and
-            # abort the (shared) XPU kernel, so clamp it out of the gather.
-            valid = (routed >= 0) & (routed < S)
-            if not valid.any():
-                continue
-            if is_xpu:
-                if (routed >= S).any() and (routed >= 0).any():
-                    raise IndexError(
-                        f"layer {self.layer_id}: offload routed slot id "
-                        f"{int(routed.max())} >= cache_size {S}: stale slot id "
-                        "(ensure_experts/copy_missing desync)"
-                    )
-            s = routed[valid]  # the slot each token's expert landed in
-            # Dedup on the host (the routed set per step is tiny): the XPU's
-            # torch.unique runs an async sort-scatter that aborts (Indexing.h
-            # "index out of bounds") when a slot id races the pool; a CPU
-            # unique + CPU->XPU gather is deterministic and identical in math.
-            for s_i in torch.unique(s.cpu()).tolist():
-                sub = valid & (routed == s_i)
-                out[sub] += top_w[sub, slot_pos, None] * _expert_compute(
-                    gu[s_i, 0:intermediate],
-                    gu[s_i, intermediate : 2 * intermediate],
-                    dn[s_i],
-                    flat[sub],
+        routed_cpu = torch.empty(B, k, dtype=torch.int64)
+        valid_cpu = torch.zeros(B, k, dtype=torch.bool)
+        for i in range(B):
+            for j in range(k):
+                slot = slots[int(expert_ids[i, j])]
+                ok = 0 <= slot < S
+                routed_cpu[i, j] = slot if ok else 0
+                valid_cpu[i, j] = ok
+        # Belt-and-suspenders tripwire: an out-of-range slot means a stale map
+        # entry; fail loudly in Python rather than aborting the (shared) XPU.
+        if is_xpu and (~valid_cpu).any():
+            stale = int(routed_cpu[~valid_cpu].max()) if (~valid_cpu).any() else -1
+            if stale >= S:
+                raise IndexError(
+                    f"layer {self.layer_id}: offload routed slot id {stale} >= "
+                    f"cache_size {S}: stale slot map (ensure_experts desync)"
                 )
+        # 4) Host-side (column j, slot s_i) -> row indices routing to it, built
+        #    from the CPU tensors only: the gather below never asks the device
+        #    "which rows matched?" (a boolean-mask index would call nonzero(),
+        #    whose data-dependent shape forces an implicit D2H sync mid-loop).
+        groups: list[tuple[int, int, list[int]]] = []
+        for j in range(k):
+            by_slot: dict[int, list[int]] = {}
+            for i in range(B):
+                if bool(valid_cpu[i, j]):
+                    by_slot.setdefault(int(routed_cpu[i, j]), []).append(i)
+            groups.extend((j, s_i, rows) for s_i, rows in by_slot.items())
+        # 5) Gather per slot on the device using host-built INTEGER indices
+        #    (static shapes, no nonzero(), no implicit D2H in the loop).
+        for j, s_i, rows in groups:
+            idx = torch.tensor(rows, dtype=torch.long, device=dev)
+            y = top_w.index_select(0, idx)[:, j, None] * _expert_compute(
+                gu[s_i, 0:intermediate],
+                gu[s_i, intermediate : 2 * intermediate],
+                dn[s_i],
+                flat.index_select(0, idx),
+            )
+            out.index_add_(0, idx, y)
         return out
 
 
