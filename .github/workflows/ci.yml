@@ -506,3 +506,104 @@ jobs:
           path: ctrf/
           retention-days: 30
           if-no-files-found: ignore
+
+  # #31 (ci-packaging): build the distributable. This is the half of the
+  # packaging issue that runs per-PR on GitHub-hosted: it produces the CPU
+  # sdist + wheel and proves the load-bearing contract -- the built wheel is
+  # torch-free (core deps) and imports cleanly without torch, while the oneAPI/
+  # XPU stack ships as the OPTIONAL [xpu]/[accel] extras (not core deps).
+  #
+  # It deliberately does NOT publish to PyPI: publishing is a manual,
+  # key-gated release step (docs/install.md "Method 2"), not something a fork
+  # PR may trigger. So the artifacts are uploaded for inspection/download, and
+  # the XPU wheel is NOT built here (it needs the self-hosted B70 fleet's
+  # oneAPI toolchain -- that path is wired in xpu.yml's nightly and
+  # scripts/build-release-wheels.sh xpu, which runs where the card exists).
+  #
+  # Same fork-safety footing as the other jobs here (ubuntu-latest, no identity
+  # guard): a fork PR builds its own wheel on a GitHub-hosted runner, never on
+  # owned hardware, and never publishes.
+  build-wheel:
+    name: Build wheel (CPU; torch-free + [xpu] extra)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist + wheel
+        run: |
+          chmod +x scripts/build-release-wheels.sh
+          bash scripts/build-release-wheels.sh cpu
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      # Contract check #1: the BUILT wheel's METADATA must not list torch (or
+      # any nvidia-* / CUDA package) among its core Requires-Dist. If someone
+      # adds torch to [project] dependencies, it lands in the core dep set and
+      # this fails -- the same dual-venv breach the `ci` job catches on the
+      # source venv, now caught on the actual distributable. The oneAPI/XPU stack
+      # may (and does) appear under the OPTIONAL [xpu] extra -- only core deps
+      # are screened here.
+      - name: "Contract: built wheel is torch-free (no torch / nvidia in core deps)"
+        run: |
+          set -euo pipefail
+          # The checker script lives in a file (not a heredoc) so the block
+          # indents cleanly under `run: |`; the same file is reused by the next
+          # step, but each step runs in its own fresh shell so there is no
+          # cross-step state dependency.
+          cat > /tmp/check_torch_free.py <<'PY'
+          import glob, sys, zipfile
+          whl = sorted(glob.glob("dist/*.whl"))
+          if not whl:
+              sys.exit("no wheel built in dist/")
+          whl = whl[0]
+          with zipfile.ZipFile(whl) as z:
+              text = z.read([n for n in z.namelist() if n.endswith("dist-info/METADATA")][0]).decode()
+          core = [l for l in text.splitlines() if l.startswith("Requires-Dist:") and "extra ==" not in l]
+          bad = [l for l in core if "torch" in l.lower() or "nvidia" in l.lower()]
+          for l in bad:
+              print("FAIL core dep pulls torch/CUDA:", l)
+          if bad:
+              sys.exit(1)
+          print(f"OK: {len(core)} core Requires-Dist, none reference torch/CUDA")
+          PY
+          python /tmp/check_torch_free.py
+
+      # Contract check #2: install the built wheel into a fresh torch-free venv
+      # and import it. This is the end-user path for a CPU box -- the import
+      # must succeed WITHOUT torch present. (The [xpu] extra is intentionally
+      # NOT installed here: it is the XPU-side stack, and installing it would
+      # pull torch, which is exactly what a CPU consumer must never get.)
+      - name: "Contract: wheel installs + imports in a torch-free venv"
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/wheelvenv
+          /tmp/wheelvenv/bin/python -m pip install -q --no-deps "$(ls dist/*.whl | head -1)"
+          cat > /tmp/check_import.py <<'PY'
+          import freetoken, freetoken.version as v
+          print("import freetoken OK, version", v.__version__)
+          try:
+              import torch  # noqa
+              print("FAIL: torch is importable in the wheel venv -- wheel is not torch-free")
+              raise SystemExit(1)
+          except ImportError:
+              print("OK: torch not importable -- wheel is torch-free (contract holds)")
+          PY
+          /tmp/wheelvenv/bin/python /tmp/check_import.py
+
+      # Upload for inspection. NOT a PyPI publish (see job comment). 30-day
+      # retention, playbook parity; if-no-files-found: error (a build that
+      # produces no wheel is a real failure, not an empty-artifact no-op).
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: freetoken-intel-wheel
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error

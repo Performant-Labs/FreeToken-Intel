@@ -52,9 +52,60 @@ device, rather than printing a fixed spec. On a CPU-only box the same command
 still runs and reports `torch.xpu available: False` with a `Level Zero driver:
 (not exposed)` line — it never crashes.
 
-## Method 2: from PyPI
+## Method 2: from a wheel (or PyPI)
 
-Not published yet. Track the packaging issue on the epic.
+The core package is **pure Python and torch-free** — installing it needs no GPU
+and no oneAPI. The Intel XPU stack (oneAPI, Level Zero, the `torch` XPU wheel,
+Triton, TBB, etc.) ships as the **optional `[xpu]` extra** (25 pinned
+packages; `[accel]` is an alias that pulls `[xpu]`). Core deps therefore never
+change between a CPU box and an XPU box, and the dual-venv contract from Method
+1 is preserved at the packaging layer: a CPU consumer installs the base package
+and never sees torch; an XPU consumer adds the extra.
+
+Install on an **XPU box** (oneAPI + Level Zero + the `icpx` compiler must
+already be present per the [Requirements](#requirements) above):
+
+The `[xpu]` extra pins each package to the **concrete version** the XPU nightly
+in [ci.md](ci.md) verifies: `torch==2.13.0+xpu` plus the oneAPI runtimes
+(oneMKL-SYCL, TBB, UMF, pyzes, tcmlib, triton-xpu, all `2026.0.0`). Note the two
+different source mechanisms:
+
+* `torch` is a **pip index** install — the `+xpu` wheel lives only on Intel's
+  PyTorch XPU index, so pip needs that index URL (same as Method 1).
+* the oneAPI runtimes are **`apt`/repo** packages on Intel's oneAPI repo,
+  installed with the oneAPI toolchain (see [dev-setup.md](dev-setup.md)) —
+  they are not pip artifacts. So on a fully set-up oneAPI box, `pip install
+  "freetoken-intel[xpu]"` resolves the `torch` pin from the XPU index and the
+  oneAPI pins from the repo already on the box's index path.
+
+```bash
+python3.11 -m venv .venv-xpu && source .venv-xpu/bin/activate
+pip install -U pip
+# torch==2.13.0+xpu from the PyTorch XPU index; the oneAPI pins resolve from
+# the oneAPI repo this box is already configured with (dev-setup.md).
+pip install "freetoken-intel[xpu]" \
+  --index-url https://download.pytorch.org/whl/xpu
+```
+
+On a **CPU-only box**, install the base package with **no extra**:
+
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -U pip
+pip install "freetoken-intel"        # no [xpu] -- torch-free by construction
+```
+
+### Where the wheels come from
+
+CI builds the CPU sdist + wheel on **every push/PR** (the `build-wheel` job in
+[ci.md](ci.md)) and uploads it as a run artifact (`freetoken-intel-wheel`).
+That is for verification — it is a CPU wheel, and it is **not** a publish.
+Publishing to PyPI is a **manual, key-gated release step** (see the packaging
+issue on the epic), so "pip install freetoken-intel[xpu]" from the public index
+is not available until the first release is cut. Until then, use Method 1
+(editable) on a dev box, or build a wheel locally with
+`scripts/build-release-wheels.sh` (CPU) / `... xpu` (on a oneAPI box) and
+`pip install dist/*.whl`.
 
 ## Verify (once serve is implemented)
 
