@@ -1058,13 +1058,26 @@ class _Qwen35MoE:
         return executor.forward(flat, top_idx, top_w, gate_up, down)
 
     def _forward_inram(self, flat, top_idx, top_w):
+        # Indices are built on the HOST, not with device-side boolean-mask
+        # indexing (`flat[sel]`) or `torch.nonzero` on an XPU tensor: on this
+        # torch/XPU build, `nonzero()` (which boolean-mask indexing calls
+        # internally) silently returns an EMPTY result for an XPU bool tensor
+        # regardless of its actual content (`sel.sum()` / `sel.tolist()` are
+        # correct; `sel.nonzero()` / `flat[sel]` are not) -- a real
+        # correctness bug, not just the "implicit D2H sync" performance
+        # concern the offload path already routes around this same way (see
+        # qwen3_moe's in-VRAM forward for the same fix).
         out = torch.zeros_like(flat)
+        top_idx_cpu = top_idx.to("cpu")
         for e in range(self.num_experts):
             for slot in range(self.top_k):
-                sel = top_idx[:, slot] == e
-                if not sel.any():
+                sel_cpu = top_idx_cpu[:, slot] == e
+                if not bool(sel_cpu.any()):
                     continue
-                out[sel] += top_w[sel, slot, None] * self.experts[e](flat[sel])
+                idx = sel_cpu.nonzero(as_tuple=True)[0].to(flat.device)
+                w = top_w.index_select(0, idx)[:, slot, None]
+                y = self.experts[e](flat.index_select(0, idx))
+                out.index_add_(0, idx, w * y)
         return out
 
     def _forward_offload(self, flat, top_idx, top_w, ctx, batch):
