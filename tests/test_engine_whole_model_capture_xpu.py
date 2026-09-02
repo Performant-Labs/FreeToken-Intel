@@ -73,11 +73,20 @@ def test_whole_decode_step_model_forward_is_graph_capturable(tmp_path):
     try:
         with engine.ctx.forward_batch(batch):
             engine.attn_backend.prepare_metadata(batch)
-            engine.attn_backend.prepare_for_capture(batch)
-            engine.model._capturing = True
 
+            # The TRUE eager baseline: ordinary decode, _capturing still
+            # False, so this exercises the exact same gather-based MoE
+            # routing and per-step-sync attention path real (non-captured)
+            # serving uses -- not the dense/fixed-shape capture variants.
+            # (PR-Agent flagged an earlier version of this test for arming
+            # _capturing before computing this baseline, which would only
+            # have proven the captured path self-consistent, not that it
+            # matches real eager decode -- see PR #124's review.)
             eager_logits = engine.model(static_input_ids, static_positions, static_out_loc).clone()
             torch.xpu.synchronize()
+
+            engine.attn_backend.prepare_for_capture(batch)
+            engine.model._capturing = True
 
             static_logits_buf = torch.empty_like(eager_logits)
 
