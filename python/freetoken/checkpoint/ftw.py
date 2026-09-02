@@ -63,14 +63,23 @@ class FtwArchive:
     def __init__(self, path: str) -> None:
         self.path = path
 
-    def write(self, tensors: Dict[str, torch.Tensor]) -> None:
-        """Write ``tensors`` (name -> tensor, any device/dtype/contiguity) to
-        this archive's directory, creating it if needed."""
+    def write(self, tensors: Dict[str, torch.Tensor] | Iterator[Tuple[str, torch.Tensor]]) -> None:
+        """Write ``tensors`` (a ``{name: tensor}`` dict, or a ``(name, tensor)``
+        iterator/generator) to this archive's directory, creating it if needed.
+
+        Accepting an iterator lets a caller (:func:`freetoken.checkpoint.
+        convert.convert_checkpoint`) stream straight from a checkpoint reader
+        without first materializing every tensor into one Python dict --
+        PR-Agent review on #126 flagged that a real multi-expert checkpoint
+        can be large enough for that intermediate dict alone to exhaust host
+        RAM during offline conversion.
+        """
         os.makedirs(self.path, exist_ok=True)
+        items = tensors.items() if isinstance(tensors, dict) else tensors
         index: Dict[str, dict] = {}
         offset = 0
         with open(os.path.join(self.path, WEIGHTS_NAME), "wb") as f:
-            for name, tensor in tensors.items():
+            for name, tensor in items:
                 # Reinterpret the tensor's own bytes as a flat uint8 view (works for
                 # every torch dtype, including bf16/fp8, which lack numpy natives) --
                 # no cast, no precision loss, just the raw storage.

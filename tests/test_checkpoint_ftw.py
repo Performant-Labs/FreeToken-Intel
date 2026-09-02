@@ -88,6 +88,27 @@ def test_convert_checkpoint_round_trips_and_copies_config(tmp_path):
         torch.testing.assert_close(back[name], original)
 
 
+def test_ftw_archive_write_accepts_a_streaming_iterator(tmp_path):
+    """convert_checkpoint streams tensor-by-tensor into write() rather than
+    materializing a {name: tensor} dict of the whole checkpoint first (a real
+    multi-expert checkpoint can be large enough for that dict alone to
+    exhaust host RAM -- PR-Agent review, PR #126). This proves write() itself
+    accepts a plain generator, not just a dict."""
+    torch.manual_seed(4)
+    source = {"x": torch.randn(2, 2), "y": torch.randn(3, 3)}
+
+    def _gen():
+        yield from source.items()
+
+    archive_dir = str(tmp_path / "streamed")
+    FtwArchive(archive_dir).write(_gen())
+
+    back = dict(FtwArchive(archive_dir).read())
+    assert set(back) == set(source)
+    for name, original in source.items():
+        torch.testing.assert_close(back[name], original)
+
+
 def test_convert_checkpoint_rejects_empty_source(tmp_path):
     src = tmp_path / "empty_ckpt"
     src.mkdir()

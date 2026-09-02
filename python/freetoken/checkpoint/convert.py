@@ -22,6 +22,22 @@ import torch
 
 from .ftw import FtwArchive
 
+
+class _CountingIterator:
+    """Wraps an iterator, counting items as they pass through, so the caller
+    can tell (after a single-pass consumer like FtwArchive.write() has
+    drained it) whether it yielded anything -- without buffering it."""
+
+    def __init__(self, source) -> None:
+        self._source = iter(source)
+        self.count = 0
+
+    def __iter__(self):
+        for item in self._source:
+            self.count += 1
+            yield item
+
+
 # Non-tensor checkpoint files worth carrying over so the FTW dir is a
 # self-contained drop-in --model path, same as the source HF dir.
 _COPY_GLOBS = (
@@ -47,10 +63,20 @@ def convert_checkpoint(model_path: str, output_path: str) -> str:
     from freetoken.models.weight import iter_safetensors
 
     os.makedirs(output_path, exist_ok=True)
-    tensors = dict(iter_safetensors(model_path, torch.device("cpu")))
-    if not tensors:
+    # Stream tensor-by-tensor straight from the reader into the archive writer
+    # rather than materializing a {name: tensor} dict of the whole checkpoint
+    # first -- a real multi-expert checkpoint can be large enough for that
+    # intermediate dict alone to exhaust host RAM (PR-Agent review, PR #126).
+    written = _CountingIterator(iter_safetensors(model_path, torch.device("cpu")))
+    FtwArchive(output_path).write(written)
+    if written.count == 0:
+        # Nothing to convert -- remove the (empty) archive files write() just
+        # created rather than leaving a broken FTW dir behind.
+        for fname in ("ftw_index.json", "ftw_weights.bin"):
+            fpath = os.path.join(output_path, fname)
+            if os.path.isfile(fpath):
+                os.remove(fpath)
         raise ValueError(f"no tensors found in checkpoint at {model_path!r}")
-    FtwArchive(output_path).write(tensors)
 
     for name in _COPY_GLOBS:
         src = os.path.join(model_path, name)
