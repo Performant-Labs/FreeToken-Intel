@@ -584,7 +584,13 @@ jobs:
         run: |
           set -euo pipefail
           python -m venv /tmp/wheelvenv
-          /tmp/wheelvenv/bin/python -m pip install -q --no-deps "$(ls dist/*.whl | head -1)"
+          # Pick the wheel in Python (glob), not `ls`: shellcheck (run by the
+          # pre-flight actionlint gate) flags `ls ... | head` as SC2012. The
+          # one-liner (no heredoc) keeps every line at the block-scalar indent.
+          # Same selection rule as the metadata check above.
+          wheel="$(python -c 'import glob,sys;w=sorted(glob.glob("dist/*.whl"));sys.exit("no wheel built in dist/") if not w else print(w[0])')"
+          echo "installing $wheel"
+          /tmp/wheelvenv/bin/python -m pip install -q --no-deps "$wheel"
           cat > /tmp/check_import.py <<'PY'
           import freetoken, freetoken.version as v
           print("import freetoken OK, version", v.__version__)
