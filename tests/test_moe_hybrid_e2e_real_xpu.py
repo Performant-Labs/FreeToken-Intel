@@ -217,8 +217,13 @@ def test_hybrid_real_model_streams_readable_tokens(tmp_path, monkeypatch):
         # M3 evidence: a real (non-503) stream came back, now as readable text.
         assert content, "the stream must be non-empty -- the real model generated tokens"
         assert "<tok-" not in content, f"decoder still emits placeholders: {content!r}"
-        # Readable prose, not undecoded binary or a raw token-id blob.
-        assert content.isprintable() or content.strip() == "", f"undecoded binary leaked: {content!r}"
+        # Readable prose, not undecoded binary or a raw token-id blob. Ordinary
+        # whitespace (newlines, tabs) is expected in real prose -- str.isprintable()
+        # treats it as "not printable", so check per-character against isprintable
+        # OR isspace instead of gating the whole string on isprintable() alone.
+        assert all(ch.isprintable() or ch.isspace() for ch in content), (
+            f"undecoded binary leaked: {content!r}"
+        )
         assert not re.search(r"\d{6,}", content), f"decoded stream looks like raw ids: {content!r}"
 
         # The decode steps must have actually driven the slot pool (the hybrid q*

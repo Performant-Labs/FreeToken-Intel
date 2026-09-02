@@ -52,7 +52,7 @@ class Req:
 
     @property
     def can_decode(self) -> bool:
-        return self.remain_len > 0
+        return self.remain_len > 0 and not self.aborted
 
 
 @dataclass

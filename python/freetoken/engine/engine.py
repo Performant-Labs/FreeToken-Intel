@@ -346,6 +346,7 @@ class Engine:
 
     # -- the loop -------------------------------------------------------------
 
+    @torch.inference_mode()
     def step(self) -> ForwardOutput:
         """Run one engine step (one model forward + one sample) over the batch
         the :class:`~freetoken.scheduler.Scheduler` selected.
