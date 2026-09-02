@@ -977,7 +977,7 @@ class _Qwen35MoE:
         elif self.use_offload:
             routed_out = self._forward_offload(flat, top_idx, top_w, ctx, batch)
         else:
-            routed_out = self._forward_inram(flat, top_idx, top_w)
+            routed_out = self._forward_inram(flat, top_idx, top_w, ctx)
         return (routed_out + shared_out).view(in_shape)
 
     def _is_cpu_layer(self, ctx) -> bool:
@@ -1057,7 +1057,7 @@ class _Qwen35MoE:
             model._moe_cpu_executor = executor
         return executor.forward(flat, top_idx, top_w, gate_up, down)
 
-    def _forward_inram(self, flat, top_idx, top_w):
+    def _forward_inram(self, flat, top_idx, top_w, ctx=None):
         # Indices are built on the HOST, not with device-side boolean-mask
         # indexing (`flat[sel]`) or `torch.nonzero` on an XPU tensor: on this
         # torch/XPU build, `nonzero()` (which boolean-mask indexing calls
@@ -1067,6 +1067,27 @@ class _Qwen35MoE:
         # correctness bug, not just the "implicit D2H sync" performance
         # concern the offload path already routes around this same way (see
         # qwen3_moe's in-VRAM forward for the same fix).
+        #
+        # EXCEPT while a graph capture is in flight (issue
+        # moe-fused-graph-capture, #123): the CPU round-trip below
+        # (`top_idx.to("cpu")`) is itself a device->host sync, a hard capture
+        # error. Route densely instead -- every expert on every token,
+        # weight-summed with a mask built from `==`/`torch.where` (plain
+        # elementwise ops: no `nonzero()`, no sync, so neither the broken
+        # on-device nonzero() nor the capture restriction applies). Strictly
+        # more compute, so opt-in via `_capturing` only (mirrors #118's
+        # fixed-KV-buffer attention, the same trade-compute-for-capturability
+        # shape).
+        model = getattr(ctx, "model", None)
+        if getattr(model, "_capturing", False):
+            out = torch.zeros_like(flat)
+            for e in range(self.num_experts):
+                w = torch.zeros(flat.shape[0], device=flat.device, dtype=flat.dtype)
+                for slot in range(self.top_k):
+                    w = torch.where(top_idx[:, slot] == e, top_w[:, slot], w)
+                out = out + w[:, None] * self.experts[e](flat)
+            return out
+
         out = torch.zeros_like(flat)
         top_idx_cpu = top_idx.to("cpu")
         for e in range(self.num_experts):
