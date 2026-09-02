@@ -241,10 +241,25 @@ class SyclAttentionBackend(BaseAttnBackend):
         # and grows every step, so it is 1 only on a degenerate first decode).
         # The per-request new-token count comes from ``batch.extend_lens`` (the
         # engine's authoritative vector: prompt_len in prefill, 1 in decode).
+        # Per-request phase: ``batch.phase`` (the scheduler's authoritative,
+        # always-correct flag -- every other backend in this codebase trusts it
+        # uniformly, e.g. TritonAttentionBackend / _forward_offload). The
+        # previous per-request re-derivation (``req.device_len !=
+        # len(req.input_ids)``) miscompares equal on the FIRST decode step
+        # following a full prompt prefill: the engine's post-step bookkeeping
+        # appends the sampled token to input_ids on a prefill step (input_ids
+        # grows to prompt_len+1) and bumps device_len to prompt_len+1 in the
+        # same step, so the two coincidentally match going into the very next
+        # step and that step is misclassified as ANOTHER prefill (kv_len=1
+        # instead of the real history length) -- corrupting decode attention
+        # from the second generated token onward. Confirmed by tracing the
+        # real per-step tables: this file's own docstrings elsewhere in this
+        # module warn against exactly this class of shape-based phase check.
+        is_decode_batch = batch.phase == "decode"
         dec_idx: list[int] = []
         pre_idx: list[int] = []
         for b, req in enumerate(batch.reqs):
-            (dec_idx if req.device_len != len(req.input_ids) else pre_idx).append(b)
+            (dec_idx if is_decode_batch else pre_idx).append(b)
         bs_dec, bs_pre = len(dec_idx), len(pre_idx)
 
         # ``positions`` / ``out_loc`` are token-indexed: one entry per *new* token,
@@ -373,10 +388,11 @@ class SyclAttentionBackend(BaseAttnBackend):
         # order, so find this request's row and make a 1-row USM view of it.
         req = next((r for r in batch.reqs if table_idx is None or r.table_idx == table_idx), batch.reqs[0])
         b = batch.reqs.index(req)
-        # Same phase signal as _build_metadata / the engine's step(): a request
-        # is in decode once a token has been generated (device_len grew past the
-        # prompt length). NOT ``extend_len == 1`` (that grows every step).
-        is_decode = req.device_len != len(req.input_ids)
+        # Same phase signal as _build_metadata: batch.phase (see that method's
+        # docstring for why the previous per-request device_len/input_ids
+        # comparison was wrong -- it miscompared equal on the first decode step
+        # after a full prefill).
+        is_decode = batch.phase == "decode"
         table = metadata.decode if is_decode else metadata.prefill
         if table is None:
             # No rows of this phase were built (should not happen when the
@@ -387,10 +403,10 @@ class SyclAttentionBackend(BaseAttnBackend):
         # exactly the dec_idx / pre_idx order _build_metadata used. The kernel's
         # bs=1 launch reads rows [0, 0+K), so point it at this request's row by
         # passing a 1-row USM slice at the phase-list index (a torch slice of an
-        # XPU tensor stays USM-backed: same storage, a row offset). Count the
-        # matching-phase requests up to and including this one (b) to get the
-        # phase-list index.
-        phase_idx = sum(1 for j in range(b + 1) if (batch.reqs[j].device_len != len(batch.reqs[j].input_ids)) == is_decode) - 1
+        # XPU tensor stays USM-backed: same storage, a row offset). Every
+        # request in the batch shares the same phase (batch.phase is uniform),
+        # so the phase-list index is just this request's position in the batch.
+        phase_idx = b
         one_row = table[phase_idx : phase_idx + 1]
         # q is head-major [qh, ext, d]; the kernel wants token-major [ext, qh, d].
         q_tok = q.transpose(0, 1).contiguous()
