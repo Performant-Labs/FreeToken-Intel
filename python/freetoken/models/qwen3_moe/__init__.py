@@ -963,8 +963,20 @@ class Qwen3MoeForCausalLM(nn.Module):
         if extend_lens is None:
             prefill = batch.is_prefill or (num_tokens > batch.size)
             extend_lens = [req.extend_len if prefill else 1 for req in reqs]
+        # A decode batch is uniform: the scheduler never mixes phases within
+        # one batch (confirmed while fixing issue #116's sycl.py phase check
+        # -- every backend in this codebase already trusts batch.phase for
+        # exactly this), so every request contributes exactly one new token.
+        # Skipping the extend_lens[i] tensor read for that case avoids a
+        # device->host sync per request inside this loop -- the sync that
+        # blocked capturing a whole decode-step model.forward() in a
+        # torch.xpu.graph() (found building issue #15's XpuGraphRunner,
+        # #117-#121). Prefill keeps reading the real per-request value: chunk
+        # sizes genuinely vary there, and prefill is not a graph-capture
+        # target (its shape already varies step to step).
+        is_decode_batch = batch.phase == "decode"
         for i, req in enumerate(reqs):
-            ext = int(extend_lens[i])
+            ext = 1 if is_decode_batch else int(extend_lens[i])
             token_slice = slice(offset, offset + ext)
             h = hidden[token_slice]
             for layer in self.layers:

@@ -1619,8 +1619,14 @@ class Qwen3_5MoEForCausalLM:
         if extend_lens is None:
             prefill = batch.is_prefill or (num_tokens > batch.size)
             extend_lens = torch.tensor([req.extend_len if prefill else 1 for req in reqs], device=hidden.device)
+        # A decode batch is uniform (the scheduler never mixes phases within
+        # one batch -- see qwen3_moe's forward() for the same fix and its
+        # rationale, issue #15's XpuGraphRunner work), so skip the
+        # extend_lens[i] device->host sync per request when decoding: every
+        # request contributes exactly one new token.
+        is_decode_batch = batch.phase == "decode"
         for i, req in enumerate(reqs):
-            ext = int(extend_lens[i])
+            ext = 1 if is_decode_batch else int(extend_lens[i])
             token_slice = slice(offset, offset + ext)
             h = hidden[token_slice]
             pos = positions[token_slice]
