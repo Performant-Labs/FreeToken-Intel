@@ -505,6 +505,28 @@ class _Qwen3MoE(nn.Module):
         # the indices on the host and gathering with `index_select` /
         # `index_add_` sidesteps it entirely (and keeps this path
         # graph-capture-friendly: no data-dependent output shape).
+        #
+        # EXCEPT: the CPU round-trip (`top_idx.to("cpu")`) is itself a
+        # device->host sync, which is a hard error while a graph capture is
+        # in flight (issue moe-fused-graph-capture, #123 -- found completing
+        # #15's XpuGraphRunner work: #118/#119/#122 fixed every other decode
+        # sync, this is the last one). While capturing, route with a dense
+        # mask instead: compute every expert for every token and weight-sum
+        # with a per-(token, expert) mask built from `==`/`torch.where`
+        # (plain elementwise ops -- no `nonzero()`, no host sync, so neither
+        # the broken-on-XPU-nonzero() bug nor the capture restriction
+        # applies). Strictly more compute than the gather above (every
+        # expert runs on every token, not just its routed rows), so this is
+        # opt-in via `_capturing` only -- the same trade-compute-for-
+        # capturability shape #118's fixed-KV-buffer attention already uses.
+        if getattr(model, "_capturing", False):
+            for e in range(self.num_experts):
+                w = torch.zeros(flat.shape[0], device=flat.device, dtype=flat.dtype)
+                for slot in range(self.top_k):
+                    w = torch.where(top_idx[:, slot] == e, top_w[:, slot], w)
+                out = out + w[:, None] * self.experts[e](flat)
+            return out.view(in_shape)
+
         top_idx_cpu = top_idx.to("cpu")
         for e in range(self.num_experts):
             for slot in range(self.top_k):
