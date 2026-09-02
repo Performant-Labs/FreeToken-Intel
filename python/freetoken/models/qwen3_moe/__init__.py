@@ -492,12 +492,29 @@ class _Qwen3MoE(nn.Module):
 
         out = torch.zeros_like(flat)
         # Per-expert gather: route each expert's tokens in one matmul each.
+        #
+        # The routing mask is built and resolved to row indices on the HOST,
+        # not with device-side boolean-mask indexing (`flat[sel]`) or
+        # `torch.nonzero` on an XPU tensor: on this torch/XPU build,
+        # `nonzero()` (which boolean-mask indexing calls internally) silently
+        # returns an EMPTY result for an XPU bool tensor regardless of its
+        # actual content (`sel.sum()` / `sel.tolist()` are correct; `sel
+        # .nonzero()` / `flat[sel]` are not) -- a real correctness bug, not
+        # just the "implicit D2H sync" performance concern the offload /
+        # hybrid / cpu backends already route around this same way. Building
+        # the indices on the host and gathering with `index_select` /
+        # `index_add_` sidesteps it entirely (and keeps this path
+        # graph-capture-friendly: no data-dependent output shape).
+        top_idx_cpu = top_idx.to("cpu")
         for e in range(self.num_experts):
             for slot in range(self.top_k):
-                sel = (top_idx[:, slot] == e)
-                if not sel.any():
+                sel_cpu = top_idx_cpu[:, slot] == e
+                if not bool(sel_cpu.any()):
                     continue
-                out[sel] += top_w[sel, slot, None] * self.experts[e](flat[sel])
+                idx = sel_cpu.nonzero(as_tuple=True)[0].to(flat.device)
+                w = top_w.index_select(0, idx)[:, slot, None]
+                y = self.experts[e](flat.index_select(0, idx))
+                out.index_add_(0, idx, w * y)
         return out.view(in_shape)
 
     def _forward_offload(self, flat, top_idx, top_w, model, batch, *, exclude: set | None = None) -> torch.Tensor:
