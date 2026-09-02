@@ -51,10 +51,45 @@ Upstream = "https://github.com/FlashML-org/FreeToken"
 ft = "freetoken.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
-# PyTorch XPU wheels + oneAPI runtime are machine-local; install from the Intel/PyTorch
-# XPU index as documented in docs/install.md. intel-extension-for-pytorch is optional.
-xpu = []
+ dev = ["pytest>=8.0"]
+# The XPU runtime stack. These are the exact pins the verified Jupiter box runs
+# (oneAPI 2026.1.1, torch 2.13.0+xpu) and the ones `xpu.yml`'s venv-contract step
+# installs -- single source of truth. They resolve ONLY from the PyTorch XPU index
+# (`--index-url https://download.pytorch.org/whl/xpu`), so installing this extra
+# requires that index URL (see docs/install.md).
+#
+# torch is installed with --no-deps by the build script / install docs: the XPU
+# wheel's metadata pulls nvidia-* CUDA packages on a plain `pip install torch`,
+# which must never land on a B70 box. The explicit Intel-side packages below are
+# its real runtime deps. intel-extension-for-pytorch is NOT pulled here -- it is
+# optional and not required by any current kernel.
+xpu = [
+    "torch==2.13.0",
+    "oneccl==2022.0.0",
+    "oneccl-devel==2022.0.0",
+    "tbb==2023.0.0",
+    "umf==1.1.0",
+    "pyzes==0.1.1",
+    "tcmlib==1.5.0",
+    "triton-xpu==3.7.2",
+    "sympy>=1.13.3",
+    "onemkl-license==2026.0.0",
+    "onemkl-sycl-blas==2026.0.0",
+    "onemkl-sycl-dft==2026.0.0",
+    "onemkl-sycl-lapack==2026.0.0",
+    "onemkl-sycl-rng==2026.0.0",
+    "onemkl-sycl-sparse==2026.0.0",
+    "jinja2",
+    "networkx",
+    "intel-cmplr-lib-rt==2026.0.0",
+    "intel-cmplr-lib-ur==2026.0.0",
+    "intel-cmplr-lic-rt==2026.0.0",
+    "intel-sycl-rt==2026.0.0",
+    "intel-opencl-rt==2026.0.0",
+    "intel-openmp==2026.0.0",
+    "dpcpp-cpp-rt==2026.0.0",
+    "intel-pti==0.17.0",
+]
 accel = ["freetoken-intel[xpu]"]
 
 [tool.setuptools]

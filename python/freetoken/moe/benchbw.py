@@ -227,11 +227,11 @@ def _bench_cpu_moe(
     # Warmup (populates any lazy allocations, settles BLAS threading).
     for _ in range(_WARMUP_ITERS):
         executor.forward(flat, top_idx, top_w, gate_up, down)
-    torch.synchronize()
+    torch.xpu.synchronize()
     start = time.perf_counter()
     for _ in range(_MEASURE_ITERS):
         executor.forward(flat, top_idx, top_w, gate_up, down)
-    torch.synchronize()
+    torch.xpu.synchronize()
     secs = time.perf_counter() - start
     if secs <= 0:
         return None
@@ -295,7 +295,6 @@ def _bench_overlap(
         dev_dn.copy_(host_dn, non_blocking=True)
         executor.forward(flat, top_idx, top_w, gate_up, down)
     torch.xpu.synchronize()
-    torch.synchronize()
 
     cpu_done = threading.Event()
 

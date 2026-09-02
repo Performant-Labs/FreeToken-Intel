@@ -48,6 +48,16 @@ class EngineConfig:
     num_page_override: int | None = None
     num_token_override: int | None = None
 
+    def __post_init__(self) -> None:
+        # A pinned moe_cache_size is the operator saying "use exactly this many
+        # slots"; auto-planning the split from VRAM would contradict that. So a
+        # positive pin disables auto (the engine checks moe_cache_auto). 0 =
+        # unset, i.e. let auto plan.
+        if self.moe_cache_size and not self.moe_cache_auto:
+            return
+        if self.moe_cache_size and self.moe_cache_auto:
+            object.__setattr__(self, "moe_cache_auto", False)
+
     @cached_property
     def hf_config(self):
         from freetoken.utils import cached_load_hf_config

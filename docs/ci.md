@@ -19,6 +19,7 @@ flowchart TD
         PF["pre-flight<br/>(actionlint)"] --> SS["secret-scan<br/>(gitleaks)"]
         PF --> CI["ci<br/>(tests + CLI smoke)"]
         PF --> CF["conformance<br/>(CUDA→SYCL + version)"]
+        PF --> BW["build-wheel<br/>(dist + torch-free)"]
     end
     subgraph "xpu.yml (nightly 02:30 UTC + dispatch)"
         CHK["check<br/>(hosted, cheap)"] -->|build=true| BLD["build<br/>(B70 fleet)"]
@@ -32,19 +33,23 @@ flowchart TD
 | **secret-scan** | hosted | No secret enters the tree. **Hard-fails** on a finding. |
 | **ci** | hosted | The CPU contract: torch-free venv, full CPU suite, live CLI smoke. |
 | **conformance** | hosted | The port's invariants: SYCL uses `sycl::ext::oneapi`, no CUDA backdoors, one version source. |
+| **build-wheel** | hosted | Builds the CPU sdist+wheel and proves the packaging contract: the wheel is torch-free (core deps) and imports without torch; the oneAPI stack rides the optional `[xpu]` extra. Artifacts uploaded, never published. |
 | **xpu-nightly** | B70 fleet | The XPU half of the contract: torch present, `torch.xpu` alive, xpu-marked tests pass. |
 | **PR-Agent review** | fleet | Advisory bot score + label. Not a gate. |
 
 `pre-flight` has no `needs:` and runs first: a broken workflow file
 fails fast and cheap instead of being discovered three jobs deep.
-`secret-scan` and `ci` are independent of each other.
+`secret-scan`, `ci`, `conformance`, and `build-wheel` are independent of
+each other. `build-wheel` is the packaging half of the dual-venv contract:
+`ci` proves the *source* venv is torch-free, `build-wheel` proves the
+*distributable* is — and that the XPU stack is an extra, not a core dep.
 
 ## Why these shapes
 
 **Public repo ⇒ `ubuntu-latest` hardcoded.** A fork PR must never
 execute on owned hardware. The org `CI_RUNNER` variable is a
 private-org mechanism and does not apply to a public repo, so the
-four `ci.yml` jobs pin `ubuntu-latest` directly. Consequently they
+five `ci.yml` jobs pin `ubuntu-latest` directly. Consequently they
 deliberately carry **no** `github.repository == ...` identity guard —
 all their jobs run hosted, so there is nothing to guard. `xpu.yml` is
 the opposite: its `build` job runs on the self-hosted B70 fleet, so

@@ -151,6 +151,54 @@ class OffloadMoeCache:
             self.bank_caches[bank] = cache
             self.banks.append((self.bank_sources[bank], cache))
 
+    def rebuild(self, cache_size: int) -> None:
+        """Re-allocate the device slot pool at a new ``cache_size`` (issue #16).
+
+        The host source banks are untouched (they live in host RAM), so resizing
+        the *device* pool is cheap: reallocate the size-dependent tensors and the
+        per-bank slot caches at the new size, then reset the (now stale) LRU
+        bookkeeping. This is what makes the elastic-memory split re-plannable at
+        runtime -- the engine re-runs the budget planner and calls this to resize
+        the cache without reloading any weights.
+        """
+        if cache_size < self.num_experts:
+            raise ValueError(
+                f"rebuild cache_size {cache_size} must be >= num_experts {self.num_experts}"
+            )
+        old_size = self.cache_size
+        self.cache_size = cache_size
+        # Re-allocate the size-dependent slot-pool tensors. (slot_for_id and
+        # active_mask are E-shaped, not S-shaped, so they are left as-is.)
+        self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
+        self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
+        plan_slots = max(self.num_experts, cache_size)
+        self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        # Re-allocate each bank's device slot cache at the new size (keep the
+        # host sources; the row shape / dtype come from the registered source).
+        # A live engine always has banks registered (the loader attaches them at
+        # load, and rebuild only runs on a live cache); the guard merely makes a
+        # bare rebuild() a clean no-op on the bank dicts instead of a KeyError.
+        if self.bank_sources:
+            for bank in self.bank_schema:
+                per_layer = self.bank_sources[bank]
+                row_shape = per_layer[0].shape[1:]
+                self.bank_caches[bank] = torch.zeros(
+                    (cache_size, *row_shape), dtype=per_layer[0].dtype, device=self.device
+                )
+            # Rebuild the (sources, cache) pairs with the new caches.
+            self.banks = [
+                (self.bank_sources[bank], self.bank_caches[bank]) for bank in self.bank_schema
+            ]
+        # The old pool is gone: clear the LRU mapping + step counter.
+        self.slot_for_id.fill_(-1)
+        self.id_of_slot.fill_(-1)
+        self.usage.zero_()
+        self.step.zero_()
+        self.active_mask.zero_()
+        self._pending_src_layer = None
+        self._pending_whole_layer = False
+
     def bank_views(self, n: int | None = None) -> tuple[torch.Tensor, ...]:
         """Per-bank slot-cache views in registration order: the full ``[S]`` pool
         (decode gather) or its first ``n`` slots (a materialized prefill layer)."""

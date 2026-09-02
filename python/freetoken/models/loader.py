@@ -47,6 +47,7 @@ def load_model(
     dummy: bool = False,
     moe_backend: str | None = None,
     moe_cpu_layers: str | None = None,
+    moe_cache_size: int | None = None,
 ) -> tuple:
     """Load a checkpoint onto ``device`` (defaults to the XPU when available).
 
@@ -60,6 +61,11 @@ def load_model(
     MoE experts are never XPU-resident -- the model builds router-only MoE
     blocks and the loader attaches the LRU slot pool (``OffloadMoeCache``) wired
     to the host banks, so the forward streams the routed experts on demand.
+
+    ``moe_cache_size`` (issue #16): the number of slots the offload cache's
+    device pool should hold. ``None`` (default) keeps the loader's conventional
+    sizing (``num_experts + max(2, num_moe)``); a positive int pins the size
+    (e.g. a value planned off the VRAM budget by the engine).
     """
     if device is None:
         device = torch.device("xpu") if is_xpu_available() else torch.device("cpu")
@@ -219,7 +225,13 @@ def load_model(
             gate_up_banks, down_banks = load_moe_expert_sources(model_path, dtype=dtype, dummy=True)
             if offload:
                 _attach_offload_cache(
-                    model, model_config, device, gate_up_banks, down_banks, moe_backend=moe_backend
+                    model,
+                    model_config,
+                    device,
+                    gate_up_banks,
+                    down_banks,
+                    moe_backend=moe_backend,
+                    moe_cache_size=moe_cache_size,
                 )
             else:
                 _place_expert_weights(model, gate_up_banks, down_banks)
@@ -249,7 +261,13 @@ def load_model(
             )
             if offload:
                 _attach_offload_cache(
-                    model, model_config, device, gate_up_banks, down_banks, moe_backend=moe_backend
+                    model,
+                    model_config,
+                    device,
+                    gate_up_banks,
+                    down_banks,
+                    moe_backend=moe_backend,
+                    moe_cache_size=moe_cache_size,
                 )
             else:
                 _place_expert_weights(model, gate_up_banks, down_banks)
@@ -356,6 +374,7 @@ def _attach_offload_cache(
     gate_up_banks,
     down_banks,
     moe_backend: str = "offload",
+    moe_cache_size: int | None = None,
 ) -> None:
     """Build the LRU slot pool and wire it into the offload model (ADR 0002).
 
@@ -381,10 +400,15 @@ def _attach_offload_cache(
     # the 61 GB of experts fits): it holds the *current* layer's whole expert set
     # (num_experts slots) plus a small slack of decode slots so a decode miss can
     # be placed without immediately evicting a just-routed expert of the same
-    # step. Sized off the layer count so the pool scales with the model (a real
-    # Qwen3-30B-A3B has 128 experts / 48 MoE layers). Operators that can afford
-    # more VRAM raise ``moe_cache_size`` to keep more layers warm at once.
-    cache_size = num_experts + max(2, num_moe)
+    # step. By default the pool is sized off the layer count so it scales with
+    # the model (a real Qwen3-30B-A3B has 128 experts / 48 MoE layers); when the
+    # engine ran the issue-#16 budget planner it instead passes the VRAM-planned
+    # size (``moe_cache_size``), which may be larger (more layers warm at once)
+    # but never below ``num_experts`` (a whole MoE layer must still fit).
+    if moe_cache_size and moe_cache_size >= num_experts:
+        cache_size = moe_cache_size
+    else:
+        cache_size = num_experts + max(2, num_moe)
     cache = OffloadMoeCache(
         num_layers=num_moe,
         num_experts=num_experts,
