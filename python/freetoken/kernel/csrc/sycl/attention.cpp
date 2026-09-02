@@ -116,13 +116,12 @@ void probe_usm_inputs(const sycl::queue& q_dev, Ptrs... ptrs) {
 // compiles correctly. See the `s = ...` line in the loop below.
 void decode_attention_impl(const float* q, const float* k_cache, const float* v_cache,
                             const int* table, int bs, int K, int qh, int kv, int d, float sm_scale,
-                            int sliding_window, float* out) {
+                            int sliding_window, float* out, sycl::queue& q_dev) {
   if (bs == 0) {
     return;
   }
   const int g = qh / kv;  // query heads per kv head (GQA group size)
   const int stride = 3;
-  sycl::queue q_dev;  // default device: the B70 when present, else a CPU device
   // Rule 1 (never a host/fake SYCL): every pointer the kernel touches must be a
   // USM (device) pointer -- a torch XPU tensor's data. A plain host pointer
   // cannot be read or written by the B70 kernel (see the memory-model note
@@ -216,7 +215,17 @@ void decode_attention_impl(const float* q, const float* k_cache, const float* v_
           }
         });
   });
-  q_dev.wait();
+  // No q_dev.wait() here (issue attn-sycl-graph-capture, #119): this queue is
+  // now the CALLER's active stream (torch's current XPU stream), not a
+  // private one this function owns -- a blocking wait on a stream that may
+  // be recording to a command graph is a hard capture error, the same class
+  // of problem the removed pre-call torch.xpu.synchronize() was (see
+  // sycl.py). Ordering for the eager (non-capturing) caller is the caller's
+  // job now: it submits this kernel on its own stream and is responsible for
+  // synchronizing before reading `out` on the host, exactly as it already
+  // does for every other op on that stream (this mirrors upstream's own CUDA
+  // kernels, which take the caller's cudaStream_t and never wait() inside
+  // the kernel either -- see kernel/csrc/include/freetoken/utils.cuh).
 }
 
 // GQA prefill / extend attention: one work-item per (request, kv-head group).
@@ -228,13 +237,12 @@ void decode_attention_impl(const float* q, const float* k_cache, const float* v_
 // out     [num_qo, qh, d]  USM (written in place)
 void prefill_attention_impl(const float* q, const float* k_cache, const float* v_cache,
                             const int* table, int bs, int K, int qh, int kv, int d, float sm_scale,
-                            int sliding_window, float* out) {
+                            int sliding_window, float* out, sycl::queue& q_dev) {
   if (bs == 0) {
     return;
   }
   const int g = qh / kv;
   const int stride = 5;  // slot, kv_len, qpos0, ext, cum_ext
-  sycl::queue q_dev;
   probe_usm_inputs(q_dev, q, k_cache, v_cache, table, out);  // Rule 1 USM guard.
 
   // Metadata (slot / kv_len / qpos0 / ext / cum_ext) is read straight from the
@@ -315,23 +323,47 @@ void prefill_attention_impl(const float* q, const float* k_cache, const float* v
           }
         });
   });
-  q_dev.wait();
+  // No q_dev.wait() -- see decode_attention_impl's comment above.
 }
 
 }  // namespace
 
 extern "C" {
 
+// queue_handle (issue attn-sycl-graph-capture, #119): the caller's active
+// SYCL queue, as an opaque pointer -- torch's XPU stream, cast from
+// torch.xpu.Stream.sycl_queue on the Python side (the direct SYCL/XPU analog
+// of the cudaStream_t upstream's own CUDA kernels take from the caller
+// rather than creating their own; see kernel/csrc/include/freetoken/utils.cuh).
+// Submitting on the queue torch.xpu.graph() is actually recording is what
+// makes this kernel's work visible to graph capture at all -- a queue this
+// function created itself, as it used to, is invisible to it regardless of
+// shape. NULL falls back to a freshly constructed default-device queue (the
+// old behavior, for any caller that does not have a stream handle to pass).
 void decode_attention(const float* q, const float* k_cache, const float* v_cache, const int* table,
                        int bs, int K, int qh, int kv, int d, float sm_scale, int sliding_window,
-                       float* out) {
-  decode_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out);
+                       float* out, void* queue_handle) {
+  if (queue_handle != nullptr) {
+    sycl::queue& q_dev = *reinterpret_cast<sycl::queue*>(queue_handle);
+    decode_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out, q_dev);
+  } else {
+    sycl::queue q_dev;  // default device: the B70 when present, else a CPU device
+    decode_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out, q_dev);
+    q_dev.wait();  // no caller stream to order against -- block here instead
+  }
 }
 
 void prefill_attention(const float* q, const float* k_cache, const float* v_cache, const int* table,
                         int bs, int K, int qh, int kv, int d, float sm_scale, int sliding_window,
-                        float* out) {
-  prefill_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out);
+                        float* out, void* queue_handle) {
+  if (queue_handle != nullptr) {
+    sycl::queue& q_dev = *reinterpret_cast<sycl::queue*>(queue_handle);
+    prefill_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out, q_dev);
+  } else {
+    sycl::queue q_dev;
+    prefill_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out, q_dev);
+    q_dev.wait();
+  }
 }
 
 }  // extern "C"
