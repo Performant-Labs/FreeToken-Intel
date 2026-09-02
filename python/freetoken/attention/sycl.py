@@ -137,6 +137,14 @@ class SyclAttentionBackend(BaseAttnBackend):
         backend, so read it from there; fall back to deriving it from the engine
         config the way the pool is sized (``num_page_override`` or
         ``max_running_req * max_seq_len``).
+
+        Both lookups are best-effort: the constructor must stay lazy-safe (see
+        ``_ensure_loaded``'s docstring) even when ``config`` is a minimal / mock
+        object with none of the expected fields (a real ``EngineConfig`` always
+        has them; only a deliberately-bare object, as the "constructor is safe"
+        test uses, does not). 0 here just means "not yet known" -- real usage
+        always has a real config or an attached pool by the time a kernel
+        actually runs, in ``_ensure_loaded`` / the forward methods below.
         """
         try:
             pool = getattr(_get_ctx(), "kv_cache", None)
@@ -144,8 +152,11 @@ class SyclAttentionBackend(BaseAttnBackend):
                 return int(pool.num_slots)
         except Exception:
             pass
-        num_pages = config.num_page_override or (config.max_running_req * config.max_seq_len)
-        return int(num_pages) * int(config.page_size)
+        try:
+            num_pages = config.num_page_override or (config.max_running_req * config.max_seq_len)
+            return int(num_pages) * int(config.page_size)
+        except AttributeError:
+            return 0
 
     def _ensure_loaded(self) -> None:
         """Compile (or load from the AOT cache) attention.cpp and bind entry points.

@@ -116,4 +116,21 @@ __all__ = [
     "create_attention_backend",
     "SUPPORTED_ATTENTION_BACKENDS",
     "validate_attn_backend",
+    "SyclAttentionBackend",
+    "SyclMetadata",
 ]
+__all_lazy__ = {"SyclAttentionBackend", "SyclMetadata"}
+
+
+def __getattr__(name):
+    # PEP 562: lazy re-export so this package stays torch-free at import time
+    # (sycl.py imports torch at module scope -- see create_sycl_backend above).
+    if name in __all_lazy__:
+        from . import sycl
+
+        return getattr(sycl, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(__all__) | set(globals()))
