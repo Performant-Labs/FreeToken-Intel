@@ -78,6 +78,7 @@ def _add_prompt(engine: Engine, output_len: int) -> None:
 
 
 @XPU
+@pytest.mark.xpu
 def test_fused_inram_forward_matches_cpu_reference_on_xpu(offload_ckpt):
     """A multi-token prefill through the in-VRAM path on real XPU hardware.
 
