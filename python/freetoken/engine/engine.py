@@ -92,10 +92,22 @@ class Engine:
             device = torch.device("xpu") if is_xpu_available() else torch.device("cpu")
         self.device = device
 
+        dtype = config.dtype if isinstance(config.dtype, torch.dtype) else None
+
+        # Issue #16 (elastic-memory): before loading, decide how the device's
+        # VRAM is split between the MoE expert slot cache and the paged KV pool.
+        # In auto mode the split is planned from the total VRAM
+        # (memory_ratio budget, MoE-priority / KV-floor, fit assert); otherwise
+        # the operator pinned moe_cache_size and the KV pool keeps its
+        # conventional size. None = "use the loader's / conventional default".
+        self._cache_budget = self._plan_cache_budget(model_config, dtype)
+        planned_cache_size, planned_num_pages = self._cache_budget
+
         # Build the model and place its weights (dense on `device`; MoE experts
         # on host offload banks). use_dummy_weight fabricates the expert banks offline so
-        # the engine is testable without a checkpoint on disk.
-        dtype = config.dtype if isinstance(config.dtype, torch.dtype) else None
+        # the engine is testable without a checkpoint on disk. The planned slot
+        # count is threaded in so the loader sizes the MoE cache off the VRAM
+        # budget instead of its conventional layer-count formula.
         self.model, _expert_sources = load_model(
             config.model_path,
             device,
@@ -103,6 +115,7 @@ class Engine:
             dummy=bool(getattr(config, "use_dummy_weight", False)),
             moe_backend=getattr(config, "moe_backend", None),
             moe_cpu_layers=getattr(config, "moe_cpu_layers", None),
+            moe_cache_size=planned_cache_size,
         )
 
         # Issue #9 (moe-hybrid): the operator's per-step PCIe-fetch cap (the
@@ -122,9 +135,15 @@ class Engine:
         # ``max_running_req * max_seq_len`` pool below what its context needs.
         max_seq_len = config.max_seq_len
         default_num_pages = config.max_running_req * max_seq_len
-        num_pages = (
-            max(config.num_page_override, default_num_pages) if config.num_page_override else default_num_pages
-        )
+        # When the budget planner sized the KV pool (auto mode), use the planned
+        # count (it is at least the KV floor and reflects the real free VRAM).
+        # Otherwise keep the conventional override-vs-default resolution.
+        if planned_num_pages is not None:
+            num_pages = planned_num_pages
+        elif config.num_page_override:
+            num_pages = max(config.num_page_override, default_num_pages)
+        else:
+            num_pages = default_num_pages
         self.page_size = config.page_size
         self.max_seq_len = max_seq_len
         self.max_running_req = config.max_running_req
@@ -187,6 +206,91 @@ class Engine:
             field_values = {f.name: getattr(config, f.name) for f in fields(EngineConfig)}
             config = SchedulerConfig(**field_values)
         self.scheduler = Scheduler(config, max_pages=num_pages, cache_budget=self._pool_budget)
+
+    def _plan_cache_budget(self, model_config, dtype):
+        """Decide the MoE cache / KV split (issue #16, elastic-memory).
+
+        Returns a ``(moe_cache_size, kv_num_pages)`` pair consumed by the
+        loader (MoE slot pool) and the engine (KV pool) respectively.
+
+        * ``moe_cache_auto`` on  -> plan from the device's total VRAM
+          (memory_ratio budget, MoE-priority / KV-floor, fit assert). ``moe_cache_rate``
+          (when set) caps the MoE share to that fraction of the budget.
+        * ``moe_cache_auto`` off  -> a pinned ``moe_cache_size`` (or the loader's
+          conventional size when that is also 0) and the conventional KV size.
+
+        Both entries are ``None`` to mean "fall back to the conventional
+        formula" so a dense (non-MoE) model or a missing XPU never changes the
+        pool the reference path has always used.
+        """
+        pinned = int(getattr(self.config, "moe_cache_size", 0) or 0)
+        if not getattr(self.config, "moe_cache_auto", False):
+            # Operator pinned the size (or nothing): no VRAM planning.
+            return (pinned if pinned else None, None)
+
+        # Auto: plan off the real VRAM. Need a live device with a total.
+        from freetoken.utils.arch import xpu_total_memory
+
+        total_vram = xpu_total_memory()
+        if total_vram is None:
+            # No XPU (CPU test box): nothing to plan against; keep conventional.
+            return (None, None)
+
+        num_experts = int(getattr(model_config, "num_experts", 0) or 0)
+        # num_moe_layers may be unset in the HF config; derive it the way the
+        # loader does (num_layers minus the dense prefix) so a config that only
+        # carries num_layers still plans.
+        num_moe_layers = int(
+            getattr(model_config, "num_moe_layers", None)
+            or (
+                int(getattr(model_config, "num_layers", 0) or 0)
+                - int(getattr(model_config, "first_k_dense_replace", 0) or 0)
+            )
+            or 0
+        )
+        if not num_experts or not num_moe_layers:
+            # Not a MoE model (or config missing the fields): no MoE cache to plan.
+            return (None, None)
+
+        from freetoken.engine.cache_budget import plan_cache_budget
+
+        dtype_bytes = getattr(dtype, "itemsize", 2) or 2
+        num_layers = int(getattr(model_config, "num_layers", 0) or 0)
+        num_kv_heads = int(getattr(model_config, "num_key_value_heads", 0) or 0)
+        # Mirror the KV pool's derivation: an explicit head_dim, else hidden_size
+        # // num_attention_heads (the TINY / Qwen3-MoE shape never sets it).
+        head_dim = int(
+            getattr(model_config, "head_dim", None)
+            or (
+                int(getattr(model_config, "hidden_size", 0) or 0)
+                // max(1, int(getattr(model_config, "num_attention_heads", 0) or 0))
+            )
+            or 0
+        )
+        moe_intermediate = int(getattr(model_config, "moe_intermediate_size", 0) or 0)
+        hidden_size = int(getattr(model_config, "hidden_size", 0) or 0)
+        kv_reserve = int(getattr(self.config, "kv_reserve_tokens", 8192) or 8192)
+        memory_ratio = float(getattr(self.config, "memory_ratio", 0.9) or 0.9)
+
+        # An operator ``moe_cache_rate`` (when set) caps the MoE share to that
+        # fraction of the budget (the KV pool keeps its reserve floor and
+        # absorbs the rest); otherwise the MoE cache is the pure priority.
+        rate = getattr(self.config, "moe_cache_rate", None)
+        cache = plan_cache_budget(
+            total_vram_bytes=total_vram,
+            memory_ratio=memory_ratio,
+            kv_reserve_tokens=kv_reserve,
+            num_experts=num_experts,
+            moe_intermediate_size=moe_intermediate,
+            hidden_size=hidden_size,
+            num_moe_layers=num_moe_layers,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype_bytes=dtype_bytes,
+            moe_fraction=rate if rate else None,
+        )
+        return (cache.moe_cache_size, cache.kv_num_pages)
 
     def _build_sampler(self, config, model_config, device) -> "object":
         from freetoken.engine.sample import Sampler
@@ -446,5 +550,69 @@ class Engine:
         return [tokens[uid] for uid in admitted_uids]
 
     def rebuild_cache(self) -> None:
-        # No radix / hybrid cache in the reference engine; nothing to rebuild.
-        pass
+        """Re-plan the MoE cache / KV split and resize the pools (issue #16).
+
+        Re-runs :meth:`_plan_cache_budget` against the *current* free VRAM (not
+        the size captured at construction) and resizes the two pools without
+        reloading any weights: the host-resident expert banks are untouched, the
+        MoE slot cache is re-allocated at the new size (:meth:`OffloadMoeCache.rebuild`,
+        which clears its LRU), and the KV pool / page table are rebuilt at the new
+        page count. This is what makes the split "elastic": an operator can
+        change the VRAM split at runtime (e.g. after a long-context burst eats
+        the KV floor) and the engine rebalances in place.
+        """
+        from freetoken.kvcache import create_kv_pool
+        from freetoken.utils.arch import xpu_total_memory
+
+        # Only meaningful on the host-offload MoE path (a live moe_cache).
+        cache = getattr(self.model, "moe_cache", None)
+        if cache is None:
+            return
+        if xpu_total_memory() is None:
+            # No live VRAM to re-plan against (CPU box); leave the pools alone.
+            return
+
+        new_cache_size, new_num_pages = self._plan_cache_budget(
+            self.config.model_config, self.config.dtype
+        )
+        # Resize the MoE slot pool in place (host banks untouched).
+        if new_cache_size and new_cache_size != cache.cache_size:
+            cache.rebuild(new_cache_size)
+        # Resize the KV pool + page table + scheduler at the new page count.
+        if new_num_pages and new_num_pages != self._pool_num_pages:
+            self._rebuild_kv_pool(new_num_pages)
+
+    def _rebuild_kv_pool(self, num_pages: int) -> None:
+        """Rebuild the paged KV pool + page table + scheduler page budget.
+
+        Called by :meth:`rebuild_cache` after the split is re-planned. The page
+        table is re-identity-mapped for the new size and the scheduler's page
+        budget + max-pages are updated so it schedules against the new pool.
+        """
+        self.kv_cache = create_kv_pool(
+            self.config.model_config,
+            page_size=self.page_size,
+            num_pages=num_pages,
+            device=self.device,
+            dtype=self.config.dtype if isinstance(self.config.dtype, torch.dtype) else torch.bfloat16,
+        )
+        self.page_table = torch.zeros(
+            (self.max_running_req + 1, self.max_seq_len), dtype=torch.int64, device=self.device
+        )
+        for r in range(self.page_table.shape[0]):
+            self.page_table[r, : self.max_seq_len] = torch.arange(self.max_seq_len, device=self.device)
+        self.kv_cache.attach_page_table(self.page_table)
+        self.ctx.kv_cache = self.kv_cache
+        self.ctx.page_table = self.page_table
+        self._pool_num_pages = num_pages
+        self._pool_budget = num_pages * self.page_size
+        # Keep the scheduler's bookkeeping consistent with the resized pool.
+        # max_pages / cache_budget are plain attrs the admission path reads; the
+        # prefill manager holds its own copy of the budget (the chunked-prefill
+        # fit test), so resync that too. (In-flight requests already own their
+        # page slots; only the budget that bounds *new* admission changes.)
+        self.scheduler.max_pages = num_pages
+        self.scheduler.cache_budget = self._pool_budget
+        prefill = getattr(self.scheduler, "prefill_manager", None)
+        if prefill is not None and hasattr(prefill, "cache_budget"):
+            prefill.cache_budget = self._pool_budget

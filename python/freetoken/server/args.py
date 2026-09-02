@@ -70,6 +70,18 @@ class ServerArgs:
     # non-negative int caps the number of routed experts fetched to the XPU each
     # decode step (the rest compute on the host CPU). Threads into EngineConfig.
     moe_hybrid_max_fetch: int = -1
+    # Issue #16 (elastic-memory): how to size the MoE expert slot cache.
+    # "auto" (default) plans the split off the device's total VRAM
+    # (memory_ratio + kv_reserve_tokens, MoE-priority / KV-floor); a positive
+    # integer pins the slot count (no planning, no VRAM read); the rate is an
+    # optional fraction-of-VRAM override when auto. None = use auto defaults.
+    moe_cache_auto: bool = True
+    moe_cache_size: int | None = None
+    moe_cache_rate: float | None = None
+    # Fraction of total VRAM treated as the addressable budget (0,1].
+    memory_ratio: float = 0.9
+    # KV pool floor, in tokens, reserved for long-context scheduling.
+    kv_reserve_tokens: int = 8192
 
     def __post_init__(self) -> None:
         if self.server_port < 0 or self.server_port > 65535:
@@ -187,6 +199,54 @@ def parse_args(args: list[str] | None = None, prog: str | None = None) -> Server
         "-1 (default) = fully profile-driven via the `ft bench bw` fetch fraction; "
         "a non-negative int caps the routed experts fetched to the XPU each decode "
         "step (the rest compute on the host CPU).",
+    )
+    parser.add_argument(
+        "--moe-cache-auto",
+        dest="moe_cache_auto",
+        default=True,
+        action="store_true",
+        help="Issue #16 (elastic-memory): plan the MoE expert-cache / KV split from "
+        "the device's total VRAM (default). Pass --moe-cache-size to pin the slot "
+        "count instead, or combine --moe-cache-rate with auto to steer the fraction.",
+    )
+    parser.add_argument(
+        "--moe-cache-no-auto",
+        dest="moe_cache_auto",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--moe-cache-size",
+        dest="moe_cache_size",
+        type=int,
+        default=None,
+        help="Pin the MoE expert slot-cache size (slots). When set, the cache is this "
+        "size and the KV pool takes the remaining VRAM (no auto planning). "
+        "Default: plan from VRAM.",
+    )
+    parser.add_argument(
+        "--moe-cache-rate",
+        dest="moe_cache_rate",
+        type=float,
+        default=None,
+        help="When --moe-cache-auto, fraction of the addressable VRAM the MoE cache "
+        "should take (the rest goes to KV). Omit to use the MoE-priority policy.",
+    )
+    parser.add_argument(
+        "--memory-ratio",
+        dest="memory_ratio",
+        type=float,
+        default=0.9,
+        help="Fraction of total VRAM treated as the addressable budget (0,1] "
+        "(issue #16). Headroom outside this is reserved for the OS / runtime.",
+    )
+    parser.add_argument(
+        "--kv-reserve-tokens",
+        dest="kv_reserve_tokens",
+        type=int,
+        default=8192,
+        help="KV pool floor in tokens, always reserved for long-context scheduling "
+        "(issue #16). The MoE cache is sized from the VRAM left after this floor.",
     )
 
     ns = parser.parse_args(args)

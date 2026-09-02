@@ -319,6 +319,16 @@ def _build_engine_holder(server_args):
             moe_cpu_threads=server_args.moe_cpu_threads,
             moe_cpu_layers=server_args.moe_cpu_layers,
             moe_hybrid_max_fetch=server_args.moe_hybrid_max_fetch,
+            # Issue #16 (elastic-memory): the MoE expert cache / KV split is
+            # planned off the device's total VRAM. The serve path plans it by
+            # default (--moe-cache-auto); a --moe-cache-size pin overrides.
+            # memory_ratio bounds the addressable budget; kv_reserve_tokens is
+            # the always-reserved KV floor for long context.
+            moe_cache_auto=server_args.moe_cache_auto,
+            moe_cache_size=server_args.moe_cache_size or 0,
+            moe_cache_rate=server_args.moe_cache_rate,
+            memory_ratio=server_args.memory_ratio,
+            kv_reserve_tokens=server_args.kv_reserve_tokens,
             # A single in-flight request per server: keeps the paged KV pool
             # small and the serve path trivially correct. (Batching is #13.)
             max_running_req=1,
