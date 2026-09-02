@@ -81,8 +81,18 @@ def iter_safetensors(model_path: str, device: torch.device | str = "cpu"):
     that holds it, even when a sibling lives in a different file) and otherwise
     falls back to scanning each shard's header. Tensors are materialized on
     ``device``.
+
+    Auto-detects an FTW archive (issue `ftw-checkpoint`, #11) and reads that
+    instead when ``model_path`` is one -- every caller of this function (every
+    model's ``iter_weights``, hence ``load_model`` / ``ft serve --model``)
+    gets FTW support for free, no per-model changes needed.
     """
     folder = download_hf_weight(model_path)
+    from freetoken.checkpoint.ftw import FtwArchive, is_ftw_dir
+
+    if is_ftw_dir(folder):
+        yield from FtwArchive(folder).read(device)
+        return
     index = os.path.join(folder, "model.safetensors.index.json")
     if os.path.isfile(index):
         with open(index, encoding="utf-8") as f:
