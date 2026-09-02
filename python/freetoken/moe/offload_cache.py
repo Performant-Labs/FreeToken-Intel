@@ -227,14 +227,24 @@ class OffloadMoeCache:
         Deriving ``slot_for_id`` from ``id_of_slot`` after each mutation makes
         the desync impossible: a slot is counted as layer L's expert e only if
         ``id_of_slot[slot] == L*E + e``.
+
+        Vectorized (issue moe-offload-gil / #112): the original per-slot
+        Python loop called ``.item()`` once per slot -- each one a
+        device->host sync on XPU -- so this scaled with ``cache_size`` badly
+        enough that growing the cache to fix thrashing (the actual point of
+        #112) just moved the bottleneck here instead. This is pure small
+        index bookkeeping (not weight-sized data), so batching it into a
+        handful of tensor ops has none of ``copy_missing``'s "extra
+        intermediate buffer" pitfall -- there's no large data to double-move.
         """
         E = self.num_experts
-        S = self.cache_size
-        self.slot_for_id.fill_(-1)
-        for slot in range(S):
-            id_ = int(self.id_of_slot[slot].item())
-            if id_ >= 0:
-                self.slot_for_id[id_ // E, id_ % E] = slot
+        ids_cpu = self.id_of_slot.to("cpu", dtype=torch.int64)
+        valid = ids_cpu >= 0
+        slots = valid.nonzero(as_tuple=True)[0]
+        ids_valid = ids_cpu[slots]
+        resynced = torch.full((self.num_layers, self.num_experts), -1, dtype=torch.int32)
+        resynced[ids_valid // E, ids_valid % E] = slots.to(torch.int32)
+        self.slot_for_id.copy_(resynced.to(self.device, non_blocking=True))
 
     def reset(self) -> None:
         """Clear all slot mappings, usage, the step counter, and the stats."""
