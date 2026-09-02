@@ -1157,51 +1157,95 @@ class _Qwen35MoE:
         n_fetch = max(1, min(n - 1, n_fetch))
         seen_sorted = sorted(seen)
         cpu_experts = set(seen_sorted[: n - n_fetch])  # (1 - f) share -> CPU
-        # The CPU half computes its share from the pinned host banks.
-        cpu_top_w = torch.ones(expert_ids_cpu.shape, dtype=top_w.dtype, device=flat.device)
+
+        # The two halves run CONCURRENTLY (issue moe-hybrid-overlap): the
+        # host-CPU half's pure-CPU matmuls (no XPU tensor touched) run on a
+        # persistent single-worker background thread while the XPU half's
+        # PCIe fetch + gather runs on *this* (main) thread -- the same regime
+        # benchbw._bench_overlap measures. A decode step then costs
+        # max(cpu_half, pcie_half), not their sum, matching the q* fetch
+        # fraction's bandwidth-matched assumption. The pool is reused across
+        # every layer / every step (cached on the model) rather than spawning
+        # a fresh thread per call: thread-creation overhead alone was large
+        # enough relative to a small model's per-expert matmul cost to erase
+        # most of the overlap's benefit when measured with a fresh Thread
+        # each time.
+        #
+        # The device<->host transfers (flat -> CPU in, the CPU result -> device
+        # out) must stay on this thread: the XPU runtime faults that sync when
+        # issued off the thread that built the engine (see
+        # test_serve_live_engine_xpu.py's docstring for the same constraint).
+        # So the CPU half's input is prepared here before the submit, and its
+        # output is moved back to the device here after the result is
+        # collected.
+        x_cpu = flat.to("cpu", non_blocking=True)
+
+        future = self._hybrid_cpu_pool(model).submit(
+            self._cpu_subset_math, x_cpu, expert_ids_cpu, ctx, cpu_experts
+        )
+
         out = self._forward_offload_core(
             flat, top_idx, top_w, ctx, batch,
             exclude=cpu_experts,
         )
-        # The host-CPU half computes its (disjoint) share.
-        out += self._forward_cpu_subset(flat, top_idx, cpu_top_w, ctx, batch, cpu_experts)
+
+        cpu_out = future.result()
+        # The host-CPU half's (disjoint) share, so the per-row sum matches the
+        # sequential version exactly regardless of which half finishes first.
+        out += cpu_out.to(flat.device, non_blocking=True)
         return out
 
-    def _forward_cpu_subset(self, flat, top_idx, cpu_top_w, ctx, batch, cpu_experts):
-        """The host-CPU half of the hybrid split: compute *only* the routed
-        experts in ``cpu_experts`` on the CPU (from the pinned host banks) and
-        return their per-row contribution. A row that routes to an expert *not*
-        in the CPU set contributes nothing (that row is served by the XPU half).
+    @staticmethod
+    def _hybrid_cpu_pool(model):
+        """A single-worker thread pool for the hybrid CPU half, cached on the
+        model so it survives across decode steps / layers instead of paying
+        thread-creation cost on every call (see ``_forward_hybrid``)."""
+        pool = getattr(model, "_moe_hybrid_cpu_pool", None)
+        if pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="moe-hybrid-cpu")
+            model._moe_hybrid_cpu_pool = pool
+        return pool
+
+    def _cpu_subset_math(self, x_cpu, expert_ids_cpu, ctx, cpu_experts):
+        """Pure-CPU math for the hybrid split's host-CPU half.
+
+        Computes *only* the routed experts in ``cpu_experts`` (from the pinned
+        host banks) and returns their per-row contribution, on the CPU -- so
+        this is safe to run on a background thread (no XPU tensor is read or
+        written anywhere in this method; the device<->host transfers around it
+        are the caller's job, on the main thread). A row that routes to an
+        expert not in ``cpu_experts`` contributes nothing (that row is served
+        by the XPU half).
 
         Accumulation is expert-major then top-k-column (matching
         ``_forward_cpu`` / the in-VRAM reference), so the per-row result the
         hybrid path sums is numerically identical to what the pure CPU backend
-        would produce for that subset.
+        would produce for that subset. The upstream per-row weight for this
+        half (``cpu_top_w`` in the pre-overlap code) was always identically
+        1.0 -- applying it was a no-op multiply -- so it is omitted here
+        rather than reintroduced as a real weight.
         """
         model = ctx.model
         moe_idx = model.moe_layer_id[self.layer_id]
         sources = model.moe_cache.bank_sources
         gate_up = sources["gate_up"][moe_idx]
         down = sources["down"][moe_idx]
-        dev = flat.device
-        expert_ids = top_idx.to("cpu")
-        B, k = expert_ids.shape
+        B, k = expert_ids_cpu.shape
         num_experts = self.num_experts
-        out = torch.zeros_like(flat)
+        out = torch.zeros_like(x_cpu)
         for e in range(num_experts):
             if e not in cpu_experts:
                 continue
             for j in range(k):
-                sel = expert_ids[:, j] == e
+                sel = expert_ids_cpu[:, j] == e
                 if not bool(sel.any()):
                     continue
                 idx = torch.nonzero(sel, as_tuple=False).view(-1)
-                idx_dev = idx.to(dev)
-                x_cpu = flat.index_select(0, idx_dev).to("cpu")
-                y = self._expert_compute_cpu(gate_up, down, e, x_cpu)
-                y_dev = y.to(dev)
-                w = cpu_top_w.index_select(0, idx_dev)[:, j, None]
-                out.index_add_(0, idx_dev, w * y_dev)
+                x_sel = x_cpu.index_select(0, idx)
+                y = self._expert_compute_cpu(gate_up, down, e, x_sel)
+                out.index_add_(0, idx, y)
         return out
 
     @staticmethod
