@@ -38,7 +38,10 @@ _KERNEL_SRC = pathlib.Path(__file__).parent.parent / "kernel" / "csrc" / "sycl" 
 
 # (const float* q, const float* kc, const float* vc, const int* table,
 #  int bs, int K, int qh, int kv, int d, float sm_scale, int sliding_window,
-#  float* out)
+#  float* out, void* queue_handle)
+# queue_handle (issue attn-sycl-graph-capture, #119): the caller's active SYCL
+# queue (torch.xpu.Stream.sycl_queue), or NULL to fall back to a fresh
+# default-device queue -- see attention.cpp's decode_attention docstring.
 _FN_TYPES = [
     ctypes.c_void_p,
     ctypes.c_void_p,
@@ -51,6 +54,7 @@ _FN_TYPES = [
     ctypes.c_int,
     ctypes.c_float,
     ctypes.c_int,
+    ctypes.c_void_p,
     ctypes.c_void_p,
 ]
 
@@ -121,9 +125,16 @@ class SyclAttentionBackend(BaseAttnBackend):
         self.capture = None
         self.capture_bs: list[int] = []
         self.max_graph_bs = 0
-        # No graph capture in this backend: the reference engine does not drive
-        # capture/replay, and a SYCL nd_range launch is not a graph node.
-        # The fields exist so BaseAttnBackend.reset_capture() stays safe.
+        # Issue attn-sycl-graph-capture (#119): forward() now submits the
+        # kernel on the CALLER's active SYCL queue (torch's current XPU
+        # stream) rather than one this backend creates itself, so
+        # torch.xpu.graph() can actually see and record the launch. While
+        # _capturing is armed, forward() also skips the pre/post
+        # torch.xpu.synchronize() calls it otherwise does for host-visible
+        # correctness -- a host sync during capture is a hard error (the
+        # error this issue exists to fix: "wait cannot be called for a queue
+        # which is recording to a command graph").
+        self._capturing = False
         self._decode = None
         self._prefill = None
         self._kv_num_slots = self._resolve_num_slots(config)
@@ -207,7 +218,11 @@ class SyclAttentionBackend(BaseAttnBackend):
         self.max_graph_bs = max(bs_list) if bs_list else 0
 
     def prepare_for_capture(self, batch) -> None:
-        return None
+        self._capturing = True
+
+    def reset_capture(self) -> None:
+        super().reset_capture()
+        self._capturing = False
 
     def prepare_for_replay(self, batch) -> None:
         # Nothing to rebind: forward() rebuilds the tables from the live batch.
@@ -412,7 +427,18 @@ class SyclAttentionBackend(BaseAttnBackend):
         q_tok = q.transpose(0, 1).contiguous()
         out = torch.zeros((ext, qh, d), device=q.device, dtype=torch.float32)
 
-        torch.xpu.synchronize()
+        # The caller's active SYCL queue (torch's current XPU stream), passed
+        # through so the kernel submits onto it instead of a queue this
+        # backend creates itself (issue attn-sycl-graph-capture, #119) -- the
+        # SYCL/XPU analog of upstream's CUDA kernels taking the caller's
+        # cudaStream_t. Making that queue's work visible to torch.xpu.graph()
+        # is what lets capture see this kernel launch at all.
+        queue_handle = ctypes.c_void_p(torch.xpu.current_stream().sycl_queue)
+        # A host sync during capture is a hard error (see __init__'s
+        # docstring); ordinary (non-capturing) callers still get the same
+        # host-visible-before-return guarantee these always provided.
+        if not self._capturing:
+            torch.xpu.synchronize()
         if is_decode:
             self._decode(
                 self._ptr(q_tok),
@@ -427,6 +453,7 @@ class SyclAttentionBackend(BaseAttnBackend):
                 ctypes.c_float(sm_scale),
                 window,
                 self._ptr(out),
+                queue_handle,
             )
         else:
             self._prefill(
@@ -442,8 +469,10 @@ class SyclAttentionBackend(BaseAttnBackend):
                 ctypes.c_float(sm_scale),
                 window,
                 self._ptr(out),
+                queue_handle,
             )
-        torch.xpu.synchronize()
+        if not self._capturing:
+            torch.xpu.synchronize()
         # The kernel wrote token-major [ext, qh, d]; the model wants head-major
         # [qh, ext, d] (it does o_proj on out.transpose(1, 2)).
         return out.transpose(0, 1).contiguous()
