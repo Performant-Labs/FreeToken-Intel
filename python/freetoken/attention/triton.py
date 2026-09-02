@@ -48,6 +48,20 @@ class TritonAttentionBackend(BaseAttnBackend):
         self.capture = None
         self.capture_bs = []
         self.max_graph_bs = 0
+        # Issue moe-hybrid-overlap's graph-capture sibling (engine-graph, #15
+        # / attn-triton-fixed-kv, #118): a decode step's KV read normally
+        # walks torch.arange(written) -- a shape that GROWS every step, which
+        # torch.xpu.graph() cannot replay (capture requires identical tensor
+        # shapes on every replay). When capturing, _attend_one instead reads
+        # a FIXED torch.arange(max_seq_len) range with an extra mask term
+        # (keypos < written) gating out the not-yet-written tail -- the
+        # standard fixed-buffer / paged-attention trick. This is strictly
+        # more compute per step (O(max_seq_len) instead of O(written)), so it
+        # is used ONLY while _capturing is True (set by prepare_for_capture);
+        # ordinary eager decode (no capture in flight) keeps the cheaper
+        # growing-slice read unchanged.
+        self._capturing = False
+        self._graph_max_seq_len = 0
 
     # -- BaseAttnBackend interface -------------------------------------------
 
@@ -57,14 +71,24 @@ class TritonAttentionBackend(BaseAttnBackend):
         return None
 
     def init_capture_graph(self, max_seq_len: int, bs_list) -> None:
-        # No CUDA/XPU graph capture in the reference backend.
+        self._graph_max_seq_len = int(max_seq_len)
         self.max_graph_bs = max(bs_list) if bs_list else 0
 
     def prepare_for_capture(self, batch) -> None:
-        return None
+        # Arms the fixed-shape KV read for the capture call(s) that follow
+        # (XpuGraphRunner.capture's warmup iterations + the one actual
+        # capture). Replay never re-enters this Python forward -- the graph
+        # replays the already-captured kernel sequence directly -- so there
+        # is nothing to arm in prepare_for_replay.
+        self._capturing = self._graph_max_seq_len > 0
 
     def prepare_for_replay(self, batch) -> None:
         return None
+
+    def reset_capture(self) -> None:
+        super().reset_capture()
+        self._capturing = False
+        self._graph_max_seq_len = 0
 
     def forward(
         self,
@@ -159,13 +183,27 @@ class TritonAttentionBackend(BaseAttnBackend):
         return out
 
     def _attend_one(self, req, qh, q_pos, written, repeat, scale, window: int = 0, layer_id: int = 0) -> torch.Tensor:
-        """Attend a block of query rows against one request's KV history."""
+        """Attend a block of query rows against one request's KV history.
+
+        Reads exactly ``[0, written)`` -- the cheap, shape-varies-per-step
+        path -- unless a graph capture is in flight (see ``prepare_for_capture``),
+        in which case it reads the FIXED ``[0, max_seq_len)`` range instead
+        (same total key count on every call, gated by an extra ``keypos <
+        written`` mask term) so the kernel launches this produces are
+        replayable. The not-yet-written tail's bytes are whatever the pool
+        buffer currently holds there (zero-initialized, or a stale previous
+        request's finite floats) -- never read as a *value*: the mask sets
+        that position's score to -inf before the softmax, so it contributes
+        exactly zero regardless of content.
+        """
         ctx = _get_ctx()
         kv_cache = ctx.kv_cache
         dev = qh.device
-        k_tok, v_tok = kv_cache.read_kv(req.table_idx, torch.arange(written, device=dev), layer_id)
-        k_all = k_tok.transpose(0, 1).contiguous()  # [kv, written, D]
-        v_all = v_tok.transpose(0, 1).contiguous()  # [kv, written, D]
+        capture_len = self._graph_max_seq_len if self._capturing else 0
+        read_len = capture_len if capture_len > written else written
+        k_tok, v_tok = kv_cache.read_kv(req.table_idx, torch.arange(read_len, device=dev), layer_id)
+        k_all = k_tok.transpose(0, 1).contiguous()  # [kv, read_len, D]
+        v_all = v_tok.transpose(0, 1).contiguous()  # [kv, read_len, D]
         if repeat != 1:
             # GQA: query head h attends KV head h // repeat. That is an
             # *interleave* of the KV heads ([0,0,1,1] for 2 kv heads, repeat 2),
@@ -173,16 +211,21 @@ class TritonAttentionBackend(BaseAttnBackend):
             # axis and would map query heads to the wrong KV head whenever there
             # are multiple KV heads (head 1 would read KV head 1 instead of 0).
             # `repeat_interleave` gives the correct h // repeat mapping.
-            k_all = k_all.repeat_interleave(repeat, dim=0)  # [num_heads, written, D]
+            k_all = k_all.repeat_interleave(repeat, dim=0)  # [num_heads, read_len, D]
             v_all = v_all.repeat_interleave(repeat, dim=0)
-        # scores = qh @ k_all^T -> [heads, qlen, written]. The mask is
-        # [1, qlen, written] (broadcast over the head dim), comparing query
+        # scores = qh @ k_all^T -> [heads, qlen, read_len]. The mask is
+        # [1, qlen, read_len] (broadcast over the head dim), comparing query
         # positions (dim 1) against key positions (dim 2). Causal: a query at
         # position q attends keys at position <= q. SWA (window > 0) additionally
         # restricts to the most recent `window` keys: q - keypos < window. This
-        # matches the SYCL kernel's branch-free mask exactly.
-        key_pos = torch.arange(written, device=dev)
+        # matches the SYCL kernel's branch-free mask exactly. When read_len >
+        # written (capturing), an extra `keypos < written` term masks out the
+        # not-yet-written tail -- causal alone would not, since those slots'
+        # positions are still <= q for a query far enough along.
+        key_pos = torch.arange(read_len, device=dev)
         allowed = q_pos[None, :, None] >= key_pos[None, None, :]
+        if read_len > written:
+            allowed = allowed & (key_pos[None, None, :] < written)
         if window > 0:
             allowed = allowed & ((q_pos[None, :, None] - key_pos[None, None, :]) < window)
         scores = torch.matmul(qh, k_all.transpose(-1, -2)) * scale
