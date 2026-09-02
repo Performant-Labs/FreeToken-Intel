@@ -18,9 +18,13 @@ from __future__ import annotations
 import os
 import shutil
 
-import torch
-
 from .ftw import FtwArchive
+
+# torch is imported lazily inside convert_checkpoint(), not at module level:
+# this module is on the `ft checkpoint` CLI's import path
+# (checkpoint/__main__.py -> convert.py), which must stay importable
+# (`ft checkpoint --help`) in a torch-free environment -- the CPU CLI-smoke
+# lane runs exactly that (caught in PR #127).
 
 
 class _CountingIterator:
@@ -60,6 +64,8 @@ def convert_checkpoint(model_path: str, output_path: str) -> str:
     Every tensor is carried over unchanged (dtype, shape, values) -- this
     repacks the storage format, it does not requantize or reshape anything.
     """
+    import torch
+
     from freetoken.models.weight import iter_safetensors
 
     os.makedirs(output_path, exist_ok=True)

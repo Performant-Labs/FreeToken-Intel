@@ -33,9 +33,16 @@ import json
 import mmap
 import os
 import warnings
-from typing import Dict, Iterator, Tuple
+from typing import TYPE_CHECKING, Dict, Iterator, Tuple
 
-import torch
+if TYPE_CHECKING:
+    import torch
+
+# torch is imported lazily inside each function/method that needs it, not at
+# module level: this module is on the `ft checkpoint` CLI's import path
+# (checkpoint/__main__.py -> convert.py -> ftw.py), which must stay
+# importable (e.g. `ft checkpoint --help`) in a torch-free environment --
+# the CPU CLI-smoke lane runs exactly that (caught in PR #127).
 
 INDEX_NAME = "ftw_index.json"
 WEIGHTS_NAME = "ftw_weights.bin"
@@ -51,6 +58,8 @@ def _dtype_to_str(dtype: torch.dtype) -> str:
 
 
 def _dtype_from_str(name: str) -> torch.dtype:
+    import torch
+
     dtype = getattr(torch, name, None)
     if not isinstance(dtype, torch.dtype):
         raise ValueError(f"unknown FTW tensor dtype {name!r}")
@@ -74,6 +83,8 @@ class FtwArchive:
         can be large enough for that intermediate dict alone to exhaust host
         RAM during offline conversion.
         """
+        import torch
+
         os.makedirs(self.path, exist_ok=True)
         items = tensors.items() if isinstance(tensors, dict) else tensors
         index: Dict[str, dict] = {}
@@ -111,6 +122,8 @@ class FtwArchive:
         tensors well past that point (e.g. building the model's state dict),
         so a raw view would go stale.
         """
+        import torch
+
         index = self.read_index()
         weights_path = os.path.join(self.path, WEIGHTS_NAME)
         with open(weights_path, "rb") as f:
