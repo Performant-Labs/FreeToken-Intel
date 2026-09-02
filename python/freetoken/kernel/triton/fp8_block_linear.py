@@ -71,14 +71,24 @@ def dequantize_block_fp8(
             f"weight_scale_inv shape {tuple(weight_scale_inv.shape)} does not match "
             f"the expected {expected_scale_shape} for weight_fp8 shape {(N, K)} at block={block}"
         )
-    # Upsample the per-block scale table to per-element via repeat_interleave (each
-    # block's single scale broadcasts to every element in that block), then multiply
-    # in fp32 for precision before casting to the caller's dtype. Trim to (N, K) in
-    # case N/K are not exact multiples of block (the repeat overshoots by the pad).
+    # Reshape into [n_blocks_row, block, n_blocks_col, block] and multiply by the
+    # per-block scale via broadcasting (scale[:, None, :, None]) rather than
+    # repeat_interleave-ing it up to a full [N, K] tensor first -- for a large
+    # checkpoint matrix (DeepSeek-V3 scale) that extra materialized fp32 scale
+    # tensor is a real, avoidable multi-hundred-MB temporary (PR-Agent review,
+    # PR #125). Pad up to a block multiple first (mirrors quantize_block_fp8),
+    # then trim back to (N, K) after.
+    n_blocks_row, n_blocks_col = expected_scale_shape
+    pad_n = n_blocks_row * block - N
+    pad_k = n_blocks_col * block - K
+    w = weight_fp8.to(torch.float32)
+    if pad_n or pad_k:
+        w = torch.nn.functional.pad(w, (0, pad_k, 0, pad_n))
+    blocks = w.reshape(n_blocks_row, block, n_blocks_col, block)
     scale = weight_scale_inv.to(torch.float32)
-    scale = scale.repeat_interleave(block, dim=0)[:N]
-    scale = scale.repeat_interleave(block, dim=1)[:, :K]
-    return (weight_fp8.to(torch.float32) * scale).to(out_dtype)
+    out = blocks * scale[:, None, :, None]
+    out = out.reshape(n_blocks_row * block, n_blocks_col * block)[:N, :K]
+    return out.to(out_dtype)
 
 
 def quantize_block_fp8(
