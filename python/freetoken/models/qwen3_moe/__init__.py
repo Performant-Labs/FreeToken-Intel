@@ -672,21 +672,71 @@ class _Qwen3MoE(nn.Module):
         n_fetch = max(1, min(n - 1, n_fetch))
         seen_sorted = sorted(seen)
         cpu_experts = set(seen_sorted[: n - n_fetch])  # (1 - f) share -> CPU
+        # The two halves run CONCURRENTLY (issue moe-hybrid-overlap): the
+        # host-CPU half's pure-CPU matmuls (no XPU tensor touched) run on a
+        # persistent single-worker background thread while the XPU half's
+        # PCIe fetch + gather runs on *this* (main) thread -- the same
+        # regime benchbw._bench_overlap measures. A decode step then costs
+        # max(cpu_half, pcie_half), not their sum, matching the q* fetch
+        # fraction's bandwidth-matched assumption. The pool is reused across
+        # every layer / every step (cached on the model) rather than
+        # spawning a fresh thread per call: this model has ~28 MoE layers per
+        # decode step, and thread-creation overhead alone was large enough
+        # relative to this tiny model's per-expert matmul cost to erase most
+        # of the overlap's benefit when measured with a fresh Thread each time.
+        #
+        # The device<->host transfers (flat -> CPU in, the CPU result -> device
+        # out) must stay on this thread: the XPU runtime faults that sync when
+        # issued off the thread that built the engine (see
+        # test_serve_live_engine_xpu.py's docstring for the same constraint).
+        # So the CPU half's *input* is prepared here before the submit, and
+        # its *output* is moved back to the device here after the result is
+        # collected -- the background worker itself never touches an XPU
+        # tensor.
+        x_cpu = flat.to("cpu", non_blocking=True).float()
+        top_idx_cpu = top_idx.to("cpu")
+        top_w_cpu = top_w.to("cpu")
+
+        future = self._hybrid_cpu_pool(model).submit(
+            self._cpu_subset_math, x_cpu, top_idx_cpu, top_w_cpu, model, cpu_experts
+        )
+
         # The XPU half fetches and computes every routed expert except the CPU
         # set; its per-(expert, column) accumulation is expert-major, matching the
         # pure offload path (and the in-VRAM reference), so the rows it serves are
         # byte-identical to what offload would produce.
         out = self._forward_offload(flat, top_idx, top_w, model, batch, exclude=cpu_experts)
-        # The host-CPU half computes its (disjoint) share from the pinned banks,
-        # also in expert-major order, so the per-row sum matches offload exactly.
-        out += self._forward_cpu_subset(flat, top_idx, top_w, model, batch, cpu_experts)
+
+        cpu_out = future.result()
+        # The host-CPU half's (disjoint) share, also in expert-major order, so
+        # the per-row sum matches offload exactly regardless of which half
+        # happened to finish first.
+        out += cpu_out.to(flat.device, non_blocking=True).to(flat.dtype)
         return out
 
-    def _forward_cpu_subset(self, flat, top_idx, top_w, model, batch, cpu_experts) -> torch.Tensor:
-        """The host-CPU half of the hybrid split: compute *only* the routed
-        experts in ``cpu_experts`` on the CPU (from the pinned host banks) and
-        return their per-row contribution. A row that routes to an expert *not*
-        in the CPU set contributes nothing (that row is served by the XPU half).
+    @staticmethod
+    def _hybrid_cpu_pool(model) -> "ThreadPoolExecutor":
+        """A single-worker thread pool for the hybrid CPU half, cached on the
+        model so it survives across decode steps / layers instead of paying
+        thread-creation cost on every call (see ``_forward_hybrid``)."""
+        pool = getattr(model, "_moe_hybrid_cpu_pool", None)
+        if pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="moe-hybrid-cpu")
+            model._moe_hybrid_cpu_pool = pool
+        return pool
+
+    def _cpu_subset_math(self, x_cpu, top_idx_cpu, top_w_cpu, model, cpu_experts) -> torch.Tensor:
+        """Pure-CPU math for the hybrid split's host-CPU half.
+
+        Computes *only* the routed experts in ``cpu_experts`` (from the pinned
+        host banks) and returns their per-row contribution, on the CPU, in
+        ``x_cpu``'s dtype/device -- so this is safe to run on a background
+        thread (no XPU tensor is read or written anywhere in this method; the
+        device<->host transfers around it are the caller's job, on the main
+        thread). A row that routes to an expert not in ``cpu_experts``
+        contributes nothing (that row is served by the XPU half).
 
         Accumulation is expert-major then top-k-column (matching
         ``_forward_cpu`` / the in-VRAM reference), so the per-row result the
@@ -694,7 +744,7 @@ class _Qwen3MoE(nn.Module):
         would produce for that subset.
         """
         if not cpu_experts:
-            return torch.zeros_like(flat)
+            return torch.zeros_like(x_cpu)
         # Host banks for this MoE layer (the pinned loader-built banks; the same
         # source the XPU slot pool streams from -- ADR 0002). No PCIe round-trip:
         # the source of truth is already on the host.
@@ -702,23 +752,7 @@ class _Qwen3MoE(nn.Module):
         sources = model.moe_cache.bank_sources
         gate_up = sources["gate_up"][moe_idx]
         down = sources["down"][moe_idx]
-        executor = getattr(model, "_moe_cpu_executor", None)
-        if executor is None:
-            from freetoken.moe.cpu_executor import CpuMoeExecutor
-
-            threads = int(getattr(model.config, "moe_cpu_threads", 0) or 0)
-            executor = CpuMoeExecutor(
-                num_experts=int(model.config.num_experts),
-                intermediate=int(model.config.moe_intermediate_size),
-                threads=threads,
-            )
-            model._moe_cpu_executor = executor
-        # Compute the subset on the host (CPU dtype, CPU math) and ship only the
-        # result back to the device.
-        x_cpu = flat.to("cpu", non_blocking=True).float()
         out = torch.zeros(x_cpu.shape, dtype=x_cpu.dtype, device="cpu")
-        top_idx_cpu = top_idx.to("cpu")
-        top_w_cpu = top_w.to("cpu")
         for e in range(int(model.config.num_experts)):
             if e not in cpu_experts:
                 continue
@@ -739,7 +773,7 @@ class _Qwen3MoE(nn.Module):
                 up = x_sel @ gu_e[I : 2 * I].t()
                 y = (F.silu(gate) * up) @ down[e].float().t()
                 out.index_add_(0, rows, y * w_sel[:, None])
-        return out.to(flat.device, non_blocking=True).to(flat.dtype)
+        return out
 
     def _forward_cpu(self, flat, top_idx, top_w, model, batch) -> torch.Tensor:
         """Run the routed experts on the host (issue #8, ADR 0002).
