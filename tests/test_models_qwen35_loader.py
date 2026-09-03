@@ -223,6 +223,72 @@ def test_load_moe_expert_sources_builds_banks_from_remapped_keys(qwen35_ckpt):
     assert down[0].device.type == "cpu"
 
 
+def test_load_moe_expert_sources_builds_banks_from_per_expert_indexed_keys(tmp_path_factory):
+    """Real checkpoint files (including the official Qwen/Qwen3.5-35B-A3B-
+    GPTQ-Int4, and any plain bf16 Qwen3.5/3.6 MoE checkpoint) always store one
+    tensor PER EXPERT (``mlp.experts.{e}.gate_proj.weight``), never the fused
+    un-indexed spelling (``mlp.experts.gate_up_proj``) the rest of this file's
+    fixture uses. _expert_source_names previously generated ONLY the fused
+    spelling, so it never matched any real checkpoint's actual keys -- every
+    routed expert silently fell through to "not an expert" and got dropped
+    (a real load_model() call on a real per-expert-indexed checkpoint raised
+    "Missing MoE expert source layers"). The GPTQ bank-only path never
+    exercises _expert_source_names (it classifies experts by a raw
+    ``.experts.`` substring check instead), which is why this was invisible
+    on every GPTQ checkpoint tested so far -- found via a real (tiny)
+    HuggingFace test checkpoint (tiny-random/qwen3.5-moe) that uses the
+    per-expert-indexed spelling."""
+    from safetensors.torch import save_file
+
+    path = tmp_path_factory.mktemp("qwen35_per_expert")
+    config = {
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "model_type": "qwen3_5_moe",
+        "tie_word_embeddings": True,
+        "text_config": _qwen35_text_config(),
+    }
+    w = {
+        "model.language_model.embed_tokens.weight": torch.randn(V, H),
+        "model.language_model.norm.weight": torch.randn(H),
+        "lm_head.weight": torch.randn(V, H),
+        "model.language_model.layers.1.self_attn.q_proj.weight": torch.randn(Q_PROJ_DIM, H),
+        "model.language_model.layers.1.self_attn.k_proj.weight": torch.randn(KV_PROJ_DIM, H),
+        "model.language_model.layers.1.self_attn.v_proj.weight": torch.randn(KV_PROJ_DIM, H),
+        "model.language_model.layers.1.self_attn.o_proj.weight": torch.randn(H, O_PROJ_DIM),
+        "model.language_model.layers.1.self_attn.q_norm.weight": torch.randn(HD),
+        "model.language_model.layers.1.self_attn.k_norm.weight": torch.randn(HD),
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": torch.randn(QKV_DIM, H),
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight": torch.randn(VALUE_DIM, H),
+        "model.language_model.layers.0.linear_attn.in_proj_b.weight": torch.randn(NV, H),
+        "model.language_model.layers.0.linear_attn.in_proj_a.weight": torch.randn(NV, H),
+        "model.language_model.layers.0.linear_attn.conv1d.weight": torch.randn(CONV_DIM, 1, CONV_K),
+        "model.language_model.layers.0.linear_attn.out_proj.weight": torch.randn(H, VALUE_DIM),
+        "model.language_model.layers.0.linear_attn.A_log": torch.randn(NV),
+        "model.language_model.layers.0.linear_attn.dt_bias": torch.randn(NV),
+    }
+    for layer in range(L):
+        w[f"model.language_model.layers.{layer}.mlp.gate.weight"] = torch.randn(E, H)
+        w[f"model.language_model.layers.{layer}.mlp.shared_expert.gate_proj.weight"] = torch.randn(I, H)
+        w[f"model.language_model.layers.{layer}.mlp.shared_expert.up_proj.weight"] = torch.randn(I, H)
+        w[f"model.language_model.layers.{layer}.mlp.shared_expert.down_proj.weight"] = torch.randn(H, I)
+        w[f"model.language_model.layers.{layer}.mlp.shared_expert_gate.weight"] = torch.randn(1, H)
+        for e in range(E):
+            base = f"model.language_model.layers.{layer}.mlp.experts.{e}"
+            w[f"{base}.gate_proj.weight"] = torch.randn(I, H)
+            w[f"{base}.up_proj.weight"] = torch.randn(I, H)
+            w[f"{base}.down_proj.weight"] = torch.randn(H, I)
+    (path / "config.json").write_text(json.dumps(config))
+    save_file({k: v.contiguous() for k, v in w.items()}, str(path / "model.safetensors"))
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model.safetensors" for k in w}})
+    )
+
+    gate_up, down = load_moe_expert_sources(str(path), dtype=torch.bfloat16)
+    assert len(gate_up) == L and len(down) == L
+    assert gate_up[0].shape == (E, 2 * I, H)
+    assert down[0].shape == (E, H, I)
+
+
 # --- the top-level loader path -------------------------------------------------
 
 
