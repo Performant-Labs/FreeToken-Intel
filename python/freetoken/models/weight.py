@@ -175,7 +175,46 @@ def load_moe_expert_sources(
         include_moe_experts=True,
         include_non_moe=False,
     )
+    # Issue moe-quant-banks-e2e (#138): a GPTQ-quantized checkpoint's expert
+    # tensors arrive from iter_weights RAW and packed (bank-only mode, see
+    # its docstring) -- stream_moe_expert_sources_gptq (#135) is the only
+    # function that knows how to fold them into per-layer banks without
+    # dequantizing. checkpoint_quant_method reads this straight from the
+    # checkpoint's own config.json, independent of ModelConfig (which does
+    # not carry quantization_config today).
+    if checkpoint_quant_method(model_path) == "gptq":
+        return stream_moe_expert_sources_gptq(src, config)
     return stream_moe_expert_sources(src, config, dtype=dtype, layer_sink=layer_sink)
+
+
+def checkpoint_quant_method(model_path: str) -> Optional[str]:
+    """``quantization_config.quant_method`` from the checkpoint's own
+    ``config.json`` (e.g. ``"gptq"``), or ``None`` for an unquantized
+    checkpoint. Read directly from the raw HF config -- independent of
+    ``ModelConfig``/``parse_config``, which does not stash this today."""
+    hf_config = cached_load_hf_config(model_path)
+    raw = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
+    qc = raw.get("quantization_config")
+    if not isinstance(qc, dict):
+        text_config = raw.get("text_config")
+        qc = text_config.get("quantization_config") if isinstance(text_config, dict) else None
+    return qc.get("quant_method") if isinstance(qc, dict) else None
+
+
+def checkpoint_gptq_group_size(model_path: str) -> int:
+    """``quantization_config.group_size`` from a GPTQ checkpoint's own
+    ``config.json``. Raises if the checkpoint has no GPTQ
+    ``quantization_config`` -- callers must check :func:`checkpoint_quant_method`
+    first (this is not a general-purpose accessor)."""
+    hf_config = cached_load_hf_config(model_path)
+    raw = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
+    qc = raw.get("quantization_config")
+    if not isinstance(qc, dict):
+        text_config = raw.get("text_config")
+        qc = text_config.get("quantization_config") if isinstance(text_config, dict) else None
+    if not isinstance(qc, dict) or "group_size" not in qc:
+        raise ValueError(f"{model_path!r} has no quantization_config.group_size (not a GPTQ checkpoint?)")
+    return int(qc["group_size"])
 
 
 def _spec_for_model_path(model_path: str, use_offload_moe: bool = False):
@@ -714,4 +753,6 @@ __all__ = [
     "_PlainBank",
     "GptqExpertBank",
     "stream_moe_expert_sources_gptq",
+    "checkpoint_quant_method",
+    "checkpoint_gptq_group_size",
 ]
