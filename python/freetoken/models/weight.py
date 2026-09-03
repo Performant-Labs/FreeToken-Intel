@@ -206,6 +206,18 @@ def load_moe_expert_sources(
     # real config.json -- see stream_moe_expert_sources_fp8's docstring).
     if quant_method == "fp8":
         return stream_moe_expert_sources_fp8(src, config)
+    # openai/gpt-oss-{20b,120b}'s own config.json quantization_config.quant_method
+    # (verified: https://huggingface.co/openai/gpt-oss-20b/raw/main/config.json).
+    if quant_method == "mxfp4":
+        return stream_moe_expert_sources_mxfp4(src, config)
+    # NOTE (issue moe-quant-banks-int8, #154): stream_moe_expert_sources_int8
+    # exists and is tested directly, but no real per-channel-INT8 MoE
+    # checkpoint's quant_method spelling has been confirmed, so it is not
+    # wired into this dispatch yet -- a real INT8 checkpoint would fall
+    # through to the plain bf16 streamer below and fail there. Real gap, not
+    # a design choice; needs a real checkpoint to close (same reasoning
+    # issue #154's own body gives for not guessing the key spelling further
+    # than it already does).
     return stream_moe_expert_sources(src, config, dtype=dtype, layer_sink=layer_sink)
 
 
@@ -1035,6 +1047,358 @@ def _finalize_fp8_bank(
     )
 
 
+@dataclass(frozen=True)
+class MxfpExpertBank:
+    """One MoE layer's packed MXFP4-quantized bank for one projection slot
+    (``gate_up`` or ``down``) -- the MXFP4 sibling of :class:`GptqExpertBank`
+    (issue `moe-quant-banks-mxfp4`, #153, part of epic #140).
+
+    ``blocks`` / ``scales`` hold one row per expert (``[E, ...]``, OCP
+    Microscaling's packed layout -- see
+    :func:`freetoken.kernel.triton.mxfp4_linear.dequantize_mxfp4_blocks`):
+    ``blocks`` is ``[E, out_features, K // 32, 16]`` ``uint8`` (16 packed
+    bytes = 32 fp4 elements per block) and ``scales`` is ``[E, out_features,
+    K // 32]`` ``uint8`` (one shared E8M0 exponent per block). Unlike GPTQ
+    there is no fourth, non-per-expert component (no ``g_idx`` equivalent):
+    MXFP4's block scale is fully local to its own block, not shared across a
+    whole projection, so every component here is a genuine per-expert row.
+
+    Deliberately packed, never dequantized here -- same RAM-budget rationale
+    as :class:`GptqExpertBank`. Dequantization happens lazily, per-expert, at
+    compute time (:class:`freetoken.moe.offload_cache.SlotWeightAccessor`)
+    against whichever of these rows the offload cache's device slot pool has
+    fetched for the current step.
+    """
+
+    blocks: torch.Tensor  # [E, out_features, K // 32, 16] uint8
+    scales: torch.Tensor  # [E, out_features, K // 32] uint8
+
+
+_MXFP4_COMPONENTS = ("blocks", "scales")
+
+
+def _parse_mxfp4_expert_key(key: str) -> Tuple[int, str, str] | None:
+    """Parse an MXFP4-packed per-layer weight key into ``(layer, proj,
+    component)``, or ``None`` if ``key`` is not one.
+
+    Recognizes ``...layers.{L}.mlp.experts.{gate_up_proj|down_proj}_{blocks|
+    scales}`` -- confirmed against the real ``openai/gpt-oss-20b`` checkpoint's
+    own ``model.safetensors.index.json``
+    (``https://huggingface.co/openai/gpt-oss-20b/raw/main/model.safetensors.index.json``):
+    e.g. ``model.layers.0.mlp.experts.gate_up_proj_blocks``. Two things this
+    real spelling gets right that the issue's own guess (``.blocks`` /
+    ``.scales``, a dot-separated trailing component like GPTQ's) got wrong:
+    the separator is an underscore fused onto the projection name, not a
+    dot-separated trailing key; and unlike GPTQ, the checkpoint ships each
+    projection's experts as ONE already-packed ``[num_experts, ...]`` tensor
+    per (layer, projection, component) -- never split per-expert-index, and
+    ``gate_proj``/``up_proj`` are already fused into a single
+    ``gate_up_proj`` tensor upstream (no separate halves to concatenate, per
+    HF's own MXFP4-quantized GPT-OSS ``quantization_config`` convention).
+    There is also a real ``..._bias`` sibling key in that checkpoint
+    (per-expert MXFP4-unrelated bf16 bias) -- out of scope for this issue
+    (packed-weight banks only) and not recognized here.
+    """
+    parts = key.split(".")
+    if "mlp" not in parts or "experts" not in parts:
+        return None
+    try:
+        mlp_pos = parts.index("mlp")
+        layer = int(parts[mlp_pos - 1])
+    except (ValueError, IndexError):
+        return None
+    if parts[mlp_pos + 1] != "experts":
+        return None
+    e_pos = parts.index("experts")
+    tail = parts[e_pos + 1 :]
+    if len(tail) != 1:
+        return None
+    token = tail[0]
+    for proj, bank_name in (("gate_up_proj", "gate_up"), ("down_proj", "down")):
+        for component in _MXFP4_COMPONENTS:
+            suffix = f"{proj}_{component}"
+            if token == suffix:
+                return layer, bank_name, component
+    return None
+
+
+def stream_moe_expert_sources_mxfp4(
+    tensors: Iterator[Tuple[str, torch.Tensor]],
+    config,
+) -> Tuple[list, list]:
+    """Stream MXFP4-packed per-layer weight tensors into packed per-layer
+    banks (issue `moe-quant-banks-mxfp4`, #153) -- the MXFP4 sibling of
+    :func:`stream_moe_expert_sources_gptq`.
+
+    Unlike GPTQ's raw checkpoint layout (one tensor per expert per
+    component), a real MXFP4 checkpoint (verified against
+    ``openai/gpt-oss-20b``) ships each ``(layer, projection, component)`` as
+    ONE already-packed ``[num_experts, ...]`` tensor -- so there is no
+    per-expert stacking to do here, only pairing each projection's
+    ``blocks`` with its ``scales`` (the two components of one
+    :class:`MxfpExpertBank`) as they stream in. Finalizes each ``(layer,
+    bank_name)`` the moment both components have arrived -- immediately
+    building the :class:`MxfpExpertBank` and releasing the raw references --
+    rather than buffering the whole checkpoint's tensors until the stream
+    ends, mirroring :func:`stream_moe_expert_sources_gptq`'s fix for the real
+    RAM-blowup bug issue #145 found in an earlier draft of that function.
+
+    Returns ``(gate_up_banks, down_banks)``, each a list of ``num_layers``
+    :class:`MxfpExpertBank`. Every tensor stays in its packed, quantized
+    form the whole way through -- never dequantized here.
+    """
+    buf: Dict[Tuple[int, str], Dict[str, torch.Tensor]] = {}
+    finalized: Dict[Tuple[int, str], MxfpExpertBank] = {}
+
+    for name, tensor in tensors:
+        info = _parse_mxfp4_expert_key(name)
+        if info is None:
+            raise ValueError(f"Unexpected MXFP4 expert weight key: {name}")
+        layer, bank_name, component = info
+        if not (0 <= layer < config.num_layers):
+            raise ValueError(f"Unexpected MoE expert layer {layer}; expected [0, {config.num_layers})")
+        key = (layer, bank_name)
+        if key in finalized:
+            raise ValueError(
+                f"Layer {layer} {bank_name!r}: tensor {name!r} arrived after this bank was already "
+                "finalized -- duplicate key or an out-of-order/re-streamed source?"
+            )
+        by_component = buf.setdefault(key, {})
+        if component in by_component:
+            raise ValueError(f"Duplicate MXFP4 component {component!r} for layer {layer} {bank_name}")
+        by_component[component] = tensor
+
+        if set(by_component) == set(_MXFP4_COMPONENTS):
+            blocks = by_component["blocks"]
+            scales = by_component["scales"]
+            if blocks.size(0) != config.num_experts:
+                raise ValueError(
+                    f"Layer {layer} {bank_name!r}: expected {config.num_experts} experts, got {blocks.size(0)}"
+                )
+            if tuple(blocks.shape[:-1]) != tuple(scales.shape):
+                raise ValueError(
+                    f"Layer {layer} {bank_name!r}: blocks/scales shape mismatch "
+                    f"{tuple(blocks.shape[:-1])} vs {tuple(scales.shape)}"
+                )
+            finalized[key] = MxfpExpertBank(blocks=blocks, scales=scales)
+            del buf[key]  # release the raw refs now that the packed bank owns the data
+
+    missing = [
+        (layer, bank_name)
+        for layer in range(config.num_layers)
+        for bank_name in ("gate_up", "down")
+        if (layer, bank_name) not in finalized
+    ]
+    if missing:
+        raise ValueError(f"Missing/incomplete MXFP4 MoE expert bank(s): {missing}")
+
+    gate_up_banks = [finalized[(layer, "gate_up")] for layer in range(config.num_layers)]
+    down_banks = [finalized[(layer, "down")] for layer in range(config.num_layers)]
+    return gate_up_banks, down_banks
+
+
+@dataclass(frozen=True)
+class Int8ExpertBank:
+    """One MoE layer's packed per-channel-INT8 bank for one projection slot
+    (``gate_up`` or ``down``) -- the INT8 sibling of :class:`GptqExpertBank`
+    (issue `moe-quant-banks-int8`, #154, part of epic #140).
+
+    ``weight`` / ``scale`` hold one row per expert (``[E, ...]``, per-channel
+    symmetric INT8 -- see :mod:`freetoken.kernel.triton.int8_linear`). Unlike
+    GPTQ there is no shared per-projection side tensor (no ``g_idx``): a
+    per-channel scale is already ``[N]`` per expert, so it fits the plain
+    ``[E, ...]`` per-expert-row bank shape directly with nothing left over.
+
+    Deliberately packed, never dequantized here -- same RAM-blowup rationale
+    as :class:`GptqExpertBank` (issue #134): dequantization happens lazily,
+    per-expert, at compute time (:class:`freetoken.moe.offload_cache.
+    SlotWeightAccessor`) against whichever rows the offload cache's device
+    slot pool has fetched for the current step.
+    """
+
+    weight: torch.Tensor  # [E, N, K] int8 ([out, in] orientation)
+    scale: torch.Tensor  # [E, N] fp32 -- one value per (expert, output channel)
+
+
+_INT8_COMPONENTS = ("weight", "weight_scale")
+
+
+def _parse_int8_expert_key(key: str) -> Tuple[int, str, int, str] | None:
+    """Parse a per-channel-INT8-packed per-expert weight key into ``(layer,
+    proj, expert_id, component)``, or ``None`` if ``key`` is not one.
+
+    Recognizes ``...layers.{L}.mlp.experts.{e}.{gate_proj|up_proj|down_proj}
+    .{weight|weight_scale}``. UNVERIFIED against a real checkpoint (issue
+    #154's own body: no small/cheap real per-channel-INT8 MoE checkpoint has
+    been identified yet, unlike GPTQ's ``_parse_gptq_expert_key`` which was
+    confirmed against ``Qwen/Qwen3.5-35B-A3B-GPTQ-Int4``) -- this spelling is
+    modeled on ``compressed-tensors``' own documented ``weight``/
+    ``weight_scale`` suffix convention (the same one its real, confirmed FP8
+    checkpoints use, e.g. ``nm-testing/Meta-Llama-3.1-8B-Instruct-FP8-hf``'s
+    ``mlp.down_proj.weight`` / ``mlp.down_proj.weight_scale``), extrapolated
+    to INT8's per-channel strategy and to MoE's per-expert key shape. Treat
+    as provisionally correct, not proven, until validated against a real
+    per-channel-INT8 MoE checkpoint.
+    """
+    parts = key.split(".")
+    if len(parts) < 2 or parts[-1] not in _INT8_COMPONENTS:
+        return None
+    component = parts[-1]
+    body = parts[:-1]
+    if "mlp" not in body or "experts" not in body:
+        return None
+    try:
+        mlp_pos = body.index("mlp")
+        layer = int(body[mlp_pos - 1])
+    except (ValueError, IndexError):
+        return None
+    if body[mlp_pos + 1] != "experts":
+        return None
+    e_pos = body.index("experts")
+    tail = body[e_pos + 1 :]
+    if len(tail) != 2:
+        return None
+    try:
+        expert_id = int(tail[0])
+    except ValueError:
+        return None
+    proj = tail[1]
+    if proj not in {"gate_proj", "up_proj", "down_proj"}:
+        return None
+    return layer, proj, expert_id, component
+
+
+def stream_moe_expert_sources_int8(
+    tensors: Iterator[Tuple[str, torch.Tensor]],
+    config,
+) -> Tuple[list, list]:
+    """Stream per-channel-INT8-packed per-expert weight tensors into packed
+    per-layer banks (issue `moe-quant-banks-int8`, #154) -- the INT8 sibling
+    of :func:`stream_moe_expert_sources_gptq`.
+
+    ``gate_up`` fuses ``gate_proj`` + ``up_proj`` (the checkpoint stores them
+    as separate quantized tensors, not pre-fused): ``weight``/``scale``
+    concatenate along their ``N`` (output-channel, dim 0 in ``[N, K]``
+    orientation) axis -- both are per-row, so the fused rows stay correct
+    with no shared side tensor to reconcile (unlike GPTQ's ``g_idx``).
+
+    Returns ``(gate_up_banks, down_banks)``, each a list of ``num_layers``
+    :class:`Int8ExpertBank`. Every tensor stays in its packed, quantized form
+    the whole way through -- never dequantized here.
+
+    Finalizes each ``(layer, bank_name)`` as soon as its last component
+    arrives, exactly like :func:`stream_moe_expert_sources_gptq` -- never
+    buffering more than one layer's worth of raw tensors per bank at once
+    (issue #145 found and fixed a real whole-checkpoint-buffering RAM bug in
+    the GPTQ streamer's first draft; this mirrors the fixed version, not the
+    buggy one).
+    """
+    buf: Dict[Tuple[int, str], Dict[int, Dict[str, Dict[str, torch.Tensor]]]] = {}
+    finalized: Dict[Tuple[int, str], Int8ExpertBank] = {}
+
+    for name, tensor in tensors:
+        info = _parse_int8_expert_key(name)
+        if info is None:
+            raise ValueError(f"Unexpected INT8 expert weight key: {name}")
+        layer, proj, expert_id, component = info
+        bank_name = "gate_up" if proj in ("gate_proj", "up_proj") else "down"
+        if not (0 <= layer < config.num_layers):
+            raise ValueError(f"Unexpected MoE expert layer {layer}; expected [0, {config.num_layers})")
+        if not (0 <= expert_id < config.num_experts):
+            raise ValueError(f"Unexpected MoE expert id {expert_id} in layer {layer}")
+        key = (layer, bank_name)
+        if key in finalized:
+            raise ValueError(
+                f"Layer {layer} {bank_name!r}: tensor {name!r} arrived after this bank was already "
+                "finalized -- duplicate key or an out-of-order/re-streamed source?"
+            )
+        by_expert = buf.setdefault(key, {})
+        by_proj = by_expert.setdefault(expert_id, {})
+        by_component = by_proj.setdefault(proj, {})
+        if component in by_component:
+            raise ValueError(f"Duplicate INT8 component {component!r} for layer {layer} expert {expert_id} {proj}")
+        by_component[component] = tensor
+
+        fuse = bank_name == "gate_up"
+        if _int8_bank_is_complete(by_expert, config.num_experts, fuse=fuse):
+            finalized[key] = _finalize_int8_bank(by_expert, config.num_experts, fuse=fuse, layer=layer)
+            del buf[key]  # release the raw per-expert tensors now that the packed bank owns the data
+
+    missing = [
+        (layer, bank_name)
+        for layer in range(config.num_layers)
+        for bank_name in ("gate_up", "down")
+        if (layer, bank_name) not in finalized
+    ]
+    if missing:
+        raise ValueError(f"Missing/incomplete INT8 MoE expert bank(s): {missing}")
+
+    gate_up_banks = [finalized[(layer, "gate_up")] for layer in range(config.num_layers)]
+    down_banks = [finalized[(layer, "down")] for layer in range(config.num_layers)]
+    return gate_up_banks, down_banks
+
+
+def _int8_bank_is_complete(
+    by_expert: Dict[int, Dict[str, Dict[str, torch.Tensor]]],
+    num_experts: int,
+    *,
+    fuse: bool,
+) -> bool:
+    """True once every expert 0..num_experts-1 has all required projections
+    (``gate_proj``+``up_proj`` for ``fuse=True``, else ``down_proj``), each
+    with both INT8 components -- i.e. this ``(layer, bank_name)`` is ready
+    for :func:`_finalize_int8_bank`."""
+    if set(by_expert) != set(range(num_experts)):
+        return False
+    required_projs = ("gate_proj", "up_proj") if fuse else ("down_proj",)
+    for e in range(num_experts):
+        by_proj = by_expert[e]
+        for proj in required_projs:
+            components = by_proj.get(proj)
+            if components is None or set(components) != set(_INT8_COMPONENTS):
+                return False
+    return True
+
+
+def _finalize_int8_bank(
+    by_expert: Dict[int, Dict[str, Dict[str, torch.Tensor]]],
+    num_experts: int,
+    *,
+    fuse: bool,
+    layer: int,
+) -> Int8ExpertBank:
+    if set(by_expert) != set(range(num_experts)):
+        missing = sorted(set(range(num_experts)) - set(by_expert))
+        raise ValueError(f"Layer {layer}: missing INT8 experts {missing}")
+
+    per_expert_rows = []
+    for e in range(num_experts):
+        by_proj = by_expert[e]
+        if fuse:
+            gate = by_proj.get("gate_proj")
+            up = by_proj.get("up_proj")
+            if gate is None or up is None:
+                raise ValueError(f"Layer {layer} expert {e}: missing gate_proj/up_proj INT8 components")
+            weight = torch.cat([gate["weight"], up["weight"]], dim=0)
+            scale = torch.cat([gate["weight_scale"], up["weight_scale"]], dim=0)
+        else:
+            down = by_proj.get("down_proj")
+            if down is None:
+                raise ValueError(f"Layer {layer} expert {e}: missing down_proj INT8 components")
+            weight, scale = down["weight"], down["weight_scale"]
+        per_expert_rows.append((weight, scale))
+
+    # _stack_expert_rows (not torch.stack): the torch XPU build mishandles a
+    # direct cat/stack of 2-D per-expert rows along a new leading dim (see
+    # _stack_expert_rows's own docstring). scale is 1-D per expert, so it is
+    # stacked with a plain torch.stack instead -- the workaround is only
+    # documented for the 2-D weight case.
+    return Int8ExpertBank(
+        weight=_stack_expert_rows([row[0] for row in per_expert_rows]),
+        scale=torch.stack([row[1] for row in per_expert_rows], dim=0),
+    )
+
+
 __all__ = [
     "load_weight",
     "load_moe_expert_sources",
@@ -1045,6 +1409,10 @@ __all__ = [
     "stream_moe_expert_sources_gptq",
     "Fp8BlockExpertBank",
     "stream_moe_expert_sources_fp8",
+    "MxfpExpertBank",
+    "stream_moe_expert_sources_mxfp4",
+    "Int8ExpertBank",
+    "stream_moe_expert_sources_int8",
     "checkpoint_quant_method",
     "checkpoint_gptq_group_size",
 ]

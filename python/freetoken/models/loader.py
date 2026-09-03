@@ -392,7 +392,7 @@ def _attach_offload_cache(
     while the model's blocks are indexed by *absolute layer id*, so we also give
     the model the ``moe_layer_id`` map (layer_id -> MoE index) the forward uses.
     """
-    from freetoken.models.weight import Fp8BlockExpertBank, GptqExpertBank
+    from freetoken.models.weight import Fp8BlockExpertBank, GptqExpertBank, Int8ExpertBank, MxfpExpertBank
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     num_experts = int(getattr(model_config, "num_experts", 0) or 0)
@@ -425,10 +425,23 @@ def _attach_offload_cache(
     # stream_moe_expert_sources_fp8 for these), not re-derived from the
     # checkpoint path here.
     is_fp8_block = bool(gate_up_banks) and isinstance(gate_up_banks[0], Fp8BlockExpertBank)
+    # An MXFP4-quantized checkpoint's banks (issue moe-quant-banks-mxfp4,
+    # #153) are MxfpExpertBank, detected the same way as GPTQ's -- from the
+    # bank shape load_moe_expert_sources already dispatched to
+    # stream_moe_expert_sources_mxfp4 for.
+    is_mxfp4 = bool(gate_up_banks) and isinstance(gate_up_banks[0], MxfpExpertBank)
+    # A per-channel-INT8 checkpoint's banks (issue moe-quant-banks-int8, #154)
+    # are Int8ExpertBank, detected the same way is_gptq is -- from the bank
+    # type itself, not re-derived from the checkpoint path here.
+    is_int8 = bool(gate_up_banks) and isinstance(gate_up_banks[0], Int8ExpertBank)
     if is_gptq:
         quant_format = "gptq_int4"
     elif is_fp8_block:
         quant_format = "fp8_block"
+    elif is_mxfp4:
+        quant_format = "mxfp4"
+    elif is_int8:
+        quant_format = "int8_channel"
     else:
         quant_format = "bf16"
     cache = OffloadMoeCache(
@@ -438,7 +451,36 @@ def _attach_offload_cache(
         device=device,
         quant_format=quant_format,
     )
-    if is_gptq:
+    if is_mxfp4:
+        # Four packed banks (issue moe-quant-banks-mxfp4, #153's
+        # _BANK_SCHEMAS["mxfp4"]) -- every bank is one row per expert (no
+        # g_idx-equivalent side table; MXFP4's scale is fully local to its
+        # own block, never shared across a whole projection), so
+        # set_bank_sources' generic per-expert-row contract applies
+        # unchanged, same as gptq_int4 below.
+        cache.set_bank_sources(
+            {
+                "blocks_gate_up": [b.blocks for b in gate_up_banks],
+                "scales_gate_up": [b.scales for b in gate_up_banks],
+                "blocks_down": [b.blocks for b in down_banks],
+                "scales_down": [b.scales for b in down_banks],
+            }
+        )
+    elif is_int8:
+        # Four packed banks (issue moe-quant-banks-schema-int8's schema) --
+        # every bank is one row per expert, so set_bank_sources' generic
+        # per-expert-row contract applies unchanged. Unlike gptq_int4 there
+        # is no shared per-projection side tensor (no g_idx equivalent): a
+        # per-channel scale is already one row per expert.
+        cache.set_bank_sources(
+            {
+                "weight_gate_up": [b.weight for b in gate_up_banks],
+                "scale_gate_up": [b.scale for b in gate_up_banks],
+                "weight_down": [b.weight for b in down_banks],
+                "scale_down": [b.scale for b in down_banks],
+            }
+        )
+    elif is_gptq:
         # Six packed banks (issue moe-quant-banks-schema, #136's schema) --
         # every bank is one row per expert, so set_bank_sources' generic
         # per-expert-row contract applies unchanged. g_idx is NOT a bank (it

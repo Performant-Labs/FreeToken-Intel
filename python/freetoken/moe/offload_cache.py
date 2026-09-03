@@ -79,6 +79,26 @@ logger = init_logger(__name__)
 # copy_missing/rebuild unchanged too. Unlike GPTQ, block-FP8 has no
 # shared-across-experts side tensor (no g_idx analogue): every expert's
 # weight_scale_inv is genuinely its own, so nothing needs extra_metadata here.
+#
+# "mxfp4" (issue moe-quant-banks-mxfp4, #153): OCP Microscaling MXFP4 --
+# each projection packs into two per-expert tensors (uint8 fp4-nibble
+# blocks + uint8 E8M0 shared-exponent scale), half of GPTQ's four, and
+# with no g_idx-equivalent side table (MXFP4's scale is fully local to
+# its own 32-element block, never shared across a whole projection) --
+# see freetoken.kernel.triton.mxfp4_linear.dequantize_mxfp4_blocks and
+# freetoken.models.weight.MxfpExpertBank. Four banks total, all
+# genuinely one-row-per-expert, so (like gptq_int4) they fit
+# set_bank_sources/copy_missing/rebuild unchanged.
+#
+# "int8_channel" (issue moe-quant-banks-int8, #154): a per-channel-INT8
+# checkpoint packs each projection into two per-expert tensors -- an int8
+# weight plus one fp scale per output-channel row (see
+# freetoken.kernel.triton.int8_linear.dequantize_int8_channel) -- the
+# simplest of the three formats in #140 (a single scale per row, no group/
+# block structure like gptq_int4's g_idx/group_size). Unlike gptq_int4 there
+# is no shared per-projection side tensor at all: the scale is already one
+# row per expert ([E, N]), so all four banks below fit the plain [E, ...]
+# per-expert-row contract with nothing left over for extra_metadata.
 _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "bf16": ("gate_up", "down"),
     "gptq_int4": (
@@ -90,6 +110,18 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
         "scales_down",
     ),
     "fp8_block": (
+        "weight_gate_up",
+        "scale_gate_up",
+        "weight_down",
+        "scale_down",
+    ),
+    "mxfp4": (
+        "blocks_gate_up",
+        "scales_gate_up",
+        "blocks_down",
+        "scales_down",
+    ),
+    "int8_channel": (
         "weight_gate_up",
         "scale_gate_up",
         "weight_down",
@@ -627,13 +659,14 @@ class SlotWeightAccessor:
 
     For ``"bf16"`` this is a thin, zero-cost wrapper around the existing
     plain-tensor indexing (behavior is unchanged from before this class
-    existed). For ``"gptq_int4"`` and ``"fp8_block"`` (issue
-    moe-quant-banks-fp8, #152) each distinct slot's packed weights are
-    dequantized **at most once per instance** (a `_forward_offload_core` call
-    handles one MoE layer for one step) -- a decode step's working set is
-    typically small (<= num_experts active slots), so this is a bounded,
-    cheap cost per step, never the whole checkpoint at once (the RAM-saving
-    point of #134's whole epic).
+    existed). For ``"gptq_int4"``, ``"fp8_block"`` (issue moe-quant-banks-fp8,
+    #152), ``"mxfp4"`` (issue moe-quant-banks-mxfp4, #153), and
+    ``"int8_channel"`` (issue moe-quant-banks-int8, #154), each distinct
+    slot's packed weights are dequantized **at most once per instance** (a
+    `_forward_offload_core` call handles one MoE layer for one step) -- a
+    decode step's working set is typically small (<= num_experts active
+    slots), so this is a bounded, cheap cost per step, never the whole
+    checkpoint at once (the RAM-saving point of #134's whole epic).
 
     ``dtype`` is the dequant output dtype -- must match the activation
     tensor's dtype (``flat``, whatever ``moe_backend="offload"`` loaded the
@@ -645,6 +678,8 @@ class SlotWeightAccessor:
     expert weights that then crashed matmul-ing against the bf16
     activations everywhere else in the model -- caught as a real forward
     pass failure against the real checkpoint, not by any synthetic test).
+    ``int8_channel`` dequantizes to ``self._dtype`` for exactly the same
+    reason, not to the checkpoint's own scale dtype.
     """
 
     def __init__(self, cache: "OffloadMoeCache", intermediate: int, dtype: torch.dtype) -> None:
@@ -690,6 +725,8 @@ class SlotWeightAccessor:
             from freetoken.kernel.triton.fp8_block_linear import _BLOCK as _FP8_DEFAULT_BLOCK
 
             self._fp8_block = int(getattr(cache, "fp8_block_size", None) or _FP8_DEFAULT_BLOCK)
+        elif self.quant_format in ("mxfp4", "int8_channel"):
+            self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
         else:
             self._gu, self._dn = cache.bank_views()
 
@@ -725,6 +762,42 @@ class SlotWeightAccessor:
             result = (gu_dense[0:i].contiguous(), gu_dense[i : 2 * i].contiguous(), dn_dense.contiguous())
             self._cache[s_i] = result
             return result
+        if self.quant_format == "int8_channel":
+            from freetoken.kernel.triton.int8_linear import dequantize_int8_channel as _dequant
+
+            b = self._banks
+            # weight/scale are already in [out, in] / [out] orientation (per
+            # output channel = per row) -- no transpose needed, unlike GPTQ's
+            # dequant which returns [in, out] and must be .T'd.
+            gu_dense = _dequant(b["weight_gate_up"][s_i], b["scale_gate_up"][s_i], out_dtype=self._dtype)
+            dn_dense = _dequant(b["weight_down"][s_i], b["scale_down"][s_i], out_dtype=self._dtype)
+            i = self._intermediate
+            result = (gu_dense[0:i], gu_dense[i : 2 * i], dn_dense)
+            self._cache[s_i] = result
+            return result
+        if self.quant_format == "mxfp4":
+            from freetoken.kernel.triton.mxfp4_linear import dequantize_mxfp4_blocks
+
+            b = self._banks
+            # dequantize_mxfp4_blocks already returns [out_features, K] --
+            # gate_up's out_features axis is the bank row's leading axis
+            # (unlike GPTQ's dequantize_gptq_int4_sequential_groups, which
+            # returns [in_features, out_features] and needs a .T), so the
+            # bf16 bank rows' [out, in] orientation falls out directly.
+            # out_dtype is self._dtype (the model's activation dtype), NOT
+            # any checkpoint-stored scales dtype -- see the class docstring
+            # for the real bug (#138) this exact mistake caused for GPTQ.
+            gu_dense = dequantize_mxfp4_blocks(
+                b["blocks_gate_up"][s_i], b["scales_gate_up"][s_i], out_dtype=self._dtype,
+            )
+            dn_dense = dequantize_mxfp4_blocks(
+                b["blocks_down"][s_i], b["scales_down"][s_i], out_dtype=self._dtype,
+            )
+            i = self._intermediate
+            result = (gu_dense[0:i], gu_dense[i : 2 * i], dn_dense)
+            self._cache[s_i] = result
+            return result
+
         from freetoken.kernel.triton.gptq_linear import dequantize_gptq_int4_sequential_groups as _dequant
 
         b = self._banks
