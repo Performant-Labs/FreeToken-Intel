@@ -20,7 +20,8 @@ from __future__ import annotations
 import glob
 import json
 import os
-from typing import Iterator, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Iterator, Optional, Tuple
 
 import torch
 from safetensors import safe_open
@@ -326,6 +327,19 @@ def _expert_source_info(key: str) -> Tuple[int, str, Optional[int]] | None:
         return None
     e_pos = parts.index("experts")
     tail = parts[e_pos + 1 :]
+    # A GPTQ-packed component (.qweight/.qzeros/.scales/.g_idx, see
+    # stream_moe_expert_sources_gptq, issue #135) is NOT a plain dense
+    # weight tensor -- silently parsing e.g. "...gate_proj.qweight" as if it
+    # were "...gate_proj"'s actual weight would misinterpret a raw
+    # int32-packed tensor as the dense weight itself (garbage, not an
+    # error). Reject loudly instead of guessing: a GPTQ checkpoint's expert
+    # tensors must go through stream_moe_expert_sources_gptq, not this
+    # (bf16-oriented) function.
+    if tail and tail[-1] in _GPTQ_COMPONENTS:
+        raise ValueError(
+            f"GPTQ-packed expert weight key {key!r} passed to the bf16 expert-source "
+            "streamer; use stream_moe_expert_sources_gptq for a GPTQ checkpoint instead"
+        )
     # Real HF safetensors keys carry a trailing ``.weight`` (``...experts.{e}.{
     # gate|up|down}_proj.weight``); the FTW-normalized packed form (ADR 0002) may
     # omit it (``...experts.{gate_up_proj|down_proj}``). A ``.bias`` trailing token
@@ -490,10 +504,214 @@ def _stack_expert_rows(rows: list) -> torch.Tensor:
     return torch.cat([row.unsqueeze(0) for row in rows], dim=0)
 
 
+@dataclass(frozen=True)
+class GptqExpertBank:
+    """One MoE layer's packed GPTQ-quantized bank for one projection slot
+    (``gate_up`` or ``down``) -- the quantized-format sibling of the plain
+    ``[E, ...]`` bf16 bank tensor ``stream_moe_expert_sources`` produces
+    (issue `moe-quant-banks-pack`, #135).
+
+    ``qweight`` / ``qzeros`` / ``scales`` hold one row per expert (``[E,
+    ...]``, AutoGPTQ's packed-int32 layout -- see
+    :mod:`freetoken.kernel.triton.gptq_linear`). ``g_idx`` does NOT: it is
+    shared across every expert of this projection type in this layer
+    (``g_idx[k] = k // group_size`` depends only on ``K``/``group_size``,
+    both architecture constants, never on which expert), so stacking it per
+    expert would be pure, avoidable duplication.
+
+    Deliberately packed, never dequantized here: dequantizing every expert
+    to bf16 at load time is a 4x expansion that blows the host RAM budget
+    for a real-scale checkpoint (issue #134). Dequantization happens lazily,
+    per-expert, at compute time (issue #137) against whichever of these rows
+    the offload cache's device slot pool has fetched for the current step.
+    """
+
+    qweight: torch.Tensor  # [E, K // 8, N] int32
+    qzeros: torch.Tensor  # [E, ceil(K/group_size), N // 8] int32
+    scales: torch.Tensor  # [E, ceil(K/group_size), N]
+    g_idx: torch.Tensor  # [K] int32 -- shared across every expert
+
+
+_GPTQ_COMPONENTS = ("qweight", "qzeros", "scales", "g_idx")
+
+
+def _parse_gptq_expert_key(key: str) -> Tuple[int, str, int, str] | None:
+    """Parse a GPTQ-packed per-expert weight key into ``(layer, proj,
+    expert_id, component)``, or ``None`` if ``key`` is not one.
+
+    Recognizes ``...layers.{L}.mlp.experts.{e}.{gate_proj|up_proj|down_proj}
+    .{qweight|qzeros|scales|g_idx}`` -- the real checkpoint's raw per-expert
+    GPTQ layout (confirmed against ``Qwen/Qwen3.5-35B-A3B-GPTQ-Int4``'s own
+    ``model.safetensors.index.json``; there is no "packed" GPTQ spelling to
+    also accept, unlike :func:`_expert_source_info`'s bf16 case -- GPTQ
+    checkpoints only ever ship the raw per-expert form).
+    """
+    parts = key.split(".")
+    if len(parts) < 2 or parts[-1] not in _GPTQ_COMPONENTS:
+        return None
+    component = parts[-1]
+    body = parts[:-1]
+    if "mlp" not in body or "experts" not in body:
+        return None
+    try:
+        mlp_pos = body.index("mlp")
+        layer = int(body[mlp_pos - 1])
+    except (ValueError, IndexError):
+        return None
+    if body[mlp_pos + 1] != "experts":
+        return None
+    e_pos = body.index("experts")
+    tail = body[e_pos + 1 :]
+    if len(tail) != 2:
+        return None
+    try:
+        expert_id = int(tail[0])
+    except ValueError:
+        return None
+    proj = tail[1]
+    if proj not in {"gate_proj", "up_proj", "down_proj"}:
+        return None
+    return layer, proj, expert_id, component
+
+
+def stream_moe_expert_sources_gptq(
+    tensors: Iterator[Tuple[str, torch.Tensor]],
+    config,
+) -> Tuple[list, list]:
+    """Stream GPTQ-packed per-expert weight tensors into packed per-layer
+    banks (issue `moe-quant-banks-pack`, #135) -- the quantized-format
+    sibling of :func:`stream_moe_expert_sources`.
+
+    Kept as a separate function rather than folded into
+    ``stream_moe_expert_sources``: GPTQ's four-tensor-per-projection shape
+    does not fit that function's single-tensor-per-projection contract, and
+    that bf16 path is well-tested and used by every other model/checkpoint
+    -- not worth risking a regression there to shoehorn GPTQ's shape in.
+
+    ``gate_up`` fuses ``gate_proj`` + ``up_proj`` (the checkpoint stores
+    them as separate quantized tensors, not pre-fused):
+    ``qweight``/``qzeros``/``scales`` concatenate along their ``N``
+    (output-channel) axis; ``g_idx`` does not change (same ``K``/
+    ``group_size`` for both halves -- asserted here, not assumed, and
+    likewise asserted equal across every expert of a bank, since it is
+    architecturally shared, never per-expert -- see :class:`GptqExpertBank`).
+
+    Returns ``(gate_up_banks, down_banks)``, each a list of ``num_layers``
+    :class:`GptqExpertBank`. Every tensor stays in its packed, quantized
+    form the whole way through -- never dequantized here (see
+    :class:`GptqExpertBank`'s docstring for why).
+
+    Simplification versus ``stream_moe_expert_sources``: this buffers a
+    whole layer's raw per-expert tensors before finalizing (not the
+    incremental per-layer-as-soon-as-complete finalization the bf16 path
+    uses to bound peak RAM during load) -- real, packed GPTQ rows are ~4x
+    smaller than their bf16 equivalents to begin with, so this is a smaller
+    concern here; revisit if issue #138's real-checkpoint validation shows
+    it matters.
+    """
+    buf: Dict[Tuple[int, str], Dict[int, Dict[str, Dict[str, torch.Tensor]]]] = {}
+    seen_layers: Dict[str, set] = {"gate_up": set(), "down": set()}
+
+    for name, tensor in tensors:
+        info = _parse_gptq_expert_key(name)
+        if info is None:
+            raise ValueError(f"Unexpected GPTQ expert weight key: {name}")
+        layer, proj, expert_id, component = info
+        bank_name = "gate_up" if proj in ("gate_proj", "up_proj") else "down"
+        if not (0 <= layer < config.num_layers):
+            raise ValueError(f"Unexpected MoE expert layer {layer}; expected [0, {config.num_layers})")
+        if not (0 <= expert_id < config.num_experts):
+            raise ValueError(f"Unexpected MoE expert id {expert_id} in layer {layer}")
+        by_expert = buf.setdefault((layer, bank_name), {})
+        by_proj = by_expert.setdefault(expert_id, {})
+        by_component = by_proj.setdefault(proj, {})
+        if component in by_component:
+            raise ValueError(f"Duplicate GPTQ component {component!r} for layer {layer} expert {expert_id} {proj}")
+        by_component[component] = tensor
+        seen_layers[bank_name].add(layer)
+
+    missing = {
+        name: sorted(set(range(config.num_layers)) - seen)
+        for name, seen in seen_layers.items()
+        if seen != set(range(config.num_layers))
+    }
+    if missing:
+        raise ValueError(f"Missing GPTQ MoE expert source layers: {missing}")
+
+    gate_up_banks = [
+        _finalize_gptq_bank(buf[(layer, "gate_up")], config.num_experts, fuse=True, layer=layer)
+        for layer in range(config.num_layers)
+    ]
+    down_banks = [
+        _finalize_gptq_bank(buf[(layer, "down")], config.num_experts, fuse=False, layer=layer)
+        for layer in range(config.num_layers)
+    ]
+    return gate_up_banks, down_banks
+
+
+def _finalize_gptq_bank(
+    by_expert: Dict[int, Dict[str, Dict[str, torch.Tensor]]],
+    num_experts: int,
+    *,
+    fuse: bool,
+    layer: int,
+) -> GptqExpertBank:
+    if set(by_expert) != set(range(num_experts)):
+        missing = sorted(set(range(num_experts)) - set(by_expert))
+        raise ValueError(f"Layer {layer}: missing GPTQ experts {missing}")
+
+    per_expert_rows = []
+    for e in range(num_experts):
+        by_proj = by_expert[e]
+        if fuse:
+            gate = by_proj.get("gate_proj")
+            up = by_proj.get("up_proj")
+            if gate is None or up is None:
+                raise ValueError(f"Layer {layer} expert {e}: missing gate_proj/up_proj GPTQ components")
+            if not torch.equal(gate["g_idx"], up["g_idx"]):
+                raise ValueError(
+                    f"Layer {layer} expert {e}: gate_proj/up_proj g_idx mismatch (different group_size/K?)"
+                )
+            qweight = torch.cat([gate["qweight"], up["qweight"]], dim=1)
+            qzeros = torch.cat([gate["qzeros"], up["qzeros"]], dim=1)
+            scales = torch.cat([gate["scales"], up["scales"]], dim=1)
+            g_idx = gate["g_idx"]
+        else:
+            down = by_proj.get("down_proj")
+            if down is None:
+                raise ValueError(f"Layer {layer} expert {e}: missing down_proj GPTQ components")
+            qweight, qzeros, scales, g_idx = down["qweight"], down["qzeros"], down["scales"], down["g_idx"]
+        per_expert_rows.append((qweight, qzeros, scales, g_idx))
+
+    # g_idx is shared, not per-expert (see GptqExpertBank docstring): assert
+    # every expert's copy agrees, then keep only one -- stacking it into an
+    # [E, K] bank would be real, avoidable duplication of identical data.
+    g_idx0 = per_expert_rows[0][3]
+    for e, row in enumerate(per_expert_rows[1:], start=1):
+        if not torch.equal(row[3], g_idx0):
+            raise ValueError(
+                f"Layer {layer}: g_idx differs between expert 0 and expert {e} "
+                "(unexpected -- group_size/K should be architecture-constant, identical for every expert)"
+            )
+
+    # _stack_expert_rows (not torch.stack): the torch XPU build mishandles a
+    # direct cat/stack of 2-D per-expert rows along a new leading dim --
+    # unsqueeze-then-cat is the reliable path this codebase already
+    # standardizes on (see _stack_expert_rows's own docstring).
+    return GptqExpertBank(
+        qweight=_stack_expert_rows([row[0] for row in per_expert_rows]),
+        qzeros=_stack_expert_rows([row[1] for row in per_expert_rows]),
+        scales=_stack_expert_rows([row[2] for row in per_expert_rows]),
+        g_idx=g_idx0,
+    )
+
+
 __all__ = [
     "load_weight",
     "load_moe_expert_sources",
     "dummy_moe_expert_sources",
     "iter_safetensors",
     "_PlainBank",
+    "GptqExpertBank",
+    "stream_moe_expert_sources_gptq",
 ]
