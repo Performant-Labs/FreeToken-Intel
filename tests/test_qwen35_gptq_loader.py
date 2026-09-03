@@ -103,3 +103,103 @@ def test_raises_on_an_incomplete_projection_at_stream_end():
     pairs = [("p.qweight", qweight), ("p.qzeros", qzeros), ("p.scales", scales)]  # missing g_idx
     with pytest.raises(ValueError, match="incomplete"):
         list(_dequantize_gptq_stream(iter(pairs)))
+
+
+# ---------------------------------------------------------------------------
+# iter_weights bank-only mode (issue moe-quant-banks-pack, #135): GPTQ
+# tensors must pass through RAW (not dequantized) when include_moe_experts=
+# True, include_non_moe=False -- the offload MoE-bank fabricator's call
+# shape. Dequantizing every expert to bf16 at load time is a 4x expansion
+# that blows the host RAM budget for a real-scale checkpoint (issue #134).
+# ---------------------------------------------------------------------------
+
+
+def test_bank_only_mode_yields_raw_gptq_components_not_dequantized(monkeypatch, tmp_path):
+    import freetoken.models.qwen3_5_moe as qwen35moe
+
+    k, n, group_size = 8, 8, 8
+    qweight, qzeros, scales, g_idx = _fake_gptq_projection(k, n, group_size)
+    prefix = "model.language_model.layers.0.mlp.experts.0.gate_proj"
+    raw_pairs = [
+        (prefix + ".qweight", qweight),
+        (prefix + ".qzeros", qzeros),
+        (prefix + ".scales", scales),
+        (prefix + ".g_idx", g_idx),
+    ]
+
+    monkeypatch.setattr(qwen35moe, "_iter_safetensors", lambda model_path, device: iter(raw_pairs))
+    monkeypatch.setattr(qwen35moe, "_cfg_for_path", lambda model_path: None)  # fall back to the substring heuristic
+
+    out = dict(
+        qwen35moe.iter_weights(
+            "unused-path", torch.device("cpu"), include_moe_experts=True, include_non_moe=False
+        )
+    )
+    # Raw component names survive (remapped model.language_model.* -> model.*),
+    # not a single dequantized "...gate_proj.weight".
+    assert set(out) == {
+        "model.layers.0.mlp.experts.0.gate_proj.qweight",
+        "model.layers.0.mlp.experts.0.gate_proj.qzeros",
+        "model.layers.0.mlp.experts.0.gate_proj.scales",
+        "model.layers.0.mlp.experts.0.gate_proj.g_idx",
+    }
+    assert out["model.layers.0.mlp.experts.0.gate_proj.qweight"].dtype == torch.int32
+    torch.testing.assert_close(out["model.layers.0.mlp.experts.0.gate_proj.qweight"], qweight)
+    torch.testing.assert_close(out["model.layers.0.mlp.experts.0.gate_proj.g_idx"], g_idx)
+
+
+def test_bank_only_mode_still_drops_non_expert_tensors(monkeypatch):
+    import freetoken.models.qwen3_5_moe as qwen35moe
+
+    k, n, group_size = 8, 8, 8
+    qweight, qzeros, scales, g_idx = _fake_gptq_projection(k, n, group_size)
+    prefix = "model.language_model.layers.0.mlp.experts.0.down_proj"
+    raw_pairs = [
+        ("model.language_model.embed_tokens.weight", torch.randn(4, 4)),
+        (prefix + ".qweight", qweight),
+        (prefix + ".qzeros", qzeros),
+        (prefix + ".scales", scales),
+        (prefix + ".g_idx", g_idx),
+        ("model.language_model.layers.0.linear_attn.norm.weight", torch.randn(4)),
+    ]
+    monkeypatch.setattr(qwen35moe, "_iter_safetensors", lambda model_path, device: iter(raw_pairs))
+    monkeypatch.setattr(qwen35moe, "_cfg_for_path", lambda model_path: None)
+
+    out = dict(
+        qwen35moe.iter_weights(
+            "unused-path", torch.device("cpu"), include_moe_experts=True, include_non_moe=False
+        )
+    )
+    assert set(out) == {
+        "model.layers.0.mlp.experts.0.down_proj.qweight",
+        "model.layers.0.mlp.experts.0.down_proj.qzeros",
+        "model.layers.0.mlp.experts.0.down_proj.scales",
+        "model.layers.0.mlp.experts.0.down_proj.g_idx",
+    }
+
+
+def test_non_bank_only_mode_still_dequantizes_eagerly(monkeypatch):
+    """The non-bank-only call shape (e.g. a hypothetical fully-in-VRAM
+    consumer) keeps today's eager-dequant behavior -- only the offload
+    bank-fabricator's call shape (include_non_moe=False) changed."""
+    import freetoken.models.qwen3_5_moe as qwen35moe
+
+    k, n, group_size = 8, 8, 8
+    qweight, qzeros, scales, g_idx = _fake_gptq_projection(k, n, group_size)
+    prefix = "model.language_model.layers.0.mlp.experts.0.gate_proj"
+    raw_pairs = [
+        (prefix + ".qweight", qweight),
+        (prefix + ".qzeros", qzeros),
+        (prefix + ".scales", scales),
+        (prefix + ".g_idx", g_idx),
+    ]
+    monkeypatch.setattr(qwen35moe, "_iter_safetensors", lambda model_path, device: iter(raw_pairs))
+    monkeypatch.setattr(qwen35moe, "_cfg_for_path", lambda model_path: None)
+
+    out = dict(
+        qwen35moe.iter_weights(
+            "unused-path", torch.device("cpu"), include_moe_experts=True, include_non_moe=True
+        )
+    )
+    assert set(out) == {"model.layers.0.mlp.experts.0.gate_proj.weight"}
+    assert out["model.layers.0.mlp.experts.0.gate_proj.weight"].dtype == torch.bfloat16

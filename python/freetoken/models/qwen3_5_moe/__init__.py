@@ -258,16 +258,30 @@ def iter_weights(
     * A **GPTQ-quantized** checkpoint (e.g. the official
       ``Qwen/Qwen3.5-35B-A3B-GPTQ-Int4``) stores each quantized projection as
       four tensors -- ``.qweight`` / ``.qzeros`` / ``.scales`` / ``.g_idx`` --
-      instead of one plain ``.weight``. Those four are buffered here (by their
-      shared name prefix) and, once complete, dequantized via
-      :func:`freetoken.kernel.triton.gptq_linear.dequantize_gptq_int4` into a
-      single dense ``.weight`` tensor before entering the rest of this
-      function -- everything below (routing, remapping, host placement) sees
-      the exact same shape it would for a plain bf16 checkpoint. Per the real
-      checkpoint's ``quantization_config.dynamic`` exclusions, only the routed
-      experts' ``gate_proj``/``up_proj``/``down_proj`` are ever quantized this
-      way; attention, the shared expert, embeddings, and ``lm_head`` stay
-      plain bf16/fp16 tensors and pass through unchanged.
+      instead of one plain ``.weight``. In **bank-only mode**
+      (``include_moe_experts=True, include_non_moe=False`` -- the offload
+      MoE-bank fabricator's call, ``load_moe_expert_sources``) these four
+      pass through **raw and unmodified**, by design (issue `moe-quant-
+      banks-pack`, #135): dequantizing every expert to bf16 at load time is
+      a 4x expansion that blows the host RAM budget for a real-scale
+      checkpoint (issue #134). A caller that wants packed GPTQ tensors
+      turned into per-layer banks streams this generator's output through
+      :func:`freetoken.models.weight.stream_moe_expert_sources_gptq`, which
+      keeps them packed the whole way through -- dequantization happens
+      lazily, per-expert, at compute time (issue #137), not here. In every
+      **other** call shape (bank-only mode is off), the four components are
+      still dequantized here via
+      :func:`freetoken.kernel.triton.gptq_linear.dequantize_gptq_int4` into
+      a single dense ``.weight`` tensor, matching a plain bf16 checkpoint's
+      shape -- the dense-placement call never sees expert tensors at all
+      (they are filtered out below), so this only actually matters for a
+      hypothetical future non-offload (fully in-VRAM) consumer of this
+      iterator; it is not exercised by the offload path once #136/#137 land.
+      Per the real checkpoint's ``quantization_config.dynamic`` exclusions,
+      only the routed experts' ``gate_proj``/``up_proj``/``down_proj`` are
+      ever quantized this way; attention, the shared expert, embeddings, and
+      ``lm_head`` stay plain bf16/fp16 tensors and pass through unchanged
+      regardless of mode.
     * Routed experts (``.experts.*``) go to **host** (offload banks); everything
       else -- including the always-on shared expert and the linear-attention
       weights -- goes to the dense ``device``.
@@ -281,7 +295,16 @@ def iter_weights(
     _cfg = _cfg_for_path(model_path)
     routed = _expert_source_names(_cfg) if _cfg is not None else None
 
-    for raw_name, tensor in _dequantize_gptq_stream(_iter_safetensors(model_path, device=device)):
+    # Bank-only mode (the offload-cache path, #135): do NOT eagerly dequantize
+    # GPTQ-packed expert tensors -- pass them through raw so a packed-bank
+    # builder can keep them packed in host RAM. Every other call shape keeps
+    # today's eager-dequant behavior (see the docstring above for why that is
+    # fine: the dense-placement call never sees expert tensors regardless).
+    bank_only = include_moe_experts and not include_non_moe
+    raw_stream = _iter_safetensors(model_path, device=device)
+    stream = raw_stream if bank_only else _dequantize_gptq_stream(raw_stream)
+
+    for raw_name, tensor in stream:
         # Drop the vision tower and the MTP head outright -- neither is part
         # of the text-serving forward pass this port runs.
         if raw_name.startswith(_VISUAL_PREFIX) or raw_name.startswith(_MTP_PREFIX):
@@ -294,7 +317,17 @@ def iter_weights(
             if raw_name.startswith(_LANGUAGE_PREFIX)
             else raw_name
         )
-        if routed is not None:
+        is_gptq_component = bank_only and name.endswith(_GPTQ_SUFFIXES)
+        if is_gptq_component:
+            # A raw GPTQ component's name (e.g. "...gate_proj.qweight") is
+            # never in `routed` (which only ever holds "...gate_proj.weight"
+            # spellings) -- classify by the same ".experts." substring the
+            # no-config fallback below already uses. Real routed-expert keys
+            # always carry ".experts." (the shared expert does not: it is
+            # "mlp.shared_expert.*", a different substring), so this is exact,
+            # not a heuristic weakening.
+            expert = ".experts." in name
+        elif routed is not None:
             expert = name in routed
         else:
             expert = ".experts." in name
@@ -305,7 +338,11 @@ def iter_weights(
             continue
         if not include_non_moe and not expert:
             continue
-        if dtype is not None and tensor.dtype != dtype:
+        # Never dtype-cast a raw GPTQ component: qweight/qzeros/g_idx are
+        # int32 and scales carries its own real dtype -- casting any of them
+        # to a requested bf16/fp16 dense dtype would silently corrupt the
+        # packed bits, not "convert" them.
+        if dtype is not None and not is_gptq_component and tensor.dtype != dtype:
             tensor = tensor.to(dtype)
         # Routed experts stream to host (offload banks); the rest (dense: the
         # shared expert, linear-attention weights, embeddings, norms, lm_head)
