@@ -142,6 +142,18 @@ def parse_config(hf_config, model_path: str | None = None, **_kwargs) -> ModelCo
     # doesn't), so to_dict() alone is not a reliable source of truth here,
     # unlike every other model package in this port.
     raw = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
+    # The checkpoint's own config.json FILE, for "was this explicitly set"
+    # gating decisions (is_moe / DSA below) -- neither getattr(hf_config,
+    # ...) NOR hf_config.to_dict() are reliable signals for that: confirmed
+    # directly, the installed transformers' real DeepseekV4Config class has
+    # non-None defaults for BOTH n_routed_experts (256) and index_topk
+    # (512) that leak through both paths even for a checkpoint whose
+    # config.json never mentions either field -- silently turning MoE/DSA
+    # "on" for a plain #190-only MLA checkpoint. Without a model_path (a
+    # mock/unit-test hf_config with no backing file) fall back to `raw`,
+    # which is NOT polluted for a hand-built mock object (only a real HF
+    # config CLASS has non-None defaults to leak).
+    file_raw = _raw_checkpoint_json(model_path) if model_path else raw
 
     def field(name, default=None):
         val = getattr(hf_config, name, None)
@@ -154,9 +166,13 @@ def parse_config(hf_config, model_path: str | None = None, **_kwargs) -> ModelCo
         "max_position_embeddings", "tie_word_embeddings", "rope_theta",
         "rope_scaling", "hidden_act", "torch_dtype", "dtype", "rms_norm_eps",
         "index_topk", "index_head_dim", "index_n_heads",
+        "n_routed_experts", "moe_intermediate_size", "num_experts_per_tok",
+        "first_k_dense_replace", "n_group", "topk_group",
+        "routed_scaling_factor", "n_shared_experts", "norm_topk_prob",
     )}
     kv_lora_rank = int(src.get("kv_lora_rank") or 0)
     qk_rope_head_dim = int(src.get("qk_rope_head_dim") or 0)
+    is_moe = bool(file_raw.get("n_routed_experts"))
     cfg = ModelConfig(
         architectures=["DeepseekV4ForCausalLM"],
         hidden_size=src.get("hidden_size"),
@@ -166,6 +182,18 @@ def parse_config(hf_config, model_path: str | None = None, **_kwargs) -> ModelCo
         num_key_value_heads=1,  # MLA: one shared compressed latent, not per-head K/V
         head_dim=kv_lora_rank + qk_rope_head_dim,  # the pool's real per-token row width
         intermediate_size=src.get("intermediate_size"),
+        # file_raw, not src/field(): confirmed directly, the installed
+        # transformers' real DeepseekV4Config's getattr/to_dict() BOTH
+        # report moe_intermediate_size == intermediate_size regardless of
+        # what the checkpoint's own config.json actually says (a real,
+        # checkpoint-independent quirk of that one field on this specific,
+        # likely still-stabilizing HF config class -- every other MoE
+        # field read via field()/src above was verified correct).
+        moe_intermediate_size=file_raw.get("moe_intermediate_size") if is_moe else None,
+        num_experts=int(src["n_routed_experts"]) if is_moe else None,
+        num_experts_per_tok=int(src.get("num_experts_per_tok") or 0) if is_moe else None,
+        first_k_dense_replace=int(src.get("first_k_dense_replace") or 0),
+        is_moe=is_moe,
         max_position_embeddings=src.get("max_position_embeddings"),
         tie_word_embeddings=src.get("tie_word_embeddings", False),
         kv_lora_rank=kv_lora_rank or None,
@@ -180,24 +208,20 @@ def parse_config(hf_config, model_path: str | None = None, **_kwargs) -> ModelCo
     cfg.attrs["v_head_dim"] = int(src.get("v_head_dim") or 0)
     cfg.attrs["attention_bias"] = bool(src.get("attention_bias", False))
     cfg.attrs["rms_norm_eps"] = float(src.get("rms_norm_eps") or 1e-6)
+    # Real MoE router (issue #192), identical math to glm4_moe's own
+    # Glm4TopkRouter -- confirmed directly against the real
+    # modeling_deepseek_v3.py: DeepseekV3TopkRouter is the SAME class shape
+    # (sigmoid + e_score_correction_bias + grouped top-2-sum + gather from
+    # raw scores + norm + routed_scaling_factor), unsurprising since GLM4's
+    # own router was itself modeled on DeepSeek-V3's.
+    if is_moe:
+        cfg.attrs["n_group"] = int(src.get("n_group") or 1)
+        cfg.attrs["topk_group"] = int(src.get("topk_group") or 1)
+        cfg.attrs["routed_scaling_factor"] = float(src.get("routed_scaling_factor") or 1.0)
+        cfg.attrs["n_shared_experts"] = int(src.get("n_shared_experts") or 0)
+        cfg.attrs["norm_topk_prob"] = bool(src.get("norm_topk_prob", True))
     # DSA (issue #191): only set when the checkpoint's own config.json FILE
-    # explicitly declares index_topk. Neither getattr(hf_config, ...) NOR
-    # hf_config.to_dict() are reliable "was it explicit" signals here:
-    # confirmed directly, the installed transformers' real DeepseekV4Config
-    # class defaults index_topk to a real non-None value (512), and
-    # to_dict() serializes that default too -- both would silently turn
-    # DSA "on" for a plain-MLA checkpoint whose config.json never mentions
-    # it at all, breaking the "every #190-only checkpoint is unaffected"
-    # guarantee this gate exists for. Read the actual JSON file instead
-    # (mirrors qwen3_moe's own _probe_head_dim, which reads raw checkpoint
-    # bytes for the same class-of-reason: a parsed config object's
-    # attribute access isn't trustworthy for this specific question).
-    # Without a model_path (a mock/unit-test hf_config with no backing
-    # file -- every model package's own test suite uses this shape) fall
-    # back to the plain to_dict() output, which is NOT polluted for a
-    # hand-built mock object (only a real HF config CLASS has non-None
-    # defaults to leak).
-    file_raw = _raw_checkpoint_json(model_path) if model_path else raw
+    # explicitly declares index_topk -- see file_raw's own docstring above.
     if file_raw.get("index_topk"):
         cfg.attrs["index_topk"] = int(file_raw["index_topk"])
         cfg.attrs["index_head_dim"] = int(file_raw.get("index_head_dim") or raw.get("index_head_dim") or 0)
@@ -219,19 +243,28 @@ def _raw_checkpoint_json(model_path: str) -> dict:
         return {}
 
 
-def iter_weights(model_path: str, device: torch.device, **_kwargs):
-    """Yield the checkpoint's tensors, each placed on ``device``.
+def iter_weights(model_path: str, device: torch.device, *, include_moe_experts: bool = True, include_non_moe: bool = True):
+    """Yield the checkpoint's tensors, each on its destination device.
 
-    Issue #190's own scope (MLA only, dense MLP every layer, see this
-    module's own docstring): no MoE expert routing at all yet -- every
-    tensor in this issue's checkpoints is dense. #192 (the real model
-    wiring issue) adds the expert-routing split back in when the real MoE
-    router lands.
+    Same dense/expert split as ``qwen3_moe``/``glm4_moe``'s own
+    ``iter_weights`` (issue #192): expert tensors (``...mlp.experts...``)
+    stay on host memory (the generic ``load_moe_expert_sources`` ->
+    ``_place_expert_weights_any`` loader path streams them into the
+    in-VRAM ``_DeepseekV4Expert`` modules, same as GLM-4.7's own MoE),
+    everything else goes to ``device``. A dense-only (no MoE) or MLA-only
+    (#190) checkpoint has no ``.experts.`` tensors at all, so this is a
+    no-op split for those -- fully backward compatible.
     """
     embed_tokens_weight = None
     saw_lm_head = False
     for name, tensor in iter_safetensors(model_path, device):
-        placed = tensor.to(device)
+        is_expert = ".experts." in name
+        if is_expert and not include_moe_experts:
+            continue
+        if not is_expert and not include_non_moe:
+            continue
+        dest = torch.device("cpu") if is_expert else device
+        placed = tensor.to(dest)
         if name == "model.embed_tokens.weight":
             embed_tokens_weight = placed
         elif name == "lm_head.weight":
@@ -446,9 +479,9 @@ def req_written_len(ctx, batch, table_idx: int) -> int:
 
 
 class _DeepseekV4MLP(nn.Module):
-    """Plain SwiGLU MLP -- every layer's feed-forward block for this
-    issue's own scope (no MoE router yet, see this module's own
-    docstring)."""
+    """Plain SwiGLU MLP -- a leading (``first_k_dense_replace``) dense
+    layer's only feed-forward block, and (with a scaled intermediate
+    size) the MoE block's always-on shared expert."""
 
     def __init__(self, hidden_size: int, intermediate_size: int, dtype) -> None:
         super().__init__()
@@ -460,6 +493,119 @@ class _DeepseekV4MLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class _DeepseekV4TopkRouter(nn.Module):
+    """DeepSeek-V3's real grouped, sigmoid, bias-corrected top-k router
+    (``DeepseekV3TopkRouter``, confirmed byte-for-byte identical math to
+    ``glm4_moe``'s own ``_Glm4TopkRouter`` against the real
+    ``modeling_deepseek_v3.py`` -- unsurprising, since GLM-4.7's own router
+    was itself modeled on DeepSeek-V3's). ``weight``/
+    ``e_score_correction_bias`` are named to match the real checkpoint's
+    ``mlp.gate.weight``/``mlp.gate.e_score_correction_bias`` keys exactly."""
+
+    def __init__(self, config: ModelConfig, dtype) -> None:
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.n_group = config.attrs.get("n_group", 1)
+        self.topk_group = config.attrs.get("topk_group", 1)
+        self.norm_topk_prob = config.attrs.get("norm_topk_prob", True)
+        self.routed_scaling_factor = config.attrs.get("routed_scaling_factor", 1.0)
+        self.weight = nn.Parameter(torch.empty(self.num_experts, config.hidden_size, dtype=dtype))
+        self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts, dtype=torch.float32))
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``hidden_states`` is ``[T, H]``. Returns ``(topk_indices [T, k],
+        topk_weights [T, k])`` -- weights already renormalized and scaled."""
+        router_logits = F.linear(hidden_states.float(), self.weight.float())  # [T, E]
+        scores = router_logits.sigmoid()
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        if self.n_group > 1:
+            T = scores_for_choice.shape[0]
+            group_scores = (
+                scores_for_choice.view(T, self.n_group, self.num_experts // self.n_group)
+                .topk(2, dim=-1)[0]
+                .sum(dim=-1)
+            )  # [T, n_group]
+            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1)[1]  # [T, topk_group]
+            group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1.0)  # [T, n_group]
+            expert_mask = (
+                group_mask.unsqueeze(-1)
+                .expand(T, self.n_group, self.num_experts // self.n_group)
+                .reshape(T, self.num_experts)
+            )
+            scores_for_choice = scores_for_choice.masked_fill(expert_mask == 0, float("-inf"))
+        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1)[1]  # [T, k], NOT sorted
+        topk_weights = scores.gather(1, topk_indices)  # gathered from the RAW (uncorrected) sigmoid scores
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * self.routed_scaling_factor
+        return topk_indices, topk_weights
+
+
+class _DeepseekV4MoE(nn.Module):
+    """A DeepSeek-V4 MoE block: the grouped-topk router
+    (:class:`_DeepseekV4TopkRouter`) + N routed experts + an always-on
+    shared expert combined by plain unweighted sum. In-VRAM only (see this
+    module's own docstring on the offload scope cut -- the same one
+    ``glm4_moe``/``gpt_oss`` already made) -- every expert is a real
+    device-resident module."""
+
+    def __init__(self, config: ModelConfig, device, dtype, layer_id: int) -> None:
+        super().__init__()
+        # Fail loud, not silently wrong: this block always builds real,
+        # device-resident expert modules and never reads the offload
+        # cache -- if the engine's moe_backend resolution (EngineConfig's
+        # own "auto" default) ever picks offload/cpu/hybrid for this
+        # architecture, every expert stays at its random constructor init
+        # forever (nothing overwrites it, since the offload/cpu code path
+        # never touches .experts at all) -- a real, confirmed bug found
+        # while building this issue's own test (a "deterministic greedy"
+        # assertion failed because two engine builds got two different
+        # random expert inits, silently, no error). Raise clearly instead.
+        if bool(getattr(config, "use_offload_moe", False)) or bool(getattr(config, "use_cpu_moe", False)) or bool(getattr(config, "use_hybrid", False)):
+            raise NotImplementedError(
+                "DeepseekV4ForCausalLM only supports the in-VRAM (fused) MoE backend "
+                "-- offload/cpu/hybrid are not wired yet (see the module's own "
+                "docstring). Pass moe_backend=\"fused\" explicitly (EngineConfig's "
+                "\"auto\" default does not know this architecture can't offload)."
+            )
+        self.layer_id = layer_id
+        self.gate = _DeepseekV4TopkRouter(config, dtype)
+        self.experts = nn.ModuleList(
+            _DeepseekV4MLP(config.hidden_size, config.moe_intermediate_size, dtype) for _ in range(config.num_experts)
+        )
+        n_shared = config.attrs.get("n_shared_experts", 0)
+        self.shared_experts = (
+            _DeepseekV4MLP(config.hidden_size, config.moe_intermediate_size * n_shared, dtype) if n_shared > 0 else None
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        in_shape = hidden_states.shape
+        flat = hidden_states.reshape(-1, in_shape[-1])  # [n_tok, H]
+        topk_indices, topk_weights = self.gate(flat)
+        topk_weights = topk_weights.to(flat.dtype)
+
+        # Host-built integer indices (never nonzero()/boolean masking on
+        # the device -- see qwen3_moe's own _forward_inram for the real
+        # bug this avoids: an XPU bool-tensor nonzero() silently returns
+        # empty).
+        top_idx_cpu = topk_indices.to("cpu")
+        out = torch.zeros_like(flat)
+        for e in range(len(self.experts)):
+            for slot in range(topk_indices.shape[1]):
+                sel_cpu = top_idx_cpu[:, slot] == e
+                if not bool(sel_cpu.any()):
+                    continue
+                idx = sel_cpu.nonzero(as_tuple=True)[0].to(flat.device)
+                w = topk_weights.index_select(0, idx)[:, slot, None]
+                y = self.experts[e](flat.index_select(0, idx))
+                out.index_add_(0, idx, w * y)
+
+        if self.shared_experts is not None:
+            out = out + self.shared_experts(flat)
+        return out.view(in_shape)
+
+
 class _DeepseekV4DecoderLayer(nn.Module):
     def __init__(self, config: ModelConfig, device, dtype, layer_id: int) -> None:
         super().__init__()
@@ -468,7 +614,12 @@ class _DeepseekV4DecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=eps, dtype=dtype)
         self.self_attn = _DeepseekV4MLA(config, device, dtype, layer_id)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=eps, dtype=dtype)
-        self.mlp = _DeepseekV4MLP(config.hidden_size, config.intermediate_size, dtype)
+        is_dense = (not config.is_moe) or layer_id < int(config.first_k_dense_replace or 0)
+        self.mlp = (
+            _DeepseekV4MLP(config.hidden_size, config.intermediate_size, dtype)
+            if is_dense
+            else _DeepseekV4MoE(config, device, dtype, layer_id)
+        )
 
     def forward(self, hidden_states, positions, table_idx, ctx, batch):
         residual = hidden_states
