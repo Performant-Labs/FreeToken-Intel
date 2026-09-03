@@ -71,6 +71,16 @@ class FunctionCallParser:
     def parse(self, text_chunks: Iterable[str]) -> Iterator[dict]:
         raise NotImplementedError(f"{type(self).__name__}.parse")
 
+    @property
+    def toolcall_opener(self) -> str | None:
+        """This grammar's own unique tool-call-opening marker string, or
+        ``None`` if it has none (issue `semantic-cache-scheduler`, #171):
+        ``freetoken.utils.hf.load_toolcall_anchor_id`` tokenizes this to
+        find the single-token id the engine watches for during decode to
+        set a request's ``toolcall_anchor_len``. The base (passthrough)
+        parser has no grammar at all, so no opener."""
+        return None
+
 
 def _parse_json_object(blob: str) -> dict:
     try:
@@ -102,6 +112,10 @@ class GenericTagParser(FunctionCallParser):
     name: str = "generic"
     open_marker: str = _TAG_OPEN
     close_marker: str = _TAG_CLOSE
+
+    @property
+    def toolcall_opener(self) -> str | None:
+        return self.open_marker
 
     def parse(self, text_chunks: Iterable[str]) -> Iterator[dict]:
         buffer = ""

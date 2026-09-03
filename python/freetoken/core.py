@@ -32,7 +32,23 @@ class Req:
     mm_embeds: object | None = None
     linear_slot_idx: int | None = None
     aborted: bool = False
+    # Set once, at the first sampled tool-call opener token (issue
+    # `semantic-cache-scheduler`, #171 -- engine.py's own decode-loop
+    # detection): the state length just after that token (its index + 1).
+    # A client-side rewrite of the echoed tool call diverges strictly after
+    # this point, so it is the deepest reuse boundary that survives such a
+    # rewrite. GDN: the state is frozen into a ping-pong slot when
+    # device_len reaches it, and donated (committed into the hybrid tree)
+    # at finish.
     toolcall_anchor_len: int | None = None
+    # Hybrid-radix (GDN linear-state) ping-pong snapshot bookkeeping, all
+    # None/0 until a hybrid-GDN model with prefix caching actually assigns
+    # them (issue #172's own scope) -- these are pure bookkeeping fields, no
+    # behavior depends on them yet:
+    mamba_ping_pong: tuple[int, int] | None = None  # 2 donatable track slots under overlap
+    mamba_next_track_idx: int = 0  # which ping-pong slot is the next snapshot dst (0/1)
+    mamba_last_track_seqlen: int | None = None  # chunk-aligned committed len of the last snapshot
+    mamba_restore_src: int | None = None  # on a prefix hit: tree snapshot slot to COW into the live slot
 
     def __post_init__(self) -> None:
         self.device_len = len(self.input_ids) if hasattr(self.input_ids, "__len__") else 0

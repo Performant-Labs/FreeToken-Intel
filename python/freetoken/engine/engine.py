@@ -200,6 +200,26 @@ class Engine:
         # at all" by the time step() needs it at completion.
         self._admitted_cached_len: dict[int, int] = {}
 
+        # Tool-call anchor id (issue `semantic-cache-scheduler`, #171): the
+        # single token id of this model's tool-call-opener grammar marker,
+        # or None (default -- feature off). Engine itself never touches
+        # tokenizers/tool-call parsers (that's the server layer's job, see
+        # server/args.py + server/function_call_parser.py); this is set
+        # post-construction by the server path (server/launch.py's
+        # _build_engine_holder), mirroring the existing
+        # ``engine.frontend_tokenizer = ...`` attach pattern there. When
+        # set, step()'s decode loop watches for it and records
+        # req.toolcall_anchor_len the first time it appears -- the deepest
+        # reuse boundary that survives a client-side rewrite of the echoed
+        # tool call. Actually FREEZING the GDN state at that boundary
+        # (CacheManager.snapshot_toolcall_anchor) needs the model wired to
+        # a real ping-pong-capable LinearStatePool, which qwen3_5_moe does
+        # not do yet (it still uses its own, older, non-ping-pong
+        # _LinearStatePool) -- that wiring is issue #172's own scope, so for
+        # now, only ever gets read by tests and by whatever future PR does
+        # that wiring, not by a live snapshot call yet.
+        self.toolcall_anchor_id: int | None = None
+
         # Attention backend (reference pure-torch GQA under "auto").
         self.attn_backend = create_attention_backend(config.attention_backend, config)
 
@@ -608,6 +628,22 @@ class Engine:
                     self._full_ids[req.table_idx].append(tok)
                 else:
                     self._full_ids[req.table_idx] = list(req.input_ids)
+            # Tool-call anchor detection (issue #171): the FIRST time this
+            # request samples the tool-call-opener token, record the state
+            # length just after it (req.device_len, already bumped above --
+            # matches Req.toolcall_anchor_len's own field docstring: "its
+            # index + 1"). Once only (the `is None` guard): a real tool
+            # call is opened once per turn, and re-arming on a later
+            # occurrence (e.g. inside the arguments JSON, or a second call
+            # in the same turn) would move the anchor to a shallower-reuse
+            # -- but still theoretically valid -- point that isn't what a
+            # client-side rewrite of the FIRST call actually needs.
+            if (
+                self.toolcall_anchor_id is not None
+                and tok == self.toolcall_anchor_id
+                and req.toolcall_anchor_len is None
+            ):
+                req.toolcall_anchor_len = req.device_len
             # The FINAL chunk of a chunked prefill -- the one that just
             # completed the prompt -- is a plain Req (promoted out of the
             # ChunkedReq chain) whose cached_len is > 0 (it resumed from a
