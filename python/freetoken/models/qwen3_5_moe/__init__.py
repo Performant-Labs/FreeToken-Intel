@@ -60,6 +60,20 @@ _MTP_PREFIX = "mtp."
 # _dequantize_gptq_stream is a no-op passthrough for a plain bf16 checkpoint.
 _GPTQ_SUFFIXES = (".qweight", ".qzeros", ".scales", ".g_idx")
 
+# Component suffixes unique to the other three packed quant formats' own
+# per-expert component tensors (block-FP8's weight_scale_inv, issue #152;
+# compressed-tensors INT8's weight_packed/weight_scale/weight_shape, issue
+# #154) -- unlike GPTQ's four, these formats' own ".weight" component is
+# NOT included here (it correctly matches _expert_source_names' plain
+# ".weight"-suffixed routed set already, see is_quant_component's own
+# comment below for why only the suffixes _expert_source_names has no
+# entry for need this bypass).
+_OTHER_QUANT_SUFFIXES = (".weight_scale_inv", ".weight_packed", ".weight_scale", ".weight_shape")
+# MXFP4's own component "suffix" is fused onto the projection name with an
+# underscore, not a dot (e.g. "...gate_up_proj_blocks"), issue #153's real
+# checkpoint spelling -- see _parse_mxfp4_expert_key's own docstring.
+_MXFP4_SUFFIXES = ("_blocks", "_scales")
+
 # The one checkpoint weight that the routed-expert bank fabricator expects to be
 # an *untransposed* [n_experts, hidden, inter] (see qwen3_moe._transpose_down):
 # the down proj of a routed expert. The shared expert's down proj is a *dense*
@@ -343,14 +357,33 @@ def iter_weights(
             else raw_name
         )
         is_gptq_component = bank_only and name.endswith(_GPTQ_SUFFIXES)
-        if is_gptq_component:
-            # A raw GPTQ component's name (e.g. "...gate_proj.qweight") is
-            # never in `routed` (which only ever holds "...gate_proj.weight"
-            # spellings) -- classify by the same ".experts." substring the
-            # no-config fallback below already uses. Real routed-expert keys
-            # always carry ".experts." (the shared expert does not: it is
-            # "mlp.shared_expert.*", a different substring), so this is exact,
-            # not a heuristic weakening.
+        # A raw packed-quant component's name -- ANY of the four formats'
+        # own component suffixes, not just GPTQ's -- is never in `routed`
+        # (:func:`_expert_source_names` only ever generates the plain
+        # ".weight"-suffixed dense spelling, one entry per expert/proj; it
+        # has no idea block-FP8 ships a second ".weight_scale_inv" tensor,
+        # INT8 ships three differently-named ones, or MXFP4 fuses its
+        # component onto the projection name with an underscore instead of
+        # a dot). Found the same way the GPTQ case originally was: a real
+        # (if tiny) non-GPTQ quantized checkpoint's forward silently lost
+        # its scale tensors here, producing incomplete banks with an opaque
+        # "missing" error several layers away from this actual cause. Each
+        # format's own ".weight" component (present for GPTQ-less formats
+        # too) is NOT in this bypass -- it already matches `routed`'s plain
+        # spelling correctly, so only the suffixes `routed` has no entry
+        # for at all need the same ".experts."-substring classification
+        # GPTQ's own components already use.
+        is_quant_component = bank_only and (
+            is_gptq_component
+            or name.endswith(_OTHER_QUANT_SUFFIXES)
+            or name.endswith(_MXFP4_SUFFIXES)
+        )
+        if is_quant_component:
+            # Real routed-expert keys always carry ".experts." (the shared
+            # expert does not: it is "mlp.shared_expert.*", a different
+            # substring), so this is exact, not a heuristic weakening --
+            # the same reasoning the no-config fallback below already
+            # relies on.
             expert = ".experts." in name
         elif routed is not None:
             expert = name in routed
@@ -363,11 +396,16 @@ def iter_weights(
             continue
         if not include_non_moe and not expert:
             continue
-        # Never dtype-cast a raw GPTQ component: qweight/qzeros/g_idx are
-        # int32 and scales carries its own real dtype -- casting any of them
-        # to a requested bf16/fp16 dense dtype would silently corrupt the
-        # packed bits, not "convert" them.
-        if dtype is not None and not is_gptq_component and tensor.dtype != dtype:
+        # Never dtype-cast a raw packed-quant component: GPTQ's
+        # qweight/qzeros/g_idx and INT8's weight_packed/weight_shape are
+        # int32/int64, MXFP4's blocks/scales are uint8 -- casting any of
+        # these to a requested bf16/fp16 dense dtype would silently
+        # corrupt the packed bits, not "convert" them (a real numeric
+        # dtype like FP8's own weight/weight_scale_inv would merely be
+        # reinterpreted, not corrupted, by such a cast, but is still
+        # excluded here for the same "never touch a packed component's
+        # dtype before the format-specific streamer parses it" discipline).
+        if dtype is not None and not is_quant_component and tensor.dtype != dtype:
             tensor = tensor.to(dtype)
         # Routed experts stream to host (offload banks); the rest (dense: the
         # shared expert, linear-attention weights, embeddings, norms, lm_head)
