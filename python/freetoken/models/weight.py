@@ -107,9 +107,24 @@ def iter_safetensors(model_path: str, device: torch.device | str = "cpu"):
             with safe_open(path, framework="pt", device="cpu") as f:
                 for name in f.keys():
                     map_[name] = path
+    # Group by shard file and open each shard exactly once, yielding every one
+    # of its tensors before moving on -- not one open (== one mmap of the
+    # whole shard) per tensor. Real bug, not a hypothetical one: found via
+    # issue #138's real-checkpoint validation, where a GPTQ MoE checkpoint's
+    # per-expert layout puts thousands of tensors in one shard (10,240 in one
+    # ~1.4GB shard of the real Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 checkpoint) --
+    # reopening (mmap-ing) that same file once per tensor exhausted a 27GB
+    # virtual-address ulimit well before physical RAM was ever the
+    # constraint. A checkpoint with only a handful of tensors per shard (the
+    # CPU test suite's tiny fixtures) never has enough tensors-per-shard for
+    # this to matter, which is why it went unnoticed until real scale.
+    by_path: Dict[str, list] = {}
     for name, path in map_.items():
+        by_path.setdefault(path, []).append(name)
+    for path, names in by_path.items():
         with safe_open(path, framework="pt", device=str(device)) as f:
-            yield name, f.get_tensor(name)
+            for name in names:
+                yield name, f.get_tensor(name)
 
 
 def load_weight(
