@@ -441,22 +441,56 @@ def _place_fp8_expert_weights(model, gate_up_banks, down_banks, device) -> None:
         )
 
 
+def _place_int8_expert_weights(model, gate_up_banks, down_banks, device) -> None:
+    """Build fully XPU-resident compressed-tensors INT8 expert modules from
+    packed banks (issue `moe-fused-int8`, #182, part of the `quant-xpu`
+    epic, #10). The INT8 sibling of :func:`_place_mxfp4_expert_weights` /
+    :func:`_place_fp8_expert_weights` -- see their docstrings for the shared
+    rationale."""
+    import torch.nn as nn
+
+    from freetoken.models.qwen3_5_moe import _Qwen35Int8Expert
+
+    intermediate = int(getattr(model.config, "moe_intermediate_size", 0))
+    for layer_id in _moe_layers(model.config):
+        moe = getattr(getattr(model, "layers", [None] * (layer_id + 1))[layer_id], "mlp", None)
+        if getattr(moe, "experts", None) is None:
+            continue
+        gu_bank = gate_up_banks[layer_id]
+        dn_bank = down_banks[layer_id]
+        num_experts = gu_bank.weight_packed.shape[0]
+        moe.experts = nn.ModuleList(
+            _Qwen35Int8Expert(
+                gu_bank.weight_packed[e].to(device),
+                gu_bank.weight_scale[e].to(device),
+                dn_bank.weight_packed[e].to(device),
+                dn_bank.weight_scale[e].to(device),
+                intermediate=intermediate,
+                k_gate_up=gu_bank.k,
+                k_down=dn_bank.k,
+            )
+            for e in range(num_experts)
+        )
+
+
 def _place_expert_weights_any(model, gate_up_banks, down_banks, device) -> None:
     """Dispatch the in-VRAM (``moe_backend="fused"``) expert placement by
     bank type: a plain bf16 stacked tensor goes through
     :func:`_place_expert_weights` unchanged (every existing bf16 test);
-    a packed :class:`~freetoken.models.weight.MxfpExpertBank` (issue #180)
-    or :class:`~freetoken.models.weight.Fp8BlockExpertBank` (issue #181)
-    goes through its own placement function instead. INT8 (#182) is the
-    remaining sibling issue that adds its own branch here.
+    a packed :class:`~freetoken.models.weight.MxfpExpertBank` (issue #180),
+    :class:`~freetoken.models.weight.Fp8BlockExpertBank` (issue #181), or
+    :class:`~freetoken.models.weight.Int8ExpertBank` (issue #182) goes
+    through its own placement function instead.
     """
-    from freetoken.models.weight import Fp8BlockExpertBank, MxfpExpertBank
+    from freetoken.models.weight import Fp8BlockExpertBank, Int8ExpertBank, MxfpExpertBank
 
     first = next((b for b in gate_up_banks if b is not None), None)
     if isinstance(first, MxfpExpertBank):
         _place_mxfp4_expert_weights(model, gate_up_banks, down_banks, device)
     elif isinstance(first, Fp8BlockExpertBank):
         _place_fp8_expert_weights(model, gate_up_banks, down_banks, device)
+    elif isinstance(first, Int8ExpertBank):
+        _place_int8_expert_weights(model, gate_up_banks, down_banks, device)
     else:
         _place_expert_weights(model, gate_up_banks, down_banks)
 
