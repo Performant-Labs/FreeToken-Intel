@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
+    from freetoken.core import Req
     from freetoken.kvcache.base import BaseCacheHandle, InsertResult, MatchResult
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
 
 
 class CacheManager:
@@ -75,3 +77,38 @@ class CacheManager:
     @property
     def evictable_size(self) -> int:
         return self.prefix_cache.size_info.evictable_size
+
+    def snapshot_toolcall_anchor(self, reqs: "list[Req]", pool: "LinearStatePool") -> None:
+        """Freeze the live GDN state of any request that has just reached
+        its tool-call anchor into an idle ping-pong track slot (issue
+        `semantic-cache-scheduler`, #171).
+
+        Ported from the real upstream ``CacheManager.snapshot_toolcall_anchor``
+        (read directly, not guessed), with one deliberate simplification:
+        upstream's own guard also required ``req.cached_len == anchor_len``
+        to land the copy at the right point in its overlapped/async CUDA
+        stream schedule. This engine is fully synchronous (no stream
+        overlap to order against) -- by the time this is called (after the
+        step's forward pass has already written this step's state), the
+        pool already holds the anchor-token state, so that guard is
+        replaced by the plain ``is None`` bookkeeping checks below, which
+        are the only ones still needed to make the snapshot idempotent
+        (once per request) and only for requests actually opted into
+        ping-pong tracking (``mamba_ping_pong`` set -- issue #172's own
+        scope, not yet done by anything in the live engine today).
+        """
+        from freetoken.utils import align_down
+
+        for req in reqs:
+            anchor = req.toolcall_anchor_len
+            if (
+                anchor is None
+                or req.mamba_ping_pong is None
+                or req.mamba_last_track_seqlen is not None
+                or align_down(anchor, self.prefix_cache.page_size) != anchor
+            ):
+                continue
+            dst = req.mamba_ping_pong[req.mamba_next_track_idx]
+            pool.copy_from(req.linear_slot_idx, dst)
+            req.mamba_last_track_seqlen = anchor
+            req.mamba_next_track_idx = 1 - req.mamba_next_track_idx

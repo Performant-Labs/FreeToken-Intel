@@ -347,6 +347,22 @@ def _build_engine_holder(server_args):
         # encode / decode path resolves it directly. Loading the tokenizer is
         # torch-free (AutoTokenizer) and happens once, here, at first request.
         engine.frontend_tokenizer = _frontend_tokenizer(server_args)
+        # Tool-call anchor id (issue `semantic-cache-scheduler`, #171): the
+        # single token id of this model's resolved tool-call-opener grammar
+        # marker, so the engine's decode loop can watch for it and set
+        # req.toolcall_anchor_len the first time a request samples it.
+        # server_args.tool_call_parser is already resolved away from "auto"
+        # by parse_args (see _infer_tool_call_parser) by the time this
+        # closure runs. None (no opener, or an unspellable/multi-token one)
+        # is a legitimate, silent no-op -- the anchor feature simply never
+        # arms for that model/grammar.
+        from freetoken.server.function_call_parser import get_parser
+        from freetoken.utils.hf import load_toolcall_anchor_id
+
+        tool_parser = get_parser(server_args.tool_call_parser)
+        engine.toolcall_anchor_id = load_toolcall_anchor_id(
+            engine.frontend_tokenizer.tokenizer, tool_parser.toolcall_opener
+        )
         engine_ref["engine"] = engine
         return engine
 
