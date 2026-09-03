@@ -697,6 +697,7 @@ class SlotWeightAccessor:
         self.quant_format = getattr(cache, "quant_format", "bf16")
         self._intermediate = intermediate
         self._dtype = dtype
+        self._is_xpu = bool(getattr(cache, "is_xpu", False))
         self._cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         if self.quant_format == "gptq_int4":
             self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
@@ -761,9 +762,58 @@ class SlotWeightAccessor:
         else:
             self._gu, self._dn = cache.bank_views()
 
+    def get_gptq_packed(
+        self, s_i: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Raw packed ``(qweight_gate_up, qzeros_gate_up, scales_gate_up,
+        qweight_down, qzeros_down, scales_down, group_size)`` views for slot
+        ``s_i`` -- ``gptq_int4`` only, and never dequantized (unlike
+        :meth:`get`). For the native fused-GEMM forward path (issue
+        `moe-quant-banks-native`, #139): :func:`freetoken.kernel.triton.
+        gptq_fused_linear.fused_gptq_expert_forward` consumes these directly,
+        skipping the dense-weight materialization :meth:`get` performs.
+        """
+        if self.quant_format != "gptq_int4":
+            raise ValueError(f"get_gptq_packed is gptq_int4-only, got quant_format={self.quant_format!r}")
+        b = self._banks
+        return (
+            b["qweight_gate_up"][s_i], b["qzeros_gate_up"][s_i], b["scales_gate_up"][s_i],
+            b["qweight_down"][s_i], b["qzeros_down"][s_i], b["scales_down"][s_i],
+            self._group_size,
+        )
+
+    def expert_forward(self, s_i: int, x: torch.Tensor) -> torch.Tensor:
+        """One MoE expert's SwiGLU forward (``down(silu(gate(x)) * up(x))``)
+        for slot ``s_i`` against input ``x``. Previously each offload
+        forward call site (``qwen3_moe``/``qwen3_5_moe``) ran this same
+        formula itself, against :meth:`get`'s dense output, via a small
+        ``_expert_compute`` helper duplicated in each model file; centralized
+        here instead so it can also dispatch to the native fused-GEMM path
+        (issue `moe-quant-banks-native`, #139) when that is expected to win:
+        ``gptq_int4``, real XPU hardware, and ``x``'s row count at or below
+        the measured crossover (see :func:`freetoken.kernel.triton.
+        gptq_fused_linear.prefer_fused_over_dequant`). Every other case
+        falls back to dequantizing via :meth:`get` first, the same math the
+        old per-model helpers ran.
+        """
+        if self.quant_format == "gptq_int4" and self._is_xpu:
+            from freetoken.kernel.triton.gptq_fused_linear import (
+                fused_gptq_expert_forward,
+                prefer_fused_over_dequant,
+            )
+
+            if prefer_fused_over_dequant(x.shape[0]):
+                qw_gu, qz_gu, s_gu, qw_dn, qz_dn, s_dn, group_size = self.get_gptq_packed(s_i)
+                return fused_gptq_expert_forward(
+                    x, qw_gu, qz_gu, s_gu, qw_dn, qz_dn, s_dn,
+                    group_size=group_size, intermediate=self._intermediate, out_dtype=self._dtype,
+                )
+        gate_w, up_w, down_w = self.get(s_i)
+        return (torch.nn.functional.silu(x @ gate_w.t()) * (x @ up_w.t())) @ down_w.t()
+
     def get(self, s_i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(gate_w, up_w, down_w)`` for slot ``s_i``, in ``[out, in]``
-        weight orientation (matching ``nn.Linear.weight`` / ``_expert_compute``'s
+        weight orientation (matching ``nn.Linear.weight`` / :meth:`expert_forward`'s
         expected shape) -- gate/up are ``[I, H]``, down is ``[H, I]``."""
         if self.quant_format == "bf16":
             i = self._intermediate
