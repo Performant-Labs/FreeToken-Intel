@@ -559,6 +559,7 @@ def _ensure_torch() -> None:
         "_Qwen35Expert",
         "_Qwen35MxfpExpert",
         "_Qwen35Fp8Expert",
+        "_Qwen35Int8Expert",
         "_Qwen35DecoderLayer",
         "Qwen3_5MoEForCausalLM",
     )
@@ -1773,6 +1774,59 @@ class _Qwen35Fp8Expert:
             self.weight_down,
             self.scale_down,
             intermediate=self.intermediate,
+            out_dtype=x.dtype,
+        )
+
+
+class _Qwen35Int8Expert:
+    """A single compressed-tensors pack-quantized INT8 MoE expert, fully
+    XPU-resident (issue `moe-fused-int8`, #182, part of the `quant-xpu`
+    epic, #10).
+
+    The INT8 sibling of :class:`_Qwen35MxfpExpert` / :class:`_Qwen35Fp8Expert`:
+    holds the checkpoint's packed ``weight_packed``/``weight_scale`` (the
+    same per-expert tensors :class:`freetoken.models.weight.Int8ExpertBank`
+    streams for the offload backend, moved onto the device instead of
+    staying on host) and never materializes a dequantized weight --
+    :func:`freetoken.kernel.triton.fused_int8_linear.fused_int8_expert_forward`
+    runs the native packed GEMM directly, the same kernel the offload
+    backend's dequant-at-compute path (#163) uses. ``k_gate_up``/``k_down``
+    (the real logical in-features per projection, an architecture constant
+    shared by every expert -- see :class:`Int8ExpertBank`'s own docstring)
+    are plain ints, not tensors, so no buffer is needed for them.
+    """
+
+    def __init__(
+        self,
+        weight_packed_gate_up: torch.Tensor,
+        weight_scale_gate_up: torch.Tensor,
+        weight_packed_down: torch.Tensor,
+        weight_scale_down: torch.Tensor,
+        intermediate: int,
+        k_gate_up: int,
+        k_down: int,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("weight_packed_gate_up", weight_packed_gate_up, persistent=False)
+        self.register_buffer("weight_scale_gate_up", weight_scale_gate_up, persistent=False)
+        self.register_buffer("weight_packed_down", weight_packed_down, persistent=False)
+        self.register_buffer("weight_scale_down", weight_scale_down, persistent=False)
+        self.intermediate = intermediate
+        self.k_gate_up = k_gate_up
+        self.k_down = k_down
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.fused_int8_linear import fused_int8_expert_forward
+
+        return fused_int8_expert_forward(
+            x,
+            self.weight_packed_gate_up,
+            self.weight_scale_gate_up,
+            self.weight_packed_down,
+            self.weight_scale_down,
+            intermediate=self.intermediate,
+            k_gate_up=self.k_gate_up,
+            k_down=self.k_down,
             out_dtype=x.dtype,
         )
 
