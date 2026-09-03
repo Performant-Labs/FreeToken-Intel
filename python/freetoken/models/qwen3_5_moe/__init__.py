@@ -558,6 +558,7 @@ def _ensure_torch() -> None:
         "_Qwen35MoE",
         "_Qwen35Expert",
         "_Qwen35MxfpExpert",
+        "_Qwen35Fp8Expert",
         "_Qwen35DecoderLayer",
         "Qwen3_5MoEForCausalLM",
     )
@@ -1728,6 +1729,49 @@ class _Qwen35MxfpExpert:
             self.scales_gate_up,
             self.blocks_down,
             self.scales_down,
+            intermediate=self.intermediate,
+            out_dtype=x.dtype,
+        )
+
+
+class _Qwen35Fp8Expert:
+    """A single block-FP8-quantized MoE expert, fully XPU-resident (issue
+    `moe-fused-fp8`, #181, part of the `quant-xpu` epic, #10).
+
+    The block-FP8 sibling of :class:`_Qwen35MxfpExpert`: holds the
+    checkpoint's packed ``weight``/``weight_scale_inv`` (the same per-expert
+    tensors :class:`freetoken.models.weight.Fp8BlockExpertBank` streams for
+    the offload backend, moved onto the device instead of staying on host)
+    and never materializes a dequantized weight --
+    :func:`freetoken.kernel.triton.fused_fp8_linear.fused_fp8_expert_forward`
+    runs the native packed GEMM directly, the same kernel the offload
+    backend's dequant-at-compute path (#163) uses.
+    """
+
+    def __init__(
+        self,
+        weight_gate_up: torch.Tensor,
+        scale_gate_up: torch.Tensor,
+        weight_down: torch.Tensor,
+        scale_down: torch.Tensor,
+        intermediate: int,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("weight_gate_up", weight_gate_up, persistent=False)
+        self.register_buffer("scale_gate_up", scale_gate_up, persistent=False)
+        self.register_buffer("weight_down", weight_down, persistent=False)
+        self.register_buffer("scale_down", scale_down, persistent=False)
+        self.intermediate = intermediate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.fused_fp8_linear import fused_fp8_expert_forward
+
+        return fused_fp8_expert_forward(
+            x,
+            self.weight_gate_up,
+            self.scale_gate_up,
+            self.weight_down,
+            self.scale_down,
             intermediate=self.intermediate,
             out_dtype=x.dtype,
         )
