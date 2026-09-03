@@ -68,6 +68,16 @@ logger = init_logger(__name__)
 # in OffloadMoeCache.extra_metadata instead (see set_extra_metadata /
 # get_extra_metadata below): a plain per-layer side table the compute step
 # (issue #137) reads directly, never routed through the LRU slot machinery.
+#
+# "int8_channel" (issue moe-quant-banks-int8, #154): a per-channel-INT8
+# checkpoint packs each projection into two per-expert tensors -- an int8
+# weight plus one fp scale per output-channel row (see
+# freetoken.kernel.triton.int8_linear.dequantize_int8_channel) -- the
+# simplest of the three formats in #140 (a single scale per row, no group/
+# block structure like gptq_int4's g_idx/group_size). Unlike gptq_int4 there
+# is no shared per-projection side tensor at all: the scale is already one
+# row per expert ([E, N]), so all four banks below fit the plain [E, ...]
+# per-expert-row contract with nothing left over for extra_metadata.
 _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "bf16": ("gate_up", "down"),
     "gptq_int4": (
@@ -92,6 +102,12 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
         "scales_gate_up",
         "blocks_down",
         "scales_down",
+    ),
+    "int8_channel": (
+        "weight_gate_up",
+        "scale_gate_up",
+        "weight_down",
+        "scale_down",
     ),
 }
 
@@ -625,11 +641,11 @@ class SlotWeightAccessor:
 
     For ``"bf16"`` this is a thin, zero-cost wrapper around the existing
     plain-tensor indexing (behavior is unchanged from before this class
-    existed). For ``"gptq_int4"`` each distinct slot's packed
-    qweight/qzeros/scales are dequantized **at most once per instance** (a
-    `_forward_offload_core` call handles one MoE layer for one step) -- a
-    decode step's working set is typically small (<= num_experts active
-    slots), so this is a bounded, cheap cost per step, never the whole
+    existed). For ``"gptq_int4"`` (and, since issue #154, ``"int8_channel"``)
+    each distinct slot's packed weights are dequantized **at most once per
+    instance** (a `_forward_offload_core` call handles one MoE layer for one
+    step) -- a decode step's working set is typically small (<= num_experts
+    active slots), so this is a bounded, cheap cost per step, never the whole
     checkpoint at once (the RAM-saving point of #134's whole epic).
 
     ``dtype`` is the dequant output dtype -- must match the activation
@@ -642,6 +658,8 @@ class SlotWeightAccessor:
     expert weights that then crashed matmul-ing against the bf16
     activations everywhere else in the model -- caught as a real forward
     pass failure against the real checkpoint, not by any synthetic test).
+    ``int8_channel`` dequantizes to ``self._dtype`` for exactly the same
+    reason, not to the checkpoint's own scale dtype.
     """
 
     def __init__(self, cache: "OffloadMoeCache", intermediate: int, dtype: torch.dtype) -> None:
@@ -674,7 +692,7 @@ class SlotWeightAccessor:
                     "gptq_int4 forward pass runs (SlotWeightAccessor refuses to guess)"
                 )
             self._group_size = int(group_size)
-        elif self.quant_format == "mxfp4":
+        elif self.quant_format in ("mxfp4", "int8_channel"):
             self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
         else:
             self._gu, self._dn = cache.bank_views()
@@ -689,6 +707,19 @@ class SlotWeightAccessor:
         cached = self._cache.get(s_i)
         if cached is not None:
             return cached
+        if self.quant_format == "int8_channel":
+            from freetoken.kernel.triton.int8_linear import dequantize_int8_channel as _dequant
+
+            b = self._banks
+            # weight/scale are already in [out, in] / [out] orientation (per
+            # output channel = per row) -- no transpose needed, unlike GPTQ's
+            # dequant which returns [in, out] and must be .T'd.
+            gu_dense = _dequant(b["weight_gate_up"][s_i], b["scale_gate_up"][s_i], out_dtype=self._dtype)
+            dn_dense = _dequant(b["weight_down"][s_i], b["scale_down"][s_i], out_dtype=self._dtype)
+            i = self._intermediate
+            result = (gu_dense[0:i], gu_dense[i : 2 * i], dn_dense)
+            self._cache[s_i] = result
+            return result
         if self.quant_format == "mxfp4":
             from freetoken.kernel.triton.mxfp4_linear import dequantize_mxfp4_blocks
 
