@@ -1329,13 +1329,17 @@ class _Qwen35MoE:
         # not a silent gap -- gptq_int4 previously would have crashed loudly
         # here (KeyError) rather than produced wrong numbers, and now simply
         # never reaches that code path.
+        # int8_channel (issue moe-quant-banks-int8, #154) hits the exact same
+        # bank-name mismatch as gptq_int4 above ("weight_gate_up"/"scale_..."
+        # instead of "gate_up"/"down") -- excluded for the same reason, not a
+        # separate decision.
         cache_quant_format = getattr(getattr(model, "moe_cache", None), "quant_format", "bf16")
         # The fetch fraction f (share of misses PCIe-fetched, the rest on CPU).
         # Read through ctx.model (the loader stores it there); a test-harness
         # Context that sets none falls back to the block-local 0.0 (pure offload),
         # which is the correct no-split default.
         fetch_frac = float(getattr(model, "moe_hybrid_fetch_fraction", 0.0) or 0.0)
-        if cache_quant_format == "gptq_int4":
+        if cache_quant_format in ("gptq_int4", "int8_channel"):
             fetch_frac = 1.0
         if fetch_frac <= 0.0:
             # No usable profile -> every miss rides PCIe (pure offload).
