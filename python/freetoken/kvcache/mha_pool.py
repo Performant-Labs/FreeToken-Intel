@@ -89,11 +89,42 @@ class MHAKVCache(BaseKVCachePool):
         self._free_slots.extend(slots)
         self._free_slots.sort()
 
+    def detach(self, req_id: int) -> list:
+        """Release ``req_id``'s own allocation bookkeeping WITHOUT returning
+        its slots to the free list (issue `kvcache`, #12): once a finished
+        request's slots are committed into the prefix-cache tree, ownership
+        transfers to the tree -- the same table_idx/``req_id`` must be
+        allocatable again for a LATER, unrelated request reusing that
+        scheduler row, but the detached slots stay live (backing the tree's
+        cached data) until the tree's own LRU eviction returns them via
+        :meth:`free_slots`, not when this request's row is recycled. Returns
+        the detached slot list (the caller already has its own copy, from
+        whatever it fed to ``CacheManager.commit`` -- returned here mainly
+        so a caller without one can still get it, and for introspection)."""
+        return self._alloc.pop(req_id, [])
+
     def is_allocated(self, req_id: int) -> bool:
         return req_id in self._alloc
 
     def allocated_slots(self, req_id: int) -> list:
         return list(self._alloc.get(req_id, ()))
+
+    def free_slots(self, slots: torch.Tensor | list[int]) -> None:
+        """Return raw slot indices to the free list, not tied to any
+        ``req_id``'s own allocation (issue `kvcache`, #12): a radix-cache
+        eviction (:meth:`freetoken.kvcache.radix_cache.RadixPrefixCache.evict`)
+        frees individual pool slots that were never owned by a single
+        ``allocate()``/``free()`` pair -- once a request's slots are
+        inserted into the prefix-cache tree, ownership transfers from this
+        pool's per-request bookkeeping to the tree, and only the tree's own
+        LRU eviction (not a request finishing) returns them here.
+        """
+        if isinstance(slots, torch.Tensor):
+            slots = slots.tolist()
+        if not slots:
+            return
+        self._free_slots.extend(int(s) for s in slots)
+        self._free_slots.sort()
 
 
 __all__ = ["MHAKVCache"]
