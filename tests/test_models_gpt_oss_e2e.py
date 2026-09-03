@@ -81,9 +81,18 @@ def _write_tiny_checkpoint(tmp_path) -> str:
 
     config = parse_config(type("Hf", (), {"to_dict": lambda self: TINY_CONFIG})())
     state = {}
+    # Fixed seed: an unseeded draw occasionally lands two logits close
+    # enough to tie that multi-threaded CPU BLAS's non-associative
+    # reduction order flips the greedy argmax between runs on the exact
+    # same weights (confirmed directly: forcing torch.set_num_threads(1)
+    # made an unseeded failure reproduce identically every time) -- a real
+    # floating-point characteristic of tiny random-weight models, not a
+    # logic bug, but this test's own job is to prove OUR forward pass is
+    # deterministic, so pin the draw to weights that don't land on a tie.
+    gen = torch.Generator().manual_seed(0)
 
     def add(name, shape):
-        state[name] = torch.randn(shape, dtype=torch.float32) * 0.02
+        state[name] = torch.randn(shape, generator=gen, dtype=torch.float32) * 0.02
 
     heads, kv, head_dim = config.num_attention_heads, config.num_key_value_heads, config.head_dim
     moe_inter, n_experts = config.moe_intermediate_size, config.num_experts
