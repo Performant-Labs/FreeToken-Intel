@@ -36,7 +36,9 @@ def _pack_nibbles(codes: list[int]) -> int:
 def _gptq_projection(k: int, n: int, group_size: int, *, weight_code: int, zero_code: int, scale: float):
     """A small, real (not random-garbage) GPTQ-packed projection: every row
     uses the same weight code / zero-point / scale, so the dequantized value
-    is a known constant: ``scale * (weight_code - (zero_code + 1))``."""
+    is a known constant: ``scale * (weight_code - zero_code)`` (this
+    checkpoint format's zero-point is stored directly, no +1 correction --
+    see issue #147)."""
     assert k % 8 == 0 and n % 8 == 0 and k % group_size == 0
     n_groups = k // group_size
     qweight = torch.tensor([[_pack_nibbles([weight_code] * 8)] * n for _ in range(k // 8)], dtype=torch.int32)
@@ -90,8 +92,8 @@ def test_packed_bank_shapes_match_the_documented_contract():
 def test_packed_bank_round_trips_to_the_known_fixture_value():
     config = SimpleNamespace(num_layers=1, num_experts=2)
     k, n, group_size = 16, 8, 8
-    # weight_code=5, zero_code=7 (+1 correction -> 8), scale=0.5 -> 0.5*(5-8) = -1.5.
-    kwargs = dict(k=k, n=n, group_size=group_size, weight_code=5, zero_code=7, scale=0.5)
+    # weight_code=5, zero_code=8, scale=0.5 -> 0.5*(5-8) = -1.5.
+    kwargs = dict(k=k, n=n, group_size=group_size, weight_code=5, zero_code=8, scale=0.5)
     stream = _expert_stream(config, gate_kwargs=kwargs, up_kwargs=kwargs, down_kwargs=kwargs)
 
     gate_up_banks, down_banks = stream_moe_expert_sources_gptq(stream, config)
@@ -117,8 +119,8 @@ def test_gate_up_concatenation_preserves_two_independently_quantized_halves():
     two halves must dequantize back to their own distinct source values."""
     config = SimpleNamespace(num_layers=1, num_experts=1)
     k, n, group_size = 16, 8, 8
-    gate_kwargs = dict(k=k, n=n, group_size=group_size, weight_code=3, zero_code=8, scale=0.25)  # -> 0.25*(3-9) = -1.5
-    up_kwargs = dict(k=k, n=n, group_size=group_size, weight_code=10, zero_code=6, scale=1.0)  # -> 1.0*(10-7) = 3.0
+    gate_kwargs = dict(k=k, n=n, group_size=group_size, weight_code=3, zero_code=9, scale=0.25)  # -> 0.25*(3-9) = -1.5
+    up_kwargs = dict(k=k, n=n, group_size=group_size, weight_code=10, zero_code=7, scale=1.0)  # -> 1.0*(10-7) = 3.0
     down_kwargs = dict(k=k, n=n, group_size=group_size, weight_code=5, zero_code=7, scale=0.5)
     stream = _expert_stream(config, gate_kwargs=gate_kwargs, up_kwargs=up_kwargs, down_kwargs=down_kwargs)
 

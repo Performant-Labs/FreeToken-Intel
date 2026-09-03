@@ -42,7 +42,9 @@ def _pack_nibbles(codes: list[int]) -> int:
 
 def _gptq_pack(k: int, n: int, *, code: int, zero_code: int, scale: float, group_size: int = GROUP):
     """A trivial (constant-valued, real-shaped) GPTQ-packed projection:
-    every element decodes to ``scale * (code - (zero_code + 1))``. Includes
+    every element decodes to ``scale * (code - zero_code)`` (this checkpoint
+    format's zero-point is stored directly, no +1 correction -- issue #147).
+    Includes
     an explicit ``g_idx`` (sequential groups) -- the real checkpoint ships
     one per expert, even though desc_act=False means it is reconstructible
     (see gptq_linear.dequantize_gptq_int4_sequential_groups, #137)."""
