@@ -24,10 +24,23 @@ out_features, packing factor ``P = 32 // bits`` int32 sub-values per word):
     g_idx    int32 [K]                       -- g_idx[k] = k // group_size (desc_act=False)
 
 Dequant: ``weight[k, n] = scales[g_idx[k], n] * (unpack(qweight)[k, n] -
-(unpack(qzeros)[g_idx[k], n] + 1))`` -- the ``+ 1`` on the zero-point is a
-real, well-known AutoGPTQ convention (not a bug to "fix"): the packer
-stores ``zero_point - 1`` because the unsigned 4-bit code 0 is reserved,
-so every reader must undo it.
+unpack(qzeros)[g_idx[k], n])``.
+
+Zero-point convention (issue #147): legacy AutoGPTQ v1 packers store
+``zero_point - 1`` (because the unsigned 4-bit code 0 was reserved), which
+would need a ``+ 1`` correction on read. This port originally assumed that
+convention from documentation, without checking it against real checkpoint
+bytes -- that was wrong. The real checkpoint this port targets
+(``Qwen/Qwen3.5-35B-A3B-GPTQ-Int4``, ``sym: true``, produced by GPTQModel,
+identifiable by its ``quantization_config``'s ``"dynamic"`` key that legacy
+AutoGPTQ configs never have) stores the true zero-point directly with no
+offset: every routed expert's ``qzeros`` for a symmetric 4-bit tensor
+unpacks to a uniform nibble value of ``8`` (the exact symmetric midpoint for
+a 4-bit code), and dequantizing with a blind ``+ 1`` shifts every weight by
+one full zero-point step, verified as a real, non-negligible systematic
+bias (dequantized weight mean of ``-0.0018`` vs. an expected/measured
+~``0`` without the offset, ~27% of the weight's own std) -- this was the
+root cause of incoherent end-to-end generation output. No ``+ 1`` on read.
 """
 from __future__ import annotations
 
@@ -89,7 +102,7 @@ def dequantize_gptq_int4(
     weight = _unpack_int32(qweight, bits=_BITS, dim=0).reshape(k, n)
     # qzeros: [G, N//8] -> unpack dim 1 (8 output channels packed per int32 word) -> [G, N//8, 8] -> [G, N].
     zeros = _unpack_int32(qzeros, bits=_BITS, dim=1).reshape(qzeros.shape[0], n)
-    zeros = zeros.to(torch.int32) + 1  # AutoGPTQ's stored-minus-one convention
+    zeros = zeros.to(torch.int32)  # this checkpoint format stores the true zero-point directly (see module docstring)
 
     g_idx = g_idx.long()
     per_row_scale = scales[g_idx]  # [K, N]

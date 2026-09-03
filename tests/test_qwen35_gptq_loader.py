@@ -24,17 +24,22 @@ def _pack_nibbles(codes: list[int]) -> int:
     word = 0
     for i, c in enumerate(codes):
         word |= c << (4 * i)
+    # Fold a word with bit 31 set (e.g. every nibble = 8) to its two's-
+    # complement negative value -- torch.tensor(..., dtype=torch.int32)
+    # rejects a Python int >= 2**31 as an overflow otherwise.
+    if word >= 1 << 31:
+        word -= 1 << 32
     return word
 
 
 def _fake_gptq_projection(k: int, n: int, group_size: int):
     """A small, real (not random-garbage) GPTQ-packed projection: constant
-    weight code 5, zero-point 8, scale 0.5 -- every dequantized element is
-    0.5 * (5 - 8) = -1.5."""
+    weight code 5, zero-point 8 (stored directly, no +1 correction -- issue
+    #147), scale 0.5 -- every dequantized element is 0.5 * (5 - 8) = -1.5."""
     assert k % 8 == 0 and n % 8 == 0 and k % group_size == 0
     n_groups = k // group_size
     qweight = torch.tensor([[_pack_nibbles([5] * 8)] * n for _ in range(k // 8)], dtype=torch.int32)
-    qzeros = torch.tensor([[_pack_nibbles([7] * 8)] * (n // 8) for _ in range(n_groups)], dtype=torch.int32)
+    qzeros = torch.tensor([[_pack_nibbles([8] * 8)] * (n // 8) for _ in range(n_groups)], dtype=torch.int32)
     scales = torch.full((n_groups, n), 0.5)
     g_idx = torch.tensor([i // group_size for i in range(k)], dtype=torch.int32)
     return qweight, qzeros, scales, g_idx
