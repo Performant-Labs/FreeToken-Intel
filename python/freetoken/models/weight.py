@@ -415,17 +415,35 @@ def stream_moe_expert_sources(
             seen[bank_name].add(layer)
             _maybe_finalize_layer(banks, per_expert, config, layer)
 
+    # Leading dense layers (``first_k_dense_replace``, e.g. GLM-4.7's own
+    # layer 0) never carry expert tensors at all -- the expected layer set
+    # is [first_k_dense_replace, num_layers), not [0, num_layers). Every
+    # model this streamer served before GLM-4.7 (issue #22) had
+    # first_k_dense_replace == 0, so this degenerates to the prior
+    # behavior for them.
+    expected_layers = set(range(int(getattr(config, "first_k_dense_replace", 0) or 0), config.num_layers))
     missing = {
-        name: sorted(set(range(config.num_layers)) - seen)
+        name: sorted(expected_layers - seen)
         for name, seen in seen.items()
-        if seen != set(range(config.num_layers))
+        if seen != expected_layers
     }
     if missing:
         raise ValueError(f"Missing MoE expert source layers: {missing}")
     _finalize_per_expert_banks(banks, per_expert, config)
+    # Compact to MoE-layer order (drop the leading first_k_dense_replace
+    # entries, which are never finalized -- a dense layer has no expert
+    # tensors at all). This is the pre-existing, real contract the offload
+    # cache attachment already documents and relies on (loader.py's
+    # _attach_offload_cache: "banks are indexed by MoE-layer order,
+    # matching the cache's 0-based MoE-layer ids") -- every model before
+    # GLM-4.7 (issue #22) had first_k_dense_replace == 0, so this was
+    # never actually exercised as a real compaction before. loader.py's
+    # in-VRAM placement functions (_place_expert_weights et al) are fixed
+    # to match: they now index by MoE-layer position, not absolute layer id.
+    first_dense = int(getattr(config, "first_k_dense_replace", 0) or 0)
     return (
-        [bank.tensor for bank in banks["gate_up"]],
-        [bank.tensor for bank in banks["down"]],
+        [bank.tensor for bank in banks["gate_up"][first_dense:]],
+        [bank.tensor for bank in banks["down"][first_dense:]],
     )
 
 

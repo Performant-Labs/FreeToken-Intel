@@ -353,15 +353,19 @@ def _place_expert_weights(model, gate_up_banks, down_banks) -> None:
     # on dim 1 -- the layout the repacker / dummy fabricator both produce). The
     # down bank is [num_experts, hidden, intermediate].
     intermediate = int(getattr(model.config, "moe_intermediate_size", 0))
-    for layer_id in _moe_layers(model.config):
+    for i, layer_id in enumerate(_moe_layers(model.config)):
         moe = getattr(getattr(model, "layers", [None] * (layer_id + 1))[layer_id], "mlp", None)
         experts = getattr(moe, "experts", None)
         if experts is None:
             continue
-        # The dummy path wraps banks in _PlainBank (exposing .tensor); the real
-        # streamed path returns the raw stacked tensors. Normalize both.
-        gu = gate_up_banks[layer_id].tensor if hasattr(gate_up_banks[layer_id], "tensor") else gate_up_banks[layer_id]
-        dn = down_banks[layer_id].tensor if hasattr(down_banks[layer_id], "tensor") else down_banks[layer_id]
+        # gate_up_banks/down_banks are MoE-layer-order-compacted (index i,
+        # not the absolute layer_id -- a leading first_k_dense_replace
+        # layer, e.g. GLM-4.7's own layer 0, has no bank entry at all, see
+        # stream_moe_expert_sources' own docstring). The dummy path wraps
+        # banks in _PlainBank (exposing .tensor); the real streamed path
+        # returns the raw stacked tensors. Normalize both.
+        gu = gate_up_banks[i].tensor if hasattr(gate_up_banks[i], "tensor") else gate_up_banks[i]
+        dn = down_banks[i].tensor if hasattr(down_banks[i], "tensor") else down_banks[i]
         for e in range(len(experts)):
             with torch.no_grad():
                 experts[e].gate_proj.weight.copy_(gu[e, 0:intermediate])
@@ -391,12 +395,13 @@ def _place_mxfp4_expert_weights(model, gate_up_banks, down_banks, device) -> Non
     from freetoken.models.qwen3_5_moe import _Qwen35MxfpExpert
 
     intermediate = int(getattr(model.config, "moe_intermediate_size", 0))
-    for layer_id in _moe_layers(model.config):
+    for i, layer_id in enumerate(_moe_layers(model.config)):
         moe = getattr(getattr(model, "layers", [None] * (layer_id + 1))[layer_id], "mlp", None)
         if getattr(moe, "experts", None) is None:
             continue
-        gu_bank = gate_up_banks[layer_id]
-        dn_bank = down_banks[layer_id]
+        # MoE-layer-order-compacted (see _place_expert_weights' own comment).
+        gu_bank = gate_up_banks[i]
+        dn_bank = down_banks[i]
         num_experts = gu_bank.blocks.shape[0]
         moe.experts = nn.ModuleList(
             _Qwen35MxfpExpert(
@@ -422,12 +427,13 @@ def _place_fp8_expert_weights(model, gate_up_banks, down_banks, device) -> None:
     from freetoken.models.qwen3_5_moe import _Qwen35Fp8Expert
 
     intermediate = int(getattr(model.config, "moe_intermediate_size", 0))
-    for layer_id in _moe_layers(model.config):
+    for i, layer_id in enumerate(_moe_layers(model.config)):
         moe = getattr(getattr(model, "layers", [None] * (layer_id + 1))[layer_id], "mlp", None)
         if getattr(moe, "experts", None) is None:
             continue
-        gu_bank = gate_up_banks[layer_id]
-        dn_bank = down_banks[layer_id]
+        # MoE-layer-order-compacted (see _place_expert_weights' own comment).
+        gu_bank = gate_up_banks[i]
+        dn_bank = down_banks[i]
         num_experts = gu_bank.weight.shape[0]
         moe.experts = nn.ModuleList(
             _Qwen35Fp8Expert(
@@ -452,12 +458,13 @@ def _place_int8_expert_weights(model, gate_up_banks, down_banks, device) -> None
     from freetoken.models.qwen3_5_moe import _Qwen35Int8Expert
 
     intermediate = int(getattr(model.config, "moe_intermediate_size", 0))
-    for layer_id in _moe_layers(model.config):
+    for i, layer_id in enumerate(_moe_layers(model.config)):
         moe = getattr(getattr(model, "layers", [None] * (layer_id + 1))[layer_id], "mlp", None)
         if getattr(moe, "experts", None) is None:
             continue
-        gu_bank = gate_up_banks[layer_id]
-        dn_bank = down_banks[layer_id]
+        # MoE-layer-order-compacted (see _place_expert_weights' own comment).
+        gu_bank = gate_up_banks[i]
+        dn_bank = down_banks[i]
         num_experts = gu_bank.weight_packed.shape[0]
         moe.experts = nn.ModuleList(
             _Qwen35Int8Expert(
