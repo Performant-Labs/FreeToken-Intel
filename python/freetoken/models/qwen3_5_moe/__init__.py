@@ -74,20 +74,30 @@ def _expert_source_names(cfg: ModelConfig) -> set:
     """The (remapped) key suffixes that are routed-expert weights: these go to
     the host offload banks, everything else stays dense on the device.
 
-    Mirrors qwen3_moe's ``_is_expert_key`` so the loader's MoE-bank plumbing
-    (``load_moe_expert_sources`` / ``stream_moe_expert_sources``) can resolve the
-    experts out of the remapped ``model.*`` keys. A routed-expert weight carries
-    a ``.experts.`` segment; the dense shared expert (``mlp.shared_expert.*``)
-    does not, so it stays on the device.
+    A routed-expert weight carries a ``.experts.`` segment; the dense shared
+    expert (``mlp.shared_expert.*``) does not, so it stays on the device.
+
+    Real checkpoint files always store one tensor **per expert** (``model.
+    layers.{i}.mlp.experts.{e}.gate_proj.weight``, not a single fused
+    ``experts.gate_proj.weight`` with no expert index) -- this previously
+    generated only the un-indexed spelling, which never matches any real
+    checkpoint's keys, so every routed expert silently fell through to "not
+    an expert" and got dropped. Found via a real (if tiny) non-GPTQ
+    checkpoint: the GPTQ bank-only path never exercises this function (it
+    classifies experts by a ``.experts.`` substring check instead, see
+    ``iter_weights``), so this bug was invisible on every GPTQ checkpoint
+    tested so far.
     """
     names = set()
     if cfg.is_moe:
         for i in range(cfg.first_k_dense_replace, cfg.num_moe_layers + cfg.first_k_dense_replace):
             mlp = f"model.layers.{i}.mlp.experts"
-            for suffix in ("gate_proj.weight", "up_proj.weight", "down_proj.weight"):
-                names.add(f"{mlp}.{suffix}")
-            # The real (packed) Qwen3.5/3.6 layout also uses the fused / un-suffixed
-            # names; accept both so a checkpoint in either spelling routes correctly.
+            for e in range(cfg.num_experts or 0):
+                for suffix in ("gate_proj.weight", "up_proj.weight", "down_proj.weight"):
+                    names.add(f"{mlp}.{e}.{suffix}")
+            # The fused / un-suffixed names (a single [E, ...] tensor per layer,
+            # no per-expert index) also route correctly if a checkpoint ever
+            # ships that spelling instead.
             names.add(f"{mlp}.gate_up_proj")
             names.add(f"{mlp}.down_proj")
     return names
