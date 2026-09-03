@@ -77,6 +77,18 @@ class PendingReq:
     _table_idx: int = 0
     _next_table_idx: int = 0
     _cache_handle: object = None
+    # GDN ping-pong state (issue `semantic-cache-e2e`, #172): the engine
+    # allocates these from its LinearStatePool at admission (add_request),
+    # BEFORE this PendingReq's prompt is ever prefilled -- _add_one_req
+    # below threads them into every Req/ChunkedReq it constructs for this
+    # request (a chunked prompt is reconstructed fresh per continuation
+    # chunk, see ``is_chunked`` below, so these must live on the STABLE
+    # PendingReq, not on any one chunk's transient Req). None for a
+    # non-hybrid model / prefix caching off (the engine never allocates
+    # them in that case).
+    linear_slot_idx: int | None = None
+    mamba_ping_pong: "tuple[int, int] | None" = None
+    mamba_restore_src: int | None = None
 
     @property
     def input_len(self) -> int:
@@ -93,6 +105,9 @@ def make_pending_req(
     sampling_params: "SamplingParams",
     cache_handle=None,
     cached_len: int = 0,
+    linear_slot_idx: int | None = None,
+    mamba_ping_pong: "tuple[int, int] | None" = None,
+    mamba_restore_src: int | None = None,
 ) -> PendingReq:
     """Build a :class:`PendingReq` from raw request fields.
 
@@ -102,7 +117,10 @@ def make_pending_req(
     (not in the engine) so the wrap stays in the torch-free scheduler package --
     the engine imports it on the XPU path but the CPU-venv policy tests never do.
     ``cached_len`` (issue #12) is the page-aligned prefix length the engine's
-    own ``CacheManager.match`` already found before calling this.
+    own ``CacheManager.match`` already found before calling this. The
+    ``linear_slot_idx``/``mamba_*`` params (issue #172) are the engine's
+    LinearStatePool allocation for this request, or None when this isn't a
+    hybrid-model + prefix-caching run.
     """
     return PendingReq(
         uid=uid,
@@ -110,6 +128,9 @@ def make_pending_req(
         sampling_params=sampling_params,
         _cache_handle=cache_handle,
         cached_len=cached_len,
+        linear_slot_idx=linear_slot_idx,
+        mamba_ping_pong=mamba_ping_pong,
+        mamba_restore_src=mamba_restore_src,
     )
 
 
@@ -264,6 +285,9 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            linear_slot_idx=pending_req.linear_slot_idx,
+            mamba_ping_pong=pending_req.mamba_ping_pong,
+            mamba_restore_src=pending_req.mamba_restore_src,
         )
         req._next_table_idx = next_table_idx  # noqa: SLF001 - engine fills after forward
         return req
