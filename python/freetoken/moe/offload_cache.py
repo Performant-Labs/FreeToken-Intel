@@ -90,15 +90,26 @@ logger = init_logger(__name__)
 # genuinely one-row-per-expert, so (like gptq_int4) they fit
 # set_bank_sources/copy_missing/rebuild unchanged.
 #
-# "int8_channel" (issue moe-quant-banks-int8, #154): a per-channel-INT8
-# checkpoint packs each projection into two per-expert tensors -- an int8
-# weight plus one fp scale per output-channel row (see
-# freetoken.kernel.triton.int8_linear.dequantize_int8_channel) -- the
-# simplest of the three formats in #140 (a single scale per row, no group/
-# block structure like gptq_int4's g_idx/group_size). Unlike gptq_int4 there
-# is no shared per-projection side tensor at all: the scale is already one
-# row per expert ([E, N]), so all four banks below fit the plain [E, ...]
-# per-expert-row contract with nothing left over for extra_metadata.
+# "int8_channel" (issue moe-quant-banks-int8, #154): compressed-tensors'
+# "pack-quantized" INT8 scheme (verified against a real checkpoint,
+# rj1013/gemma-4-26B-A4B-it_q8 -- an EARLIER, unverified draft of this
+# format assumed plain unpacked int8 tensors; that was wrong, see issue
+# #154's own comment trail and freetoken.kernel.triton.int8_packed_linear's
+# module docstring for the full correction). Each projection packs into two
+# per-expert tensors -- weight_packed (int32, 4 int8 values densely packed
+# per word along K) + weight_scale (one value per (output channel, group)
+# pair; num_groups==1 degenerates to pure per-channel, the same mechanism
+# serves both) -- unlike gptq_int4 there is no shared per-projection side
+# tensor for either of these (packing/grouping is entirely along K, so an
+# N-axis expert-row concat never crosses a word or group boundary), but K
+# itself (the real logical in-features, from the checkpoint's own
+# weight_shape tensor) IS shared across every expert of one projection type
+# -- and, unlike GPTQ's group_size (checkpoint-wide but not derivable from
+# architecture dims alone), gate_up's K is always hidden_size and down's K
+# is always moe_intermediate_size, both architecture constants identical
+# across every MoE layer -- so SlotWeightAccessor reads them as two plain
+# scalar cache attributes (cache.int8_k_gate_up / cache.int8_k_down), the
+# same pattern as cache.gptq_group_size, not a per-layer side table.
 _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "bf16": ("gate_up", "down"),
     "gptq_int4": (
@@ -122,10 +133,10 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
         "scales_down",
     ),
     "int8_channel": (
-        "weight_gate_up",
-        "scale_gate_up",
-        "weight_down",
-        "scale_down",
+        "weight_packed_gate_up",
+        "weight_scale_gate_up",
+        "weight_packed_down",
+        "weight_scale_down",
     ),
 }
 
@@ -725,8 +736,28 @@ class SlotWeightAccessor:
             from freetoken.kernel.triton.fp8_block_linear import _BLOCK as _FP8_DEFAULT_BLOCK
 
             self._fp8_block = int(getattr(cache, "fp8_block_size", None) or _FP8_DEFAULT_BLOCK)
-        elif self.quant_format in ("mxfp4", "int8_channel"):
+        elif self.quant_format == "mxfp4":
             self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
+        elif self.quant_format == "int8_channel":
+            self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
+            # K (real logical in-features) is an architecture constant per
+            # projection type -- gate_up's is always hidden_size, down's is
+            # always moe_intermediate_size -- so, like gptq_group_size, the
+            # loader sets these once as plain scalar cache attributes rather
+            # than a per-layer side table. No default here on purpose (see
+            # the gptq_int4 branch above for the same "refuse to guess"
+            # rationale): the loader must set both before any int8_channel
+            # forward runs.
+            k_gate_up = getattr(cache, "int8_k_gate_up", None)
+            k_down = getattr(cache, "int8_k_down", None)
+            if k_gate_up is None or k_down is None:
+                raise ValueError(
+                    "OffloadMoeCache.int8_k_gate_up / int8_k_down are not set -- the loader "
+                    "must set them from the checkpoint's real weight_shape before any "
+                    "int8_channel forward pass runs (SlotWeightAccessor refuses to guess)"
+                )
+            self._int8_k_gate_up = int(k_gate_up)
+            self._int8_k_down = int(k_down)
         else:
             self._gu, self._dn = cache.bank_views()
 
@@ -763,14 +794,23 @@ class SlotWeightAccessor:
             self._cache[s_i] = result
             return result
         if self.quant_format == "int8_channel":
-            from freetoken.kernel.triton.int8_linear import dequantize_int8_channel as _dequant
+            from freetoken.kernel.triton.int8_packed_linear import dequantize_int8_packed as _dequant
 
             b = self._banks
-            # weight/scale are already in [out, in] / [out] orientation (per
-            # output channel = per row) -- no transpose needed, unlike GPTQ's
-            # dequant which returns [in, out] and must be .T'd.
-            gu_dense = _dequant(b["weight_gate_up"][s_i], b["scale_gate_up"][s_i], out_dtype=self._dtype)
-            dn_dense = _dequant(b["weight_down"][s_i], b["scale_down"][s_i], out_dtype=self._dtype)
+            # weight_packed/weight_scale are already in [out, in-packed] /
+            # [out, groups] orientation (per output channel = per row) -- no
+            # transpose needed, unlike GPTQ's dequant which returns [in, out]
+            # and must be .T'd. out_dtype is self._dtype (the model's
+            # activation dtype), NOT the checkpoint's own stored scale dtype
+            # -- the same dtype bug class issue #138 found for gptq_int4.
+            gu_dense = _dequant(
+                b["weight_packed_gate_up"][s_i], b["weight_scale_gate_up"][s_i],
+                k=self._int8_k_gate_up, out_dtype=self._dtype,
+            )
+            dn_dense = _dequant(
+                b["weight_packed_down"][s_i], b["weight_scale_down"][s_i],
+                k=self._int8_k_down, out_dtype=self._dtype,
+            )
             i = self._intermediate
             result = (gu_dense[0:i], gu_dense[i : 2 * i], dn_dense)
             self._cache[s_i] = result

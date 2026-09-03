@@ -210,14 +210,17 @@ def load_moe_expert_sources(
     # (verified: https://huggingface.co/openai/gpt-oss-20b/raw/main/config.json).
     if quant_method == "mxfp4":
         return stream_moe_expert_sources_mxfp4(src, config)
-    # NOTE (issue moe-quant-banks-int8, #154): stream_moe_expert_sources_int8
-    # exists and is tested directly, but no real per-channel-INT8 MoE
-    # checkpoint's quant_method spelling has been confirmed, so it is not
-    # wired into this dispatch yet -- a real INT8 checkpoint would fall
-    # through to the plain bf16 streamer below and fail there. Real gap, not
-    # a design choice; needs a real checkpoint to close (same reasoning
-    # issue #154's own body gives for not guessing the key spelling further
-    # than it already does).
+    # "compressed-tensors" (issue moe-quant-banks-int8, #154): this
+    # quant_method is shared across multiple bit-widths/strategies -- only
+    # dispatch to the INT8 streamer when checkpoint_is_int8_pack_quantized
+    # confirms num_bits=8/type="int"/format="pack-quantized" specifically
+    # (verified against rj1013/gemma-4-26B-A4B-it_q8's real config.json; see
+    # stream_moe_expert_sources_int8's docstring). Any other compressed-
+    # tensors scheme (e.g. INT4, a different FP8 variant) falls through to
+    # the plain bf16 streamer below and fails loudly there -- a real,
+    # not-yet-supported format, not silently mishandled as INT8.
+    if quant_method == "compressed-tensors" and checkpoint_is_int8_pack_quantized(model_path):
+        return stream_moe_expert_sources_int8(src, config)
     return stream_moe_expert_sources(src, config, dtype=dtype, layer_sink=layer_sink)
 
 
@@ -233,6 +236,63 @@ def checkpoint_quant_method(model_path: str) -> Optional[str]:
         text_config = raw.get("text_config")
         qc = text_config.get("quantization_config") if isinstance(text_config, dict) else None
     return qc.get("quant_method") if isinstance(qc, dict) else None
+
+
+def _compressed_tensors_weights_config(model_path: str) -> Optional[dict]:
+    """``quantization_config.config_groups.*.weights`` (the first group) from
+    a checkpoint using the ``compressed-tensors`` library's format, or
+    ``None`` if it has no such config. Shared helper for the ``int8_pack_
+    quantized`` checks below (issue `moe-quant-banks-int8`, #154)."""
+    hf_config = cached_load_hf_config(model_path)
+    raw = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
+    qc = raw.get("quantization_config")
+    if not isinstance(qc, dict):
+        text_config = raw.get("text_config")
+        qc = text_config.get("quantization_config") if isinstance(text_config, dict) else None
+    if not isinstance(qc, dict):
+        return None
+    config_groups = qc.get("config_groups")
+    if not isinstance(config_groups, dict) or not config_groups:
+        return None
+    group = next(iter(config_groups.values()))
+    if not isinstance(group, dict) or group.get("format") != "pack-quantized":
+        return None
+    weights = group.get("weights")
+    return weights if isinstance(weights, dict) else None
+
+
+def checkpoint_is_int8_pack_quantized(model_path: str) -> bool:
+    """Whether this checkpoint uses ``compressed-tensors``' ``pack-
+    quantized`` INT8 scheme (issue `moe-quant-banks-int8`, #154 -- verified
+    against ``rj1013/gemma-4-26B-A4B-it_q8``'s real ``config.json``):
+    ``num_bits: 8``, ``type: "int"``, ``format: "pack-quantized"``.
+
+    ``compressed-tensors``' own ``quant_method`` value (``"compressed-
+    tensors"``, from :func:`checkpoint_quant_method`) is shared across
+    multiple bit-widths/strategies (INT8, INT4, FP8 variants, ...) --
+    unlike GPTQ's or block-FP8's own dedicated ``quant_method`` strings
+    (``"gptq"``, ``"fp8"``), so a caller must inspect ``config_groups``
+    itself to confirm this specific scheme, not just check ``quant_method``
+    alone. Call this BEFORE :func:`checkpoint_int8_pack_quantized_group_size`
+    to distinguish "not this format" from "this format, per-channel"
+    (``group_size: null`` is a valid value of THIS format, not an absence
+    of it).
+    """
+    weights = _compressed_tensors_weights_config(model_path)
+    return weights is not None and weights.get("num_bits") == 8 and weights.get("type") == "int"
+
+
+def checkpoint_int8_pack_quantized_group_size(model_path: str) -> Optional[int]:
+    """``quantization_config.config_groups.*.weights.group_size`` for a
+    checkpoint :func:`checkpoint_is_int8_pack_quantized` has already
+    confirmed is a real ``compressed-tensors`` ``pack-quantized`` INT8
+    checkpoint. ``None`` means the checkpoint's own config literally sets
+    ``group_size: null`` -- pure per-channel (one group covering the whole
+    row), NOT "this function found no config" (call
+    :func:`checkpoint_is_int8_pack_quantized` first to rule that case out).
+    """
+    weights = _compressed_tensors_weights_config(model_path)
+    return weights.get("group_size") if weights is not None else None
 
 
 def checkpoint_gptq_group_size(model_path: str) -> int:
@@ -1199,15 +1259,34 @@ def stream_moe_expert_sources_mxfp4(
 
 @dataclass(frozen=True)
 class Int8ExpertBank:
-    """One MoE layer's packed per-channel-INT8 bank for one projection slot
-    (``gate_up`` or ``down``) -- the INT8 sibling of :class:`GptqExpertBank`
-    (issue `moe-quant-banks-int8`, #154, part of epic #140).
+    """One MoE layer's packed compressed-tensors ``pack-quantized`` INT8 bank
+    for one projection slot (``gate_up`` or ``down``) -- the INT8 sibling of
+    :class:`GptqExpertBank` (issue `moe-quant-banks-int8`, #154, part of
+    epic #140).
 
-    ``weight`` / ``scale`` hold one row per expert (``[E, ...]``, per-channel
-    symmetric INT8 -- see :mod:`freetoken.kernel.triton.int8_linear`). Unlike
-    GPTQ there is no shared per-projection side tensor (no ``g_idx``): a
-    per-channel scale is already ``[N]`` per expert, so it fits the plain
-    ``[E, ...]`` per-expert-row bank shape directly with nothing left over.
+    Corrected from an earlier, unverified draft (see issue #154's own
+    comment trail): confirmed against a REAL deployed MoE checkpoint,
+    ``rj1013/gemma-4-26B-A4B-it_q8`` (Gemma-4-26B-A4B, ``num_experts: 128``,
+    ``quantization_config.quant_method: "compressed-tensors"``,
+    ``format: "pack-quantized"``), and cross-checked bit-exact against the
+    real ``compressed_tensors`` pip package's own ``unpack_from_int32`` /
+    ``dequantize`` on that checkpoint's actual tensor bytes (fetched via
+    HTTP range request) -- not the plain unpacked-int8 format the earlier
+    draft guessed.
+
+    ``weight_packed`` / ``weight_scale`` hold one row per expert (``[E,
+    ...]``). ``weight_packed`` is ``[E, N, ceil(K/4)]`` int32 (4 int8 values
+    densely packed per word along the K axis -- see
+    :mod:`freetoken.kernel.triton.int8_packed_linear` for the full bit-layout
+    docs). ``weight_scale`` is ``[E, N, num_groups]``: ``num_groups == 1`` is
+    pure per-channel (this issue's original title), ``num_groups > 1`` is
+    sequential-group (the real checkpoint found uses ``group_size=32`` for
+    its MoE experts) -- both are the same on-disk mechanism, so one bank
+    shape covers both. ``k`` (the real logical in-features, from the
+    checkpoint's own ``weight_shape`` tensor) is shared across every expert
+    of one projection type within a layer (same rationale as GPTQ's shared
+    ``g_idx``: it is an architecture constant, not a per-expert value), so it
+    is carried once here rather than duplicated ``E`` times.
 
     Deliberately packed, never dequantized here -- same RAM-blowup rationale
     as :class:`GptqExpertBank` (issue #134): dequantization happens lazily,
@@ -1216,45 +1295,48 @@ class Int8ExpertBank:
     slot pool has fetched for the current step.
     """
 
-    weight: torch.Tensor  # [E, N, K] int8 ([out, in] orientation)
-    scale: torch.Tensor  # [E, N] fp32 -- one value per (expert, output channel)
+    weight_packed: torch.Tensor  # [E, N, ceil(K/4)] int32
+    weight_scale: torch.Tensor  # [E, N, num_groups]
+    k: int  # real logical in-features, shared across every expert/component here
 
 
-_INT8_COMPONENTS = ("weight", "weight_scale")
+_INT8_COMPONENTS = ("weight_packed", "weight_scale", "weight_shape")
 
 
 def _parse_int8_expert_key(key: str) -> Tuple[int, str, int, str] | None:
-    """Parse a per-channel-INT8-packed per-expert weight key into ``(layer,
-    proj, expert_id, component)``, or ``None`` if ``key`` is not one.
+    """Parse a compressed-tensors pack-quantized INT8 per-expert weight key
+    into ``(layer, proj, expert_id, component)``, or ``None`` if ``key`` is
+    not one.
 
-    Recognizes ``...layers.{L}.mlp.experts.{e}.{gate_proj|up_proj|down_proj}
-    .{weight|weight_scale}``. UNVERIFIED against a real checkpoint (issue
-    #154's own body: no small/cheap real per-channel-INT8 MoE checkpoint has
-    been identified yet, unlike GPTQ's ``_parse_gptq_expert_key`` which was
-    confirmed against ``Qwen/Qwen3.5-35B-A3B-GPTQ-Int4``) -- this spelling is
-    modeled on ``compressed-tensors``' own documented ``weight``/
-    ``weight_scale`` suffix convention (the same one its real, confirmed FP8
-    checkpoints use, e.g. ``nm-testing/Meta-Llama-3.1-8B-Instruct-FP8-hf``'s
-    ``mlp.down_proj.weight`` / ``mlp.down_proj.weight_scale``), extrapolated
-    to INT8's per-channel strategy and to MoE's per-expert key shape. Treat
-    as provisionally correct, not proven, until validated against a real
-    per-channel-INT8 MoE checkpoint.
+    Recognizes ``...layers.{L}.experts.{e}.{gate_proj|up_proj|down_proj}
+    .{weight_packed|weight_scale|weight_shape}`` -- confirmed against the
+    real ``rj1013/gemma-4-26B-A4B-it_q8`` checkpoint's own
+    ``model.safetensors.index.json`` on HuggingFace: e.g.
+    ``model.language_model.layers.1.experts.0.gate_proj.weight_packed`` is a
+    real key in its index. Note this real checkpoint has NO ``mlp.`` segment
+    between ``layers.{L}`` and ``experts`` (unlike GPTQ's ``layers.{L}.mlp.
+    experts.{e}...``) -- also tolerates an intervening ``mlp`` token (i.e.
+    ``layers.{L}.mlp.experts.{e}...``) since that is GPTQ's own real,
+    confirmed convention and a future INT8 checkpoint may follow it instead;
+    only the no-``mlp`` form is confirmed for INT8 specifically so far.
     """
     parts = key.split(".")
     if len(parts) < 2 or parts[-1] not in _INT8_COMPONENTS:
         return None
     component = parts[-1]
     body = parts[:-1]
-    if "mlp" not in body or "experts" not in body:
-        return None
-    try:
-        mlp_pos = body.index("mlp")
-        layer = int(body[mlp_pos - 1])
-    except (ValueError, IndexError):
-        return None
-    if body[mlp_pos + 1] != "experts":
+    if "experts" not in body:
         return None
     e_pos = body.index("experts")
+    if e_pos == 0:
+        return None
+    layer_pos = e_pos - 2 if body[e_pos - 1] == "mlp" else e_pos - 1
+    if layer_pos < 0:
+        return None
+    try:
+        layer = int(body[layer_pos])
+    except ValueError:
+        return None
     tail = body[e_pos + 1 :]
     if len(tail) != 2:
         return None
@@ -1272,15 +1354,19 @@ def stream_moe_expert_sources_int8(
     tensors: Iterator[Tuple[str, torch.Tensor]],
     config,
 ) -> Tuple[list, list]:
-    """Stream per-channel-INT8-packed per-expert weight tensors into packed
-    per-layer banks (issue `moe-quant-banks-int8`, #154) -- the INT8 sibling
-    of :func:`stream_moe_expert_sources_gptq`.
+    """Stream compressed-tensors pack-quantized INT8 per-expert weight
+    tensors into packed per-layer banks (issue `moe-quant-banks-int8`, #154)
+    -- the INT8 sibling of :func:`stream_moe_expert_sources_gptq`.
 
     ``gate_up`` fuses ``gate_proj`` + ``up_proj`` (the checkpoint stores them
-    as separate quantized tensors, not pre-fused): ``weight``/``scale``
-    concatenate along their ``N`` (output-channel, dim 0 in ``[N, K]``
-    orientation) axis -- both are per-row, so the fused rows stay correct
-    with no shared side tensor to reconcile (unlike GPTQ's ``g_idx``).
+    as separate quantized tensors, not pre-fused): ``weight_packed`` /
+    ``weight_scale`` concatenate along their ``N`` (output-channel, dim 0)
+    axis -- both are per-row, and packing/grouping is entirely along the
+    ORTHOGONAL ``K`` axis, so N-axis concatenation never crosses a group or
+    word boundary (unlike block-FP8's ``N``-axis blocking, #152, which does
+    need an alignment check here). ``k`` (from ``weight_shape``) must agree
+    between ``gate_proj`` and ``up_proj`` (both take the same hidden_size
+    input) -- asserted, not assumed.
 
     Returns ``(gate_up_banks, down_banks)``, each a list of ``num_layers``
     :class:`Int8ExpertBank`. Every tensor stays in its packed, quantized form
@@ -1346,8 +1432,8 @@ def _int8_bank_is_complete(
 ) -> bool:
     """True once every expert 0..num_experts-1 has all required projections
     (``gate_proj``+``up_proj`` for ``fuse=True``, else ``down_proj``), each
-    with both INT8 components -- i.e. this ``(layer, bank_name)`` is ready
-    for :func:`_finalize_int8_bank`."""
+    with all three INT8 components -- i.e. this ``(layer, bank_name)`` is
+    ready for :func:`_finalize_int8_bank`."""
     if set(by_expert) != set(range(num_experts)):
         return False
     required_projs = ("gate_proj", "up_proj") if fuse else ("down_proj",)
@@ -1358,6 +1444,14 @@ def _int8_bank_is_complete(
             if components is None or set(components) != set(_INT8_COMPONENTS):
                 return False
     return True
+
+
+def _int8_logical_k(weight_shape: torch.Tensor) -> int:
+    """The real logical in-features from a ``weight_shape`` tensor (``[2]``
+    int64, ``[out_features, in_features]`` -- see ``Int8ExpertBank``'s own
+    docstring for why this is stored separately from ``weight_packed``'s own
+    shape rather than derived from it)."""
+    return int(weight_shape[1].item())
 
 
 def _finalize_int8_bank(
@@ -1372,6 +1466,7 @@ def _finalize_int8_bank(
         raise ValueError(f"Layer {layer}: missing INT8 experts {missing}")
 
     per_expert_rows = []
+    k0 = None
     for e in range(num_experts):
         by_proj = by_expert[e]
         if fuse:
@@ -1379,23 +1474,38 @@ def _finalize_int8_bank(
             up = by_proj.get("up_proj")
             if gate is None or up is None:
                 raise ValueError(f"Layer {layer} expert {e}: missing gate_proj/up_proj INT8 components")
-            weight = torch.cat([gate["weight"], up["weight"]], dim=0)
-            scale = torch.cat([gate["weight_scale"], up["weight_scale"]], dim=0)
+            k_gate = _int8_logical_k(gate["weight_shape"])
+            k_up = _int8_logical_k(up["weight_shape"])
+            if k_gate != k_up:
+                raise ValueError(
+                    f"Layer {layer} expert {e}: gate_proj K={k_gate} != up_proj K={k_up} "
+                    "(both project the same hidden_size input; a mismatch means a wiring bug)"
+                )
+            k = k_gate
+            weight_packed = torch.cat([gate["weight_packed"], up["weight_packed"]], dim=0)
+            weight_scale = torch.cat([gate["weight_scale"], up["weight_scale"]], dim=0)
         else:
             down = by_proj.get("down_proj")
             if down is None:
                 raise ValueError(f"Layer {layer} expert {e}: missing down_proj INT8 components")
-            weight, scale = down["weight"], down["weight_scale"]
-        per_expert_rows.append((weight, scale))
+            k = _int8_logical_k(down["weight_shape"])
+            weight_packed, weight_scale = down["weight_packed"], down["weight_scale"]
+        if k0 is None:
+            k0 = k
+        elif k != k0:
+            raise ValueError(
+                f"Layer {layer}: expert {e}'s K={k} differs from expert 0's K={k0} "
+                "(K is an architecture constant, expected identical across every expert)"
+            )
+        per_expert_rows.append((weight_packed, weight_scale))
 
     # _stack_expert_rows (not torch.stack): the torch XPU build mishandles a
     # direct cat/stack of 2-D per-expert rows along a new leading dim (see
-    # _stack_expert_rows's own docstring). scale is 1-D per expert, so it is
-    # stacked with a plain torch.stack instead -- the workaround is only
-    # documented for the 2-D weight case.
+    # _stack_expert_rows's own docstring).
     return Int8ExpertBank(
-        weight=_stack_expert_rows([row[0] for row in per_expert_rows]),
-        scale=torch.stack([row[1] for row in per_expert_rows], dim=0),
+        weight_packed=_stack_expert_rows([row[0] for row in per_expert_rows]),
+        weight_scale=_stack_expert_rows([row[1] for row in per_expert_rows]),
+        k=k0,
     )
 
 
