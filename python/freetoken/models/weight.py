@@ -107,9 +107,24 @@ def iter_safetensors(model_path: str, device: torch.device | str = "cpu"):
             with safe_open(path, framework="pt", device="cpu") as f:
                 for name in f.keys():
                     map_[name] = path
+    # Group by shard file and open each shard exactly once, yielding every one
+    # of its tensors before moving on -- not one open (== one mmap of the
+    # whole shard) per tensor. Real bug, not a hypothetical one: found via
+    # issue #138's real-checkpoint validation, where a GPTQ MoE checkpoint's
+    # per-expert layout puts thousands of tensors in one shard (10,240 in one
+    # ~1.4GB shard of the real Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 checkpoint) --
+    # reopening (mmap-ing) that same file once per tensor exhausted a 27GB
+    # virtual-address ulimit well before physical RAM was ever the
+    # constraint. A checkpoint with only a handful of tensors per shard (the
+    # CPU test suite's tiny fixtures) never has enough tensors-per-shard for
+    # this to matter, which is why it went unnoticed until real scale.
+    by_path: Dict[str, list] = {}
     for name, path in map_.items():
+        by_path.setdefault(path, []).append(name)
+    for path, names in by_path.items():
         with safe_open(path, framework="pt", device=str(device)) as f:
-            yield name, f.get_tensor(name)
+            for name in names:
+                yield name, f.get_tensor(name)
 
 
 def load_weight(
@@ -640,16 +655,23 @@ def stream_moe_expert_sources_gptq(
     form the whole way through -- never dequantized here (see
     :class:`GptqExpertBank`'s docstring for why).
 
-    Simplification versus ``stream_moe_expert_sources``: this buffers a
-    whole layer's raw per-expert tensors before finalizing (not the
-    incremental per-layer-as-soon-as-complete finalization the bf16 path
-    uses to bound peak RAM during load) -- real, packed GPTQ rows are ~4x
-    smaller than their bf16 equivalents to begin with, so this is a smaller
-    concern here; revisit if issue #138's real-checkpoint validation shows
-    it matters.
+    Finalizes each ``(layer, bank_name)`` as soon as its last component
+    arrives -- immediately concatenating/stacking it into a
+    :class:`GptqExpertBank` and releasing its raw per-expert tensors --
+    rather than buffering the *entire checkpoint's* raw tensors until the
+    stream ends. This was a real bug, not a hypothetical one: found by
+    issue #138's real-checkpoint validation, an earlier version of this
+    function buffered every layer's raw components until after the whole
+    stream was consumed, so peak RAM briefly held (nearly) the whole raw
+    checkpoint *and* the packed banks being built from it at once --
+    exactly the RAM blowup issue #135 (this function's own issue) was
+    supposed to eliminate, just moved to a different phase of the same
+    call. The real ``Qwen/Qwen3.5-35B-A3B-GPTQ-Int4`` checkpoint's loader
+    call exhausted a 27GB virtual-address ceiling on shard 6 of 14 before
+    this fix.
     """
     buf: Dict[Tuple[int, str], Dict[int, Dict[str, Dict[str, torch.Tensor]]]] = {}
-    seen_layers: Dict[str, set] = {"gate_up": set(), "down": set()}
+    finalized: Dict[Tuple[int, str], GptqExpertBank] = {}
 
     for name, tensor in tensors:
         info = _parse_gptq_expert_key(name)
@@ -661,31 +683,58 @@ def stream_moe_expert_sources_gptq(
             raise ValueError(f"Unexpected MoE expert layer {layer}; expected [0, {config.num_layers})")
         if not (0 <= expert_id < config.num_experts):
             raise ValueError(f"Unexpected MoE expert id {expert_id} in layer {layer}")
-        by_expert = buf.setdefault((layer, bank_name), {})
+        key = (layer, bank_name)
+        if key in finalized:
+            raise ValueError(
+                f"Layer {layer} {bank_name!r}: tensor {name!r} arrived after this bank was already "
+                "finalized -- duplicate key or an out-of-order/re-streamed source?"
+            )
+        by_expert = buf.setdefault(key, {})
         by_proj = by_expert.setdefault(expert_id, {})
         by_component = by_proj.setdefault(proj, {})
         if component in by_component:
             raise ValueError(f"Duplicate GPTQ component {component!r} for layer {layer} expert {expert_id} {proj}")
         by_component[component] = tensor
-        seen_layers[bank_name].add(layer)
 
-    missing = {
-        name: sorted(set(range(config.num_layers)) - seen)
-        for name, seen in seen_layers.items()
-        if seen != set(range(config.num_layers))
-    }
+        fuse = bank_name == "gate_up"
+        if _gptq_bank_is_complete(by_expert, config.num_experts, fuse=fuse):
+            finalized[key] = _finalize_gptq_bank(by_expert, config.num_experts, fuse=fuse, layer=layer)
+            del buf[key]  # release the raw per-expert tensors now that the packed bank owns the data
+
+    missing = [
+        (layer, bank_name)
+        for layer in range(config.num_layers)
+        for bank_name in ("gate_up", "down")
+        if (layer, bank_name) not in finalized
+    ]
     if missing:
-        raise ValueError(f"Missing GPTQ MoE expert source layers: {missing}")
+        raise ValueError(f"Missing/incomplete GPTQ MoE expert bank(s): {missing}")
 
-    gate_up_banks = [
-        _finalize_gptq_bank(buf[(layer, "gate_up")], config.num_experts, fuse=True, layer=layer)
-        for layer in range(config.num_layers)
-    ]
-    down_banks = [
-        _finalize_gptq_bank(buf[(layer, "down")], config.num_experts, fuse=False, layer=layer)
-        for layer in range(config.num_layers)
-    ]
+    gate_up_banks = [finalized[(layer, "gate_up")] for layer in range(config.num_layers)]
+    down_banks = [finalized[(layer, "down")] for layer in range(config.num_layers)]
     return gate_up_banks, down_banks
+
+
+def _gptq_bank_is_complete(
+    by_expert: Dict[int, Dict[str, Dict[str, torch.Tensor]]],
+    num_experts: int,
+    *,
+    fuse: bool,
+) -> bool:
+    """True once every expert 0..num_experts-1 has all required projections
+    (``gate_proj``+``up_proj`` for ``fuse=True``, else ``down_proj``), each
+    with all four GPTQ components -- i.e. this ``(layer, bank_name)`` is
+    ready for :func:`_finalize_gptq_bank`."""
+    if set(by_expert) != set(range(num_experts)):
+        return False
+    required_projs = ("gate_proj", "up_proj") if fuse else ("down_proj",)
+    for e in range(num_experts):
+        by_proj = by_expert[e]
+        for proj in required_projs:
+            components = by_proj.get(proj)
+            if components is None or set(components) != set(_GPTQ_COMPONENTS):
+                return False
+    return True
 
 
 def _finalize_gptq_bank(

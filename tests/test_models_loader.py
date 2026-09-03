@@ -245,6 +245,57 @@ def test_iter_safetensors_reads_shards_onto_device(dense_ckpt):
     assert got["model.embed_tokens.weight"].device == device
 
 
+def test_iter_safetensors_opens_each_shard_exactly_once(tmp_path):
+    """Real bug found by issue #138's real-checkpoint validation: an earlier
+    version opened (mmap'd) the shard file once PER TENSOR instead of once
+    per shard. For a checkpoint with many tensors in one shard (a GPTQ MoE
+    checkpoint's per-expert layout puts thousands in one file), that
+    exhausted a 27GB virtual-address ulimit well before physical RAM was
+    ever the constraint -- confirmed against the real
+    Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 checkpoint (10,240 tensors in one ~1.4GB
+    shard). Spies on safe_open's call count directly, not just correctness
+    (the old and new code paths return identical tensors either way)."""
+    from safetensors.torch import save_file
+
+    import freetoken.models.weight as weight_mod
+
+    path = tmp_path / "many_tensors_ckpt"
+    path.mkdir()
+    # 20 small tensors in ONE shard -- if opened per-tensor, safe_open would
+    # be called 20 times for this one file; opened per-shard, exactly once.
+    tensors = {f"t{i}": torch.randn(2, 2) for i in range(20)}
+    save_file({k: v.contiguous() for k, v in tensors.items()}, str(path / "model.safetensors"))
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
+    )
+
+    open_count = 0
+    real_safe_open = weight_mod.safe_open
+
+    class _CountingSafeOpen:
+        def __init__(self, *args, **kwargs):
+            nonlocal open_count
+            open_count += 1
+            self._inner = real_safe_open(*args, **kwargs)
+
+        def __enter__(self):
+            return self._inner.__enter__()
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+    weight_mod.safe_open = _CountingSafeOpen
+    try:
+        got = dict(weight_mod.iter_safetensors(str(path), torch.device("cpu")))
+    finally:
+        weight_mod.safe_open = real_safe_open
+
+    assert open_count == 1, f"expected exactly 1 safe_open call for 1 shard, got {open_count}"
+    assert set(got) == set(tensors)
+    for name, expected in tensors.items():
+        torch.testing.assert_close(got[name], expected)
+
+
 def test_load_moe_expert_sources_dummy_banks(moe_ckpt):
     gate_up, down = load_moe_expert_sources(moe_ckpt, dtype=torch.bfloat16, dummy=True)
     # Per-layer banks, one per MoE layer, stacked to [num_experts, ...].
