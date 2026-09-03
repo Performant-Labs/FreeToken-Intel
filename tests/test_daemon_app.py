@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from freetoken.daemon.app import create_app
+from freetoken.daemon.app import CSRF_HEADER_NAME, CSRF_HEADER_VALUE, create_app
+
+_CSRF_HEADERS = {CSRF_HEADER_NAME: CSRF_HEADER_VALUE}
 
 
 class _FakeServeManager:
@@ -46,7 +48,7 @@ def test_status_route_reflects_not_running():
 def test_start_route_builds_ft_serve_argv_and_reports_running():
     fake = _FakeServeManager()
     client = TestClient(create_app(fake))
-    resp = client.post("/start", json={"model": "tiny-model", "host": "127.0.0.1", "port": 9090})
+    resp = client.post("/start", json={"model": "tiny-model", "host": "127.0.0.1", "port": 9090}, headers=_CSRF_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["running"] is True
     assert "freetoken.cli" in fake.started_with
@@ -59,7 +61,7 @@ def test_start_route_builds_ft_serve_argv_and_reports_running():
 def test_start_route_passes_through_extra_args():
     fake = _FakeServeManager()
     client = TestClient(create_app(fake))
-    client.post("/start", json={"model": "m", "extra_args": ["--moe-backend", "cpu"]})
+    client.post("/start", json={"model": "m", "extra_args": ["--moe-backend", "cpu"]}, headers=_CSRF_HEADERS)
     assert fake.started_with[-2:] == ["--moe-backend", "cpu"]
 
 
@@ -67,7 +69,7 @@ def test_start_route_returns_409_when_already_running():
     fake = _FakeServeManager()
     fake._raise_on_start = RuntimeError("a child process is already running; stop it first")
     client = TestClient(create_app(fake))
-    resp = client.post("/start", json={"model": "m"})
+    resp = client.post("/start", json={"model": "m"}, headers=_CSRF_HEADERS)
     assert resp.status_code == 409
 
 
@@ -75,10 +77,30 @@ def test_stop_route_stops_and_reports_not_running():
     fake = _FakeServeManager()
     fake._running = True
     client = TestClient(create_app(fake))
-    resp = client.post("/stop")
+    resp = client.post("/stop", headers=_CSRF_HEADERS)
     assert resp.status_code == 200
     assert fake.stopped is True
     assert resp.json()["running"] is False
+
+
+def test_start_route_rejects_request_without_csrf_header():
+    """A plain cross-origin HTML form (or a "simple" fetch) cannot set a
+    custom header without a CORS preflight this app never approves -- so a
+    request missing the header is rejected outright (PR-Agent review, PR #128)."""
+    fake = _FakeServeManager()
+    client = TestClient(create_app(fake))
+    resp = client.post("/start", json={"model": "m"})  # no CSRF header
+    assert resp.status_code == 403
+    assert fake.started_with is None
+
+
+def test_stop_route_rejects_request_without_csrf_header():
+    fake = _FakeServeManager()
+    fake._running = True
+    client = TestClient(create_app(fake))
+    resp = client.post("/stop")  # no CSRF header
+    assert resp.status_code == 403
+    assert fake.stopped is False
 
 
 def test_create_app_defaults_to_a_real_serve_manager():

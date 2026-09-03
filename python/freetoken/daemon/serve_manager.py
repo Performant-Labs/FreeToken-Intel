@@ -15,14 +15,23 @@ a real checkpoint).
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from typing import Optional
 
 
 class ServeManager:
-    """Starts, stops, and reports the status of one supervised child process."""
+    """Starts, stops, and reports the status of one supervised child process.
+
+    All mutation (and the check-then-act in ``start``/``stop``) happens
+    under one lock: FastAPI runs its synchronous route handlers in a
+    threadpool, so two concurrent ``/start`` calls (or a ``start`` racing a
+    ``stop``) would otherwise both observe "not running" and spawn two
+    children, leaking the first one's handle (PR-Agent review, PR #128).
+    """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
         self._argv: list[str] = []
         self._started_at: Optional[float] = None
@@ -31,42 +40,49 @@ class ServeManager:
     def start(self, argv: list[str], *, meta: Optional[dict] = None) -> None:
         """Spawn ``argv`` as the supervised child. Raises ``RuntimeError`` if
         a child is already running (``stop()`` it first)."""
-        if self.is_running():
-            raise RuntimeError("a child process is already running; stop it first")
-        self._proc = subprocess.Popen(argv)
-        self._argv = list(argv)
-        self._started_at = time.monotonic()
-        self._meta = dict(meta) if meta else {}
+        with self._lock:
+            if self._is_running_locked():
+                raise RuntimeError("a child process is already running; stop it first")
+            self._proc = subprocess.Popen(argv)
+            self._argv = list(argv)
+            self._started_at = time.monotonic()
+            self._meta = dict(meta) if meta else {}
 
     def stop(self, timeout: float = 10.0) -> None:
         """Terminate the supervised child (SIGTERM, then SIGKILL after
         ``timeout`` seconds). A no-op if nothing is running."""
-        if self._proc is None:
-            return
-        if self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait(timeout=timeout)
-        self._proc = None
-        self._argv = []
-        self._started_at = None
-        self._meta = {}
+        with self._lock:
+            if self._proc is None:
+                return
+            if self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait(timeout=timeout)
+            self._proc = None
+            self._argv = []
+            self._started_at = None
+            self._meta = {}
+
+    def _is_running_locked(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
 
     def is_running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+        with self._lock:
+            return self._is_running_locked()
 
     def status(self) -> dict:
         """JSON-able status: what ``ft ctl`` / the daemon's ``/status`` route
         report. ``uptime_s`` and the rest are ``None``/empty when nothing is
         running (a stopped/never-started child is not an error)."""
-        running = self.is_running()
-        return {
-            "running": running,
-            "pid": self._proc.pid if running else None,
-            "argv": self._argv if running else [],
-            "meta": self._meta if running else {},
-            "uptime_s": (time.monotonic() - self._started_at) if running else None,
-        }
+        with self._lock:
+            running = self._is_running_locked()
+            return {
+                "running": running,
+                "pid": self._proc.pid if running else None,
+                "argv": self._argv if running else [],
+                "meta": self._meta if running else {},
+                "uptime_s": (time.monotonic() - self._started_at) if running else None,
+            }

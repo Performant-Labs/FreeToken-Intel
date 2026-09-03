@@ -16,6 +16,8 @@ import json
 import urllib.error
 import urllib.request
 
+from .app import CSRF_HEADER_NAME, CSRF_HEADER_VALUE
+
 DEFAULT_BASE_URL = "http://127.0.0.1:8500"
 
 
@@ -31,7 +33,9 @@ class DaemonClient:
 
     def _request(self, method: str, path: str, body: dict | None = None) -> dict:
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        headers = {"Content-Type": "application/json"} if data is not None else {}
+        headers = {CSRF_HEADER_NAME: CSRF_HEADER_VALUE}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
         req = urllib.request.Request(f"{self.base_url}{path}", data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
