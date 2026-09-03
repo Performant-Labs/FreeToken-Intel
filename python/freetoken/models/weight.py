@@ -197,8 +197,15 @@ def load_moe_expert_sources(
     # dequantizing. checkpoint_quant_method reads this straight from the
     # checkpoint's own config.json, independent of ModelConfig (which does
     # not carry quantization_config today).
-    if checkpoint_quant_method(model_path) == "gptq":
+    quant_method = checkpoint_quant_method(model_path)
+    if quant_method == "gptq":
         return stream_moe_expert_sources_gptq(src, config)
+    # "fp8" (issue moe-quant-banks-fp8, #152): DeepSeek-V3 / sglang / vLLM's
+    # own quantization_config.quant_method spelling for the block-FP8
+    # convention this streams (verified against deepseek-ai/DeepSeek-V3's
+    # real config.json -- see stream_moe_expert_sources_fp8's docstring).
+    if quant_method == "fp8":
+        return stream_moe_expert_sources_fp8(src, config)
     return stream_moe_expert_sources(src, config, dtype=dtype, layer_sink=layer_sink)
 
 
@@ -393,6 +400,19 @@ def _expert_source_info(key: str) -> Tuple[int, str, Optional[int]] | None:
         raise ValueError(
             f"GPTQ-packed expert weight key {key!r} passed to the bf16 expert-source "
             "streamer; use stream_moe_expert_sources_gptq for a GPTQ checkpoint instead"
+        )
+    # Same defense for block-FP8's per-block scale component (see
+    # stream_moe_expert_sources_fp8, issue #152). Unlike GPTQ's qweight/qzeros/
+    # g_idx, block-FP8's OTHER component is spelled ``.weight`` -- identical to
+    # a plain dense tensor's own trailing token -- so it cannot be rejected the
+    # same way and instead relies on load_moe_expert_sources' checkpoint_quant_method
+    # dispatch (the primary safety net for both quantized formats) to never reach
+    # this function at all. ``weight_scale_inv`` has no such collision, so it is
+    # rejected here too, as defense in depth.
+    if tail and tail[-1] == "weight_scale_inv":
+        raise ValueError(
+            f"block-FP8-packed expert weight key {key!r} passed to the bf16 expert-source "
+            "streamer; use stream_moe_expert_sources_fp8 for a block-FP8 checkpoint instead"
         )
     # Real HF safetensors keys carry a trailing ``.weight`` (``...experts.{e}.{
     # gate|up|down}_proj.weight``); the FTW-normalized packed form (ADR 0002) may
@@ -794,6 +814,227 @@ def _finalize_gptq_bank(
     )
 
 
+@dataclass(frozen=True)
+class Fp8BlockExpertBank:
+    """One MoE layer's packed block-FP8 bank for one projection slot
+    (``gate_up`` or ``down``) -- the block-FP8 sibling of
+    :class:`GptqExpertBank` (issue `moe-quant-banks-fp8`, #152, part of the
+    same #134/#140 epic).
+
+    ``weight`` / ``weight_scale_inv`` hold one row per expert (``[E, ...]``,
+    the DeepSeek-V3 / sglang / vLLM ``w8a8_block_fp8`` layout -- see
+    :mod:`freetoken.kernel.triton.fp8_block_linear`). Unlike GPTQ's ``g_idx``,
+    block-FP8 has no side tensor shared across experts: every expert's scale
+    table is a function of that expert's own weight magnitudes alone, so both
+    tensors fit the plain per-expert ``[E, ...]`` bank shape and there is
+    nothing left over for ``OffloadMoeCache.extra_metadata``.
+
+    Deliberately packed, never dequantized here: dequantizing every expert to
+    the activation dtype at load time is the same real-scale RAM blowup issue
+    #134 built ADR 0002 to avoid. Dequantization happens lazily, per-expert,
+    at compute time (:class:`freetoken.moe.offload_cache.SlotWeightAccessor`)
+    against whichever row the offload cache's device slot pool has fetched
+    for the current step.
+    """
+
+    weight: torch.Tensor  # [E, N, K] torch.float8_e4m3fn
+    weight_scale_inv: torch.Tensor  # [E, ceil(N/block), ceil(K/block)]
+
+
+_FP8_COMPONENTS = ("weight", "weight_scale_inv")
+_FP8_DEFAULT_BLOCK = 128  # DeepSeek-V3 / sglang / vLLM's own default; see fp8_block_linear.py
+
+
+def _parse_fp8_expert_key(key: str) -> Tuple[int, str, int, str] | None:
+    """Parse a block-FP8-packed per-expert weight key into ``(layer, proj,
+    expert_id, component)``, or ``None`` if ``key`` is not one.
+
+    Recognizes ``...layers.{L}.mlp.experts.{e}.{gate_proj|up_proj|down_proj}
+    .{weight|weight_scale_inv}`` -- verified against the real
+    ``deepseek-ai/DeepSeek-V3`` checkpoint's own ``model.safetensors.index.json``
+    on HuggingFace (its ``config.json`` reads ``quantization_config ==
+    {"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+    "weight_block_size": [128, 128]}``, and ``model.layers.3.mlp.experts.0.
+    gate_proj.{weight,weight_scale_inv}`` are real keys in its index) -- the
+    same per-expert key shape GPTQ uses (:func:`_parse_gptq_expert_key`), just
+    with block-FP8's two components instead of GPTQ's four, and no shared
+    ``g_idx``-like side tensor.
+    """
+    parts = key.split(".")
+    if len(parts) < 2 or parts[-1] not in _FP8_COMPONENTS:
+        return None
+    component = parts[-1]
+    body = parts[:-1]
+    if "mlp" not in body or "experts" not in body:
+        return None
+    try:
+        mlp_pos = body.index("mlp")
+        layer = int(body[mlp_pos - 1])
+    except (ValueError, IndexError):
+        return None
+    if body[mlp_pos + 1] != "experts":
+        return None
+    e_pos = body.index("experts")
+    tail = body[e_pos + 1 :]
+    if len(tail) != 2:
+        return None
+    try:
+        expert_id = int(tail[0])
+    except ValueError:
+        return None
+    proj = tail[1]
+    if proj not in {"gate_proj", "up_proj", "down_proj"}:
+        return None
+    return layer, proj, expert_id, component
+
+
+def stream_moe_expert_sources_fp8(
+    tensors: Iterator[Tuple[str, torch.Tensor]],
+    config,
+    *,
+    block: int = _FP8_DEFAULT_BLOCK,
+) -> Tuple[list, list]:
+    """Stream block-FP8-packed per-expert weight tensors into packed per-layer
+    banks (issue `moe-quant-banks-fp8`, #152) -- the block-FP8 sibling of
+    :func:`stream_moe_expert_sources_gptq`.
+
+    ``gate_up`` fuses ``gate_proj`` + ``up_proj`` (the checkpoint stores them
+    as separate quantized tensors, not pre-fused): both ``weight`` and
+    ``weight_scale_inv`` concatenate along dim 0, the ``N`` (output-channel)
+    axis -- matching every other bank's ``[E, 2I, H]`` gate-then-up
+    convention. Unlike GPTQ's ``K``-axis groups (architecture-constant and
+    shared across the whole checkpoint, so concatenating on ``N`` never
+    crosses a group boundary), block-FP8 blocks the ``N`` axis too:
+    concatenating two independently-quantized ``[N, K]`` tensors only
+    produces a tensor whose blocks still exactly cover ``block`` rows each if
+    ``gate_proj``'s own ``N`` (the MoE intermediate size) is itself a multiple
+    of ``block`` -- true of every real block-FP8 checkpoint found so far
+    (DeepSeek-V3's ``moe_intermediate_size`` is 2048, evenly divisible by its
+    own ``weight_block_size`` of 128) -- asserted in :func:`_finalize_fp8_bank`
+    rather than assumed, raising loudly instead of silently misaligning the
+    fused scale table.
+
+    Finalizes each ``(layer, bank_name)`` as soon as its last component
+    arrives, mirroring :func:`stream_moe_expert_sources_gptq`'s incremental
+    per-layer finalization -- never buffering more than one layer's worth of
+    raw per-expert tensors at once (issue #145 found and fixed a real
+    whole-checkpoint-buffering RAM bug in the GPTQ version's first draft; the
+    same bug class is avoided here from the start, not retrofitted).
+    """
+    buf: Dict[Tuple[int, str], Dict[int, Dict[str, Dict[str, torch.Tensor]]]] = {}
+    finalized: Dict[Tuple[int, str], Fp8BlockExpertBank] = {}
+
+    for name, tensor in tensors:
+        info = _parse_fp8_expert_key(name)
+        if info is None:
+            raise ValueError(f"Unexpected block-FP8 expert weight key: {name}")
+        layer, proj, expert_id, component = info
+        bank_name = "gate_up" if proj in ("gate_proj", "up_proj") else "down"
+        if not (0 <= layer < config.num_layers):
+            raise ValueError(f"Unexpected MoE expert layer {layer}; expected [0, {config.num_layers})")
+        if not (0 <= expert_id < config.num_experts):
+            raise ValueError(f"Unexpected MoE expert id {expert_id} in layer {layer}")
+        key = (layer, bank_name)
+        if key in finalized:
+            raise ValueError(
+                f"Layer {layer} {bank_name!r}: tensor {name!r} arrived after this bank was already "
+                "finalized -- duplicate key or an out-of-order/re-streamed source?"
+            )
+        by_expert = buf.setdefault(key, {})
+        by_proj = by_expert.setdefault(expert_id, {})
+        by_component = by_proj.setdefault(proj, {})
+        if component in by_component:
+            raise ValueError(f"Duplicate block-FP8 component {component!r} for layer {layer} expert {expert_id} {proj}")
+        by_component[component] = tensor
+
+        fuse = bank_name == "gate_up"
+        if _fp8_bank_is_complete(by_expert, config.num_experts, fuse=fuse):
+            finalized[key] = _finalize_fp8_bank(by_expert, config.num_experts, fuse=fuse, layer=layer, block=block)
+            del buf[key]  # release the raw per-expert tensors now that the packed bank owns the data
+
+    missing = [
+        (layer, bank_name)
+        for layer in range(config.num_layers)
+        for bank_name in ("gate_up", "down")
+        if (layer, bank_name) not in finalized
+    ]
+    if missing:
+        raise ValueError(f"Missing/incomplete block-FP8 MoE expert bank(s): {missing}")
+
+    gate_up_banks = [finalized[(layer, "gate_up")] for layer in range(config.num_layers)]
+    down_banks = [finalized[(layer, "down")] for layer in range(config.num_layers)]
+    return gate_up_banks, down_banks
+
+
+def _fp8_bank_is_complete(
+    by_expert: Dict[int, Dict[str, Dict[str, torch.Tensor]]],
+    num_experts: int,
+    *,
+    fuse: bool,
+) -> bool:
+    """True once every expert 0..num_experts-1 has all required projections
+    (``gate_proj``+``up_proj`` for ``fuse=True``, else ``down_proj``), each
+    with both block-FP8 components -- i.e. this ``(layer, bank_name)`` is
+    ready for :func:`_finalize_fp8_bank`."""
+    if set(by_expert) != set(range(num_experts)):
+        return False
+    required_projs = ("gate_proj", "up_proj") if fuse else ("down_proj",)
+    for e in range(num_experts):
+        by_proj = by_expert[e]
+        for proj in required_projs:
+            components = by_proj.get(proj)
+            if components is None or set(components) != set(_FP8_COMPONENTS):
+                return False
+    return True
+
+
+def _finalize_fp8_bank(
+    by_expert: Dict[int, Dict[str, Dict[str, torch.Tensor]]],
+    num_experts: int,
+    *,
+    fuse: bool,
+    layer: int,
+    block: int,
+) -> Fp8BlockExpertBank:
+    if set(by_expert) != set(range(num_experts)):
+        missing = sorted(set(range(num_experts)) - set(by_expert))
+        raise ValueError(f"Layer {layer}: missing block-FP8 experts {missing}")
+
+    per_expert_rows = []
+    for e in range(num_experts):
+        by_proj = by_expert[e]
+        if fuse:
+            gate = by_proj.get("gate_proj")
+            up = by_proj.get("up_proj")
+            if gate is None or up is None:
+                raise ValueError(f"Layer {layer} expert {e}: missing gate_proj/up_proj block-FP8 components")
+            # See stream_moe_expert_sources_fp8's docstring for why this
+            # alignment must hold before the N-axis concat below is safe.
+            n_gate = gate["weight"].shape[0]
+            if n_gate % block != 0:
+                raise ValueError(
+                    f"Layer {layer} expert {e}: gate_proj N={n_gate} is not a multiple of block={block}; "
+                    "fusing gate_proj+up_proj on the N axis would misalign the fused weight_scale_inv"
+                )
+            weight = torch.cat([gate["weight"], up["weight"]], dim=0)
+            weight_scale_inv = torch.cat([gate["weight_scale_inv"], up["weight_scale_inv"]], dim=0)
+        else:
+            down = by_proj.get("down_proj")
+            if down is None:
+                raise ValueError(f"Layer {layer} expert {e}: missing down_proj block-FP8 components")
+            weight, weight_scale_inv = down["weight"], down["weight_scale_inv"]
+        per_expert_rows.append((weight, weight_scale_inv))
+
+    # _stack_expert_rows (not torch.stack): the torch XPU build mishandles a
+    # direct cat/stack of 2-D per-expert rows along a new leading dim --
+    # unsqueeze-then-cat is the reliable path this codebase already
+    # standardizes on (see _stack_expert_rows's own docstring).
+    return Fp8BlockExpertBank(
+        weight=_stack_expert_rows([row[0] for row in per_expert_rows]),
+        weight_scale_inv=_stack_expert_rows([row[1] for row in per_expert_rows]),
+    )
+
+
 __all__ = [
     "load_weight",
     "load_moe_expert_sources",
@@ -802,6 +1043,8 @@ __all__ = [
     "_PlainBank",
     "GptqExpertBank",
     "stream_moe_expert_sources_gptq",
+    "Fp8BlockExpertBank",
+    "stream_moe_expert_sources_fp8",
     "checkpoint_quant_method",
     "checkpoint_gptq_group_size",
 ]

@@ -68,6 +68,17 @@ logger = init_logger(__name__)
 # in OffloadMoeCache.extra_metadata instead (see set_extra_metadata /
 # get_extra_metadata below): a plain per-layer side table the compute step
 # (issue #137) reads directly, never routed through the LRU slot machinery.
+#
+# "fp8_block" (issue moe-quant-banks-fp8, #152): a block-FP8-quantized
+# checkpoint (DeepSeek-V3 / sglang / vLLM's public w8a8_block_fp8 convention,
+# see freetoken.kernel.triton.fp8_block_linear) packs each projection into
+# two per-expert tensors -- weight (fp8) + weight_scale_inv (the per-block
+# scale table) -- instead of GPTQ's three. Four banks total: {weight,
+# weight_scale_inv} x {gate_up,down}. All four are one-row-per-expert
+# ([E, ...]), same as bf16/gptq_int4, so they fit set_bank_sources/
+# copy_missing/rebuild unchanged too. Unlike GPTQ, block-FP8 has no
+# shared-across-experts side tensor (no g_idx analogue): every expert's
+# weight_scale_inv is genuinely its own, so nothing needs extra_metadata here.
 _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "bf16": ("gate_up", "down"),
     "gptq_int4": (
@@ -77,6 +88,12 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
         "qweight_down",
         "qzeros_down",
         "scales_down",
+    ),
+    "fp8_block": (
+        "weight_gate_up",
+        "scale_gate_up",
+        "weight_down",
+        "scale_down",
     ),
 }
 
@@ -610,12 +627,13 @@ class SlotWeightAccessor:
 
     For ``"bf16"`` this is a thin, zero-cost wrapper around the existing
     plain-tensor indexing (behavior is unchanged from before this class
-    existed). For ``"gptq_int4"`` each distinct slot's packed
-    qweight/qzeros/scales are dequantized **at most once per instance** (a
-    `_forward_offload_core` call handles one MoE layer for one step) -- a
-    decode step's working set is typically small (<= num_experts active
-    slots), so this is a bounded, cheap cost per step, never the whole
-    checkpoint at once (the RAM-saving point of #134's whole epic).
+    existed). For ``"gptq_int4"`` and ``"fp8_block"`` (issue
+    moe-quant-banks-fp8, #152) each distinct slot's packed weights are
+    dequantized **at most once per instance** (a `_forward_offload_core` call
+    handles one MoE layer for one step) -- a decode step's working set is
+    typically small (<= num_experts active slots), so this is a bounded,
+    cheap cost per step, never the whole checkpoint at once (the RAM-saving
+    point of #134's whole epic).
 
     ``dtype`` is the dequant output dtype -- must match the activation
     tensor's dtype (``flat``, whatever ``moe_backend="offload"`` loaded the
@@ -659,6 +677,19 @@ class SlotWeightAccessor:
                     "gptq_int4 forward pass runs (SlotWeightAccessor refuses to guess)"
                 )
             self._group_size = int(group_size)
+        elif self.quant_format == "fp8_block":
+            self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
+            # No group_size-style checkpoint parameter to thread through here:
+            # block-FP8's block size is a fixed convention (128), not a
+            # per-checkpoint choice like GPTQ's group_size -- every real
+            # block-FP8 checkpoint found so far (DeepSeek-V3 included) uses
+            # weight_block_size == [128, 128]. An optional cache.fp8_block_size
+            # override is still honored (falls back to the module default)
+            # in case a future checkpoint's quantization_config.weight_block_size
+            # ever differs.
+            from freetoken.kernel.triton.fp8_block_linear import _BLOCK as _FP8_DEFAULT_BLOCK
+
+            self._fp8_block = int(getattr(cache, "fp8_block_size", None) or _FP8_DEFAULT_BLOCK)
         else:
             self._gu, self._dn = cache.bank_views()
 
@@ -666,19 +697,41 @@ class SlotWeightAccessor:
         """``(gate_w, up_w, down_w)`` for slot ``s_i``, in ``[out, in]``
         weight orientation (matching ``nn.Linear.weight`` / ``_expert_compute``'s
         expected shape) -- gate/up are ``[I, H]``, down is ``[H, I]``."""
-        if self.quant_format != "gptq_int4":
+        if self.quant_format == "bf16":
             i = self._intermediate
             return self._gu[s_i, 0:i], self._gu[s_i, i : 2 * i], self._dn[s_i]
         cached = self._cache.get(s_i)
         if cached is not None:
             return cached
+        if self.quant_format == "fp8_block":
+            from freetoken.kernel.triton.fp8_block_linear import dequantize_block_fp8
+
+            b = self._banks
+            # dequantize_block_fp8 reconstructs [N, K] -- already the [out, in]
+            # orientation this port's bank rows use (unlike GPTQ's dequant,
+            # which returns [in, out] and needs a .T). out_dtype is
+            # self._dtype (the model's activation dtype), NOT the checkpoint's
+            # own stored weight_scale_inv dtype -- the same dtype bug class
+            # issue #138 found for gptq_int4 (see the class docstring).
+            gu_dense = dequantize_block_fp8(
+                b["weight_gate_up"][s_i], b["scale_gate_up"][s_i],
+                block=self._fp8_block, out_dtype=self._dtype,
+            )
+            dn_dense = dequantize_block_fp8(
+                b["weight_down"][s_i], b["scale_down"][s_i],
+                block=self._fp8_block, out_dtype=self._dtype,
+            )
+            i = self._intermediate
+            result = (gu_dense[0:i].contiguous(), gu_dense[i : 2 * i].contiguous(), dn_dense.contiguous())
+            self._cache[s_i] = result
+            return result
         from freetoken.kernel.triton.gptq_linear import dequantize_gptq_int4_sequential_groups as _dequant
 
         b = self._banks
         # dequantize_gptq_int4_sequential_groups returns [in_features, out_features]
         # (nn.Linear's transpose); .T gives the [out, in] orientation this port's
         # bf16 bank rows already use. out_dtype is self._dtype (the model's
-        # activation dtype), NOT the checkpoint's own scales.dtype -- see the
+        # activation dtype), NOT the checkpoint's own stored scales dtype -- see the
         # class docstring for the real bug this was.
         gu_dense = _dequant(
             b["qweight_gate_up"][s_i], b["qzeros_gate_up"][s_i], b["scales_gate_up"][s_i],
