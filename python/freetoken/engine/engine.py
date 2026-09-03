@@ -144,6 +144,14 @@ class Engine:
             num_pages = max(config.num_page_override, default_num_pages)
         else:
             num_pages = default_num_pages
+        # +1 page of slack: MHAKVCache (issue #173) reserves slot 0 as a
+        # dummy/padding slot, so the pool's real allocatable capacity is one
+        # page short of `num_pages * page_size` slots -- without this, the
+        # LAST request admitted up to max_running_req would fail to allocate
+        # its full max_seq_len-sized row (confirmed directly: a 2-running-req
+        # pool sized to exactly fit 2 full rows raised "KV pool full" on the
+        # second admission).
+        num_pages += 1
         self.page_size = config.page_size
         self.max_seq_len = max_seq_len
         self.max_running_req = config.max_running_req
@@ -155,14 +163,19 @@ class Engine:
             dtype=dtype or torch.bfloat16,
         )
 
-        # Page table: [max_running_req+1, max_seq_len] identity slot map
-        # (slot `pos` holds the token at position `pos`); +1 row so table_idx
-        # 0..max_running_req are all valid.
+        # Page table: [max_running_req+1, max_seq_len] slot map, +1 row so
+        # table_idx 0..max_running_req are all valid (the scheduler only ever
+        # hands out 0..max_running_req-1 -- see Scheduler._free_slots -- so
+        # row max_running_req is a padding row, never allocated). Rows start
+        # all-zero (pointing at MHAKVCache's reserved slot 0) and are filled
+        # with a REAL, disjoint slot run per request at admission time
+        # (add_request), not a shared identity map -- see issue
+        # `engine-kv-addressing` (#173): every row pointing at the SAME slot
+        # range let two concurrently-decoding requests silently corrupt each
+        # other's KV.
         self.page_table = torch.zeros(
             (self.max_running_req + 1, max_seq_len), dtype=torch.int64, device=device
         )
-        for r in range(self.page_table.shape[0]):
-            self.page_table[r, :max_seq_len] = torch.arange(max_seq_len, device=device)
         self.kv_cache.attach_page_table(self.page_table)
 
         # Attention backend (reference pure-torch GQA under "auto").
@@ -327,22 +340,42 @@ class Engine:
         preserved -- and the assigned row is stored back on ``req``. Raises
         :class:`RuntimeError` when the request cap is reached so a caller can
         reject the request cleanly.
+
+        Also allocates this row's own disjoint KV-pool slot run (issue
+        `engine-kv-addressing`, #173) -- a chunked prompt's later
+        continuations reuse this SAME table_idx/allocation for the rest of
+        the request's lifetime (see ``scheduler/prefill.py``'s own
+        continuation handling), so one allocation here covers the whole
+        request; :meth:`_free_slot` releases it when the request finishes.
         """
         pending = make_pending_req(req.uid, req.input_ids, req.sampling_params, req.cache_handle)
         uid = self.scheduler.add(pending)
         req.uid = uid
         req.table_idx = pending._table_idx  # noqa: SLF001
+        self._allocate_slot(req.table_idx)
         return req
+
+    def _allocate_slot(self, table_idx: int) -> None:
+        """Give page-table row ``table_idx`` its own disjoint KV-pool slot
+        run, real per-request isolation instead of the old shared identity
+        map (issue #173)."""
+        num_pages = -(-self.max_seq_len // self.page_size)  # ceil
+        slots = self.kv_cache.allocate(table_idx, num_pages=num_pages)
+        self.page_table[table_idx, : self.max_seq_len] = slots[: self.max_seq_len]
 
     def abort_request(self, uid: int) -> bool:
         """Free a request's page slot and drop it from the scheduler (any phase)."""
-        return self.scheduler.abort(uid)
+        before = set(self.scheduler._free_slots)  # noqa: SLF001
+        ok = self.scheduler.abort(uid)
+        if ok:
+            for table_idx in set(self.scheduler._free_slots) - before:  # noqa: SLF001
+                self._free_slot(table_idx)
+        return ok
 
     def _free_slot(self, table_idx: int) -> None:
-        # Restore the identity slot map for a freed row (no-op on the reference
-        # pool, which re-derives the slot from the position; kept for symmetry
-        # with a paged pool that may need to clear a row on release).
-        pass
+        # Return this row's KV-pool slot run so a later request admitted to
+        # the same table_idx can allocate a fresh one (issue #173).
+        self.kv_cache.free(table_idx)
 
     # -- the loop -------------------------------------------------------------
 
@@ -485,8 +518,16 @@ class Engine:
 
         # Record the step in the scheduler: promote finished prefills into the
         # decode set, refresh the decode set, and free the rows of requests that
-        # completed (hit max_tokens / eos).
+        # completed (hit max_tokens / eos). Diff the scheduler's own free-list
+        # before/after (rather than trusting `finished` above, which only
+        # reflects THIS step's stop-condition checks) so the KV-pool release
+        # exactly matches whichever table_idx rows the scheduler itself
+        # actually freed (issue #173) -- the single source of truth for row
+        # lifetime.
+        before = set(self.scheduler._free_slots)  # noqa: SLF001
         self.scheduler.complete(batch)
+        for table_idx in set(self.scheduler._free_slots) - before:  # noqa: SLF001
+            self._free_slot(table_idx)
         return ForwardOutput(next_token_ids=next_ids, finished=finished, reqs=list(batch.reqs))
 
     def generate(self, max_steps: int | None = None) -> List[List[int]]:
@@ -586,10 +627,17 @@ class Engine:
     def _rebuild_kv_pool(self, num_pages: int) -> None:
         """Rebuild the paged KV pool + page table + scheduler page budget.
 
-        Called by :meth:`rebuild_cache` after the split is re-planned. The page
-        table is re-identity-mapped for the new size and the scheduler's page
-        budget + max-pages are updated so it schedules against the new pool.
+        Called by :meth:`rebuild_cache` after the split is re-planned. This
+        replaces the pool with a brand-new, empty one (no in-flight request's
+        actual KV bytes survive a rebuild -- a pre-existing limitation of the
+        elastic-VRAM feature, not something this fixes); the fresh page table
+        starts all-zero (no rows allocated), matching a freshly-constructed
+        engine's own state. The scheduler's page budget + max-pages are
+        updated so it schedules against the new pool.
         """
+        # +1 page of slack for MHAKVCache's reserved slot 0 -- see the same
+        # comment at construction time (issue #173).
+        num_pages += 1
         self.kv_cache = create_kv_pool(
             self.config.model_config,
             page_size=self.page_size,
@@ -600,8 +648,6 @@ class Engine:
         self.page_table = torch.zeros(
             (self.max_running_req + 1, self.max_seq_len), dtype=torch.int64, device=self.device
         )
-        for r in range(self.page_table.shape[0]):
-            self.page_table[r, : self.max_seq_len] = torch.arange(self.max_seq_len, device=self.device)
         self.kv_cache.attach_page_table(self.page_table)
         self.ctx.kv_cache = self.kv_cache
         self.ctx.page_table = self.page_table

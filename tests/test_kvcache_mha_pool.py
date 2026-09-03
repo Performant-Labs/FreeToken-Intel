@@ -129,11 +129,13 @@ def test_write_read_kv_roundtrip_through_page_table():
     assert torch.all(got_k2 == 0)
 
 
-def test_create_kv_pool_factory_still_returns_flat_pool():
-    # The hero factory is unchanged by this issue: it still builds the flat
-    # identity pool, NOT MHAKVCache -- so wiring MHAKVCache in must be explicit.
+def test_create_kv_pool_factory_returns_mha_pool():
+    # Issue `engine-kv-addressing` (#173): the flat identity pool's shared
+    # page_table (every row -> the SAME slot range) let two requests
+    # decoding concurrently at overlapping positions corrupt each other's
+    # KV. create_kv_pool -- the engine's own factory -- now builds
+    # MHAKVCache, which gives each request a real, disjoint slot run.
     pool = create_kv_pool(
         _ModelConfig(), page_size=2, num_pages=8, device=torch.device("cpu"), dtype=torch.float32
     )
-    assert isinstance(pool, MHAKVCache.__mro__[1])  # the flat BaseKVCachePool
-    assert not isinstance(pool, MHAKVCache)
+    assert isinstance(pool, MHAKVCache)
