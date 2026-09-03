@@ -825,6 +825,27 @@ class SlotWeightAccessor:
             b["blocks_down"][s_i], b["scales_down"][s_i],
         )
 
+    def get_int8_packed(
+        self, s_i: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Raw packed ``(weight_packed_gate_up, weight_scale_gate_up,
+        weight_packed_down, weight_scale_down, k_gate_up, k_down)`` views
+        for slot ``s_i`` -- ``int8_channel`` only, and never dequantized
+        (unlike :meth:`get`). For the native fused-GEMM forward path (issue
+        `moe-quant-banks-native-multi`, #163): :func:`freetoken.kernel.
+        triton.fused_int8_linear.fused_int8_expert_forward` consumes these
+        directly, skipping the dense-weight materialization :meth:`get`
+        performs.
+        """
+        if self.quant_format != "int8_channel":
+            raise ValueError(f"get_int8_packed is int8_channel-only, got quant_format={self.quant_format!r}")
+        b = self._banks
+        return (
+            b["weight_packed_gate_up"][s_i], b["weight_scale_gate_up"][s_i],
+            b["weight_packed_down"][s_i], b["weight_scale_down"][s_i],
+            self._int8_k_gate_up, self._int8_k_down,
+        )
+
     def expert_forward(self, s_i: int, x: torch.Tensor) -> torch.Tensor:
         """One MoE expert's SwiGLU forward (``down(silu(gate(x)) * up(x))``)
         for slot ``s_i`` against input ``x``. Previously each offload
@@ -832,15 +853,17 @@ class SlotWeightAccessor:
         formula itself, against :meth:`get`'s dense output, via a small
         ``_expert_compute`` helper duplicated in each model file; centralized
         here instead so it can also dispatch to a native fused-GEMM path
-        (issue `moe-quant-banks-native`, #139; extended to fp8_block/mxfp4
-        by #163) when one is expected to win: real XPU hardware, a format
-        with a fused kernel, and ``x``'s row count at or below that
-        format's measured crossover (see each format's own
+        (issue `moe-quant-banks-native`, #139; extended to fp8_block/mxfp4/
+        int8_channel by #163) when one is expected to win: real XPU
+        hardware, a format with a fused kernel, and ``x``'s row count at or
+        below that format's measured crossover (see each format's own
         ``prefer_fused_over_dequant``: :func:`freetoken.kernel.triton.
         gptq_fused_linear.prefer_fused_over_dequant`,
         :func:`freetoken.kernel.triton.fused_fp8_linear.
         prefer_fused_over_dequant`, :func:`freetoken.kernel.triton.
-        fused_mxfp4_linear.prefer_fused_over_dequant`). Every other case
+        fused_mxfp4_linear.prefer_fused_over_dequant`,
+        :func:`freetoken.kernel.triton.fused_int8_linear.
+        prefer_fused_over_dequant`). Every other case
         falls back to dequantizing via :meth:`get` first, the same math the
         old per-model helpers ran.
         """
@@ -879,6 +902,18 @@ class SlotWeightAccessor:
                 return fused_mxfp4_expert_forward(
                     x, blk_gu, sc_gu, blk_dn, sc_dn,
                     intermediate=self._intermediate, out_dtype=self._dtype,
+                )
+        elif self.quant_format == "int8_channel" and self._is_xpu:
+            from freetoken.kernel.triton.fused_int8_linear import (
+                fused_int8_expert_forward,
+                prefer_fused_over_dequant,
+            )
+
+            if prefer_fused_over_dequant(x.shape[0]):
+                wp_gu, ws_gu, wp_dn, ws_dn, k_gu, k_dn = self.get_int8_packed(s_i)
+                return fused_int8_expert_forward(
+                    x, wp_gu, ws_gu, wp_dn, ws_dn,
+                    intermediate=self._intermediate, k_gate_up=k_gu, k_down=k_dn, out_dtype=self._dtype,
                 )
         gate_w, up_w, down_w = self.get(s_i)
         return (torch.nn.functional.silu(x @ gate_w.t()) * (x @ up_w.t())) @ down_w.t()
