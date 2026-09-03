@@ -392,7 +392,7 @@ def _attach_offload_cache(
     while the model's blocks are indexed by *absolute layer id*, so we also give
     the model the ``moe_layer_id`` map (layer_id -> MoE index) the forward uses.
     """
-    from freetoken.models.weight import GptqExpertBank
+    from freetoken.models.weight import GptqExpertBank, MxfpExpertBank
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     num_experts = int(getattr(model_config, "num_experts", 0) or 0)
@@ -419,14 +419,35 @@ def _attach_offload_cache(
     # stream_moe_expert_sources_gptq for these), not re-derived from the
     # checkpoint path here.
     is_gptq = bool(gate_up_banks) and isinstance(gate_up_banks[0], GptqExpertBank)
+    # An MXFP4-quantized checkpoint's banks (issue moe-quant-banks-mxfp4,
+    # #153) are MxfpExpertBank, detected the same way as GPTQ's -- from the
+    # bank shape load_moe_expert_sources already dispatched to
+    # stream_moe_expert_sources_mxfp4 for.
+    is_mxfp4 = bool(gate_up_banks) and isinstance(gate_up_banks[0], MxfpExpertBank)
+    quant_format = "gptq_int4" if is_gptq else ("mxfp4" if is_mxfp4 else "bf16")
     cache = OffloadMoeCache(
         num_layers=num_moe,
         num_experts=num_experts,
         cache_size=cache_size,
         device=device,
-        quant_format="gptq_int4" if is_gptq else "bf16",
+        quant_format=quant_format,
     )
-    if is_gptq:
+    if is_mxfp4:
+        # Four packed banks (issue moe-quant-banks-mxfp4, #153's
+        # _BANK_SCHEMAS["mxfp4"]) -- every bank is one row per expert (no
+        # g_idx-equivalent side table; MXFP4's scale is fully local to its
+        # own block, never shared across a whole projection), so
+        # set_bank_sources' generic per-expert-row contract applies
+        # unchanged, same as gptq_int4 below.
+        cache.set_bank_sources(
+            {
+                "blocks_gate_up": [b.blocks for b in gate_up_banks],
+                "scales_gate_up": [b.scales for b in gate_up_banks],
+                "blocks_down": [b.blocks for b in down_banks],
+                "scales_down": [b.scales for b in down_banks],
+            }
+        )
+    elif is_gptq:
         # Six packed banks (issue moe-quant-banks-schema, #136's schema) --
         # every bank is one row per expert, so set_bank_sources' generic
         # per-expert-row contract applies unchanged. g_idx is NOT a bank (it
