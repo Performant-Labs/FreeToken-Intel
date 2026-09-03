@@ -392,7 +392,7 @@ def _attach_offload_cache(
     while the model's blocks are indexed by *absolute layer id*, so we also give
     the model the ``moe_layer_id`` map (layer_id -> MoE index) the forward uses.
     """
-    from freetoken.models.weight import GptqExpertBank, Int8ExpertBank, MxfpExpertBank
+    from freetoken.models.weight import Fp8BlockExpertBank, GptqExpertBank, Int8ExpertBank, MxfpExpertBank
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     num_experts = int(getattr(model_config, "num_experts", 0) or 0)
@@ -419,6 +419,12 @@ def _attach_offload_cache(
     # stream_moe_expert_sources_gptq for these), not re-derived from the
     # checkpoint path here.
     is_gptq = bool(gate_up_banks) and isinstance(gate_up_banks[0], GptqExpertBank)
+    # A block-FP8-quantized checkpoint's banks (issue moe-quant-banks-fp8,
+    # #152) are Fp8BlockExpertBank, detected the same way -- from the bank
+    # shape itself (load_moe_expert_sources already dispatched to
+    # stream_moe_expert_sources_fp8 for these), not re-derived from the
+    # checkpoint path here.
+    is_fp8_block = bool(gate_up_banks) and isinstance(gate_up_banks[0], Fp8BlockExpertBank)
     # An MXFP4-quantized checkpoint's banks (issue moe-quant-banks-mxfp4,
     # #153) are MxfpExpertBank, detected the same way as GPTQ's -- from the
     # bank shape load_moe_expert_sources already dispatched to
@@ -430,6 +436,8 @@ def _attach_offload_cache(
     is_int8 = bool(gate_up_banks) and isinstance(gate_up_banks[0], Int8ExpertBank)
     if is_gptq:
         quant_format = "gptq_int4"
+    elif is_fp8_block:
+        quant_format = "fp8_block"
     elif is_mxfp4:
         quant_format = "mxfp4"
     elif is_int8:
@@ -498,6 +506,20 @@ def _attach_offload_cache(
         from freetoken.models.weight import checkpoint_gptq_group_size
 
         cache.gptq_group_size = checkpoint_gptq_group_size(model_path)
+    elif is_fp8_block:
+        # Four packed banks (_BANK_SCHEMAS["fp8_block"]) -- every bank is one
+        # row per expert, so set_bank_sources' generic per-expert-row contract
+        # applies unchanged. Unlike GPTQ there is no shared side tensor to
+        # register via set_extra_metadata (see Fp8BlockExpertBank's own
+        # docstring): block-FP8's weight_scale_inv is genuinely per-expert.
+        cache.set_bank_sources(
+            {
+                "weight_gate_up": [b.weight for b in gate_up_banks],
+                "scale_gate_up": [b.weight_scale_inv for b in gate_up_banks],
+                "weight_down": [b.weight for b in down_banks],
+                "scale_down": [b.weight_scale_inv for b in down_banks],
+            }
+        )
     else:
         # The banks are indexed by MoE-layer order (moe_layers), matching the
         # cache's 0-based MoE-layer ids.

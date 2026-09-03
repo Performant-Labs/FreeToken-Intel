@@ -696,17 +696,15 @@ class _Qwen3MoE(nn.Module):
         # issue's own accept criteria explicitly allows it as a first cut),
         # not a silent gap -- gptq_int4 previously would have crashed loudly
         # here (KeyError) rather than produced wrong numbers, and now simply
-        # never reaches that code path.
-        # Issue moe-quant-banks-mxfp4 (#153) / moe-quant-banks-int8 (#154):
-        # "mxfp4" and "int8_channel" are excluded from the hybrid split for
-        # the exact same reason gptq_int4 is -- the CPU half's math reads
-        # model.moe_cache.bank_sources["gate_up"] / ["down"] directly, which
-        # either format's differently-named banks (blocks_gate_up, ...;
-        # weight_gate_up, ...) would KeyError on. No dequant-and-cache logic
-        # exists for the CPU path yet, so force fetch_frac to 1.0 here too.
+        # never reaches that code path. "fp8_block" (issue
+        # moe-quant-banks-fp8, #152), "mxfp4" (issue moe-quant-banks-mxfp4,
+        # #153), and "int8_channel" (issue moe-quant-banks-int8, #154) hit
+        # the exact same bank-name mismatch (weight_gate_up/scale_gate_up/...
+        # or blocks_.../scales_... instead of gate_up/down) -- excluded for
+        # the same reason, not a separate decision.
         cache_quant_format = getattr(getattr(model, "moe_cache", None), "quant_format", "bf16")
         fetch_frac = float(getattr(model, "moe_hybrid_fetch_fraction", 0.0) or 0.0)
-        if cache_quant_format in ("gptq_int4", "mxfp4", "int8_channel"):
+        if cache_quant_format in ("gptq_int4", "fp8_block", "mxfp4", "int8_channel"):
             fetch_frac = 1.0
         if fetch_frac <= 0.0:
             # No usable profile -> every miss rides PCIe (pure offload).
