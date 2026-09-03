@@ -129,6 +129,7 @@ def plan_cache_budget(
     dtype_bytes: int = 2,
     min_moe_cache_size: Optional[int] = None,
     moe_fraction: Optional[float] = None,
+    bytes_per_slot_override: Optional[int] = None,
 ) -> CacheBudget:
     """Split the addressable VRAM into a MoE expert cache and a KV pool.
 
@@ -165,8 +166,19 @@ def plan_cache_budget(
         num_layers: total decoder layers (the KV pool's layer count).
         num_kv_heads: KV (GQA) heads per layer.
         head_dim: per-head dim.
-        dtype_bytes: bytes per element (2 for bf16/fp16, 4 for fp32).
+        dtype_bytes: bytes per element (2 for bf16/fp16, 4 for fp32). Ignored
+            when ``bytes_per_slot_override`` is given.
         min_moe_cache_size: override the minimum slot count (default ``E``).
+        bytes_per_slot_override: use this exact per-slot byte count instead
+            of ``_bytes_per_expert_slot``'s bf16 ``(gate_up + down) *
+            dtype_bytes`` formula (issue #16 / #136) -- for a non-bf16 bank
+            schema (e.g. a GPTQ-Int4-packed offload cache), whose real
+            per-slot footprint is a different shape the single-scalar
+            ``dtype_bytes`` formula cannot express. See
+            ``freetoken.moe.offload_cache.gptq_int4_bytes_per_expert_slot``
+            for the gptq_int4 schema's real byte-size helper -- this module
+            stays torch-free, so it does not import that helper itself; the
+            caller computes it and passes the result in here.
 
     Returns:
         A :class:`CacheBudget` with the resolved counts.
@@ -188,9 +200,14 @@ def plan_cache_budget(
 
     budget = int(total_vram_bytes * memory_ratio)
 
-    bytes_per_slot = _bytes_per_expert_slot(
-        num_experts, moe_intermediate_size, hidden_size, dtype_bytes
-    )
+    if bytes_per_slot_override is not None:
+        if bytes_per_slot_override <= 0:
+            raise ValueError(f"bytes_per_slot_override must be positive, got {bytes_per_slot_override}")
+        bytes_per_slot = bytes_per_slot_override
+    else:
+        bytes_per_slot = _bytes_per_expert_slot(
+            num_experts, moe_intermediate_size, hidden_size, dtype_bytes
+        )
     bytes_per_kv_token = _bytes_per_kv_token(num_layers, num_kv_heads, head_dim, dtype_bytes)
     if bytes_per_kv_token <= 0:
         raise ValueError("bytes_per_kv_token computed to zero")

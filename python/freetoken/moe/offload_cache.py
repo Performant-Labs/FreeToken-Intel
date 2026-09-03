@@ -47,9 +47,80 @@ logger = init_logger(__name__)
 # The single bank layout the loader produces today (ADR 0002). A format's schema
 # names its banks in registration order; the cache machinery is layout-agnostic
 # and iterates the schema. "bf16" is the only layout wired up in this port.
+#
+# "gptq_int4" (issue moe-quant-banks-schema, #136): a GPTQ-Int4-quantized
+# checkpoint (e.g. the official Qwen/Qwen3.5-35B-A3B-GPTQ-Int4) packs each
+# projection into three per-expert tensors -- qweight/qzeros/scales (see
+# freetoken.kernel.triton.gptq_linear for the bit layout) -- instead of bf16's
+# one. Six banks total: {qweight,qzeros,scales} x {gate_up,down}. All six are
+# genuinely one-row-per-expert ([E, ...], same as bf16's two banks) so they
+# fit set_bank_sources/copy_missing/rebuild completely unchanged -- these are
+# plain index bookkeeping + generic tensor copies with no bf16/float
+# assumption anywhere (verified by reading the whole file, not assumed).
+#
+# GPTQ's fourth component, g_idx, deliberately has NO bank here: it is a
+# single [K] tensor per (layer, projection type) -- identical for every
+# expert of that projection (g_idx[k] = k // group_size depends only on K and
+# group_size, both architecture constants) -- so it does not fit the
+# per-expert [E, ...] row-per-slot contract every bank above shares, and
+# manufacturing E identical copies of it would be real, pointless memory and
+# LRU-slot churn for data that never varies per expert or per step. It lives
+# in OffloadMoeCache.extra_metadata instead (see set_extra_metadata /
+# get_extra_metadata below): a plain per-layer side table the compute step
+# (issue #137) reads directly, never routed through the LRU slot machinery.
 _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "bf16": ("gate_up", "down"),
+    "gptq_int4": (
+        "qweight_gate_up",
+        "qzeros_gate_up",
+        "scales_gate_up",
+        "qweight_down",
+        "qzeros_down",
+        "scales_down",
+    ),
 }
+
+
+def gptq_int4_bytes_per_expert_slot(
+    hidden_size: int,
+    moe_intermediate_size: int,
+    group_size: int,
+    *,
+    qweight_bytes: int = 4,  # int32
+    scale_bytes: int = 2,  # fp16/bf16
+) -> int:
+    """Real packed VRAM bytes for ONE expert slot under the ``gptq_int4``
+    schema -- for :func:`freetoken.engine.cache_budget.plan_cache_budget`'s
+    ``bytes_per_slot_override`` (issue #16's planner hardcodes the bf16
+    2-bank ``(gate_up + down) * dtype_bytes`` formula; a packed int4 slot's
+    real footprint is a different, smaller shape entirely, summed per bank
+    below rather than approximated by one scalar ``dtype_bytes``).
+
+    Mirrors :func:`freetoken.kernel.triton.gptq_linear`'s packing: for a
+    ``[K, N]`` logical projection, ``qweight`` packs 8 int4 values per int32
+    word along ``K`` (``K // 8`` words x ``N``); ``qzeros`` packs 8 per word
+    along ``N``, one row per group (``ceil(K/group_size) x N // 8``);
+    ``scales`` is one fp16/bf16 value per (group, output channel)
+    (``ceil(K/group_size) x N``). ``gate_up`` fuses gate_proj + up_proj (K =
+    hidden_size, N = 2 * moe_intermediate_size); ``down`` is the reverse
+    (K = moe_intermediate_size, N = hidden_size).
+    """
+    if hidden_size <= 0 or moe_intermediate_size <= 0 or group_size <= 0:
+        raise ValueError(
+            "gptq_int4_bytes_per_expert_slot needs positive hidden_size / "
+            "moe_intermediate_size / group_size"
+        )
+
+    def _proj_bytes(k: int, n: int) -> int:
+        groups = -(-k // group_size)  # ceil
+        qweight = (k // 8) * n * qweight_bytes
+        qzeros = groups * (n // 8) * qweight_bytes
+        scales = groups * n * scale_bytes
+        return qweight + qzeros + scales
+
+    gate_up = _proj_bytes(hidden_size, 2 * moe_intermediate_size)
+    down = _proj_bytes(moe_intermediate_size, hidden_size)
+    return gate_up + down
 
 
 class OffloadMoeCache:
@@ -119,6 +190,12 @@ class OffloadMoeCache:
         self.bank_caches: dict[str, torch.Tensor] = {}
         self.banks: list[tuple[list, torch.Tensor]] = []
 
+        # Per-layer side data that does NOT vary per expert/slot (issue #136),
+        # e.g. gptq_int4's g_idx: [K], identical for every expert of a
+        # projection type, so it never needs the LRU slot-cache/copy_missing
+        # machinery above -- see the _BANK_SCHEMAS["gptq_int4"] comment.
+        self.extra_metadata: dict[str, list] = {}
+
         # The layer whose misses ensure_experts / materialize_layer staged last.
         self._pending_src_layer: Optional[int] = None
         self._pending_whole_layer = False
@@ -150,6 +227,25 @@ class OffloadMoeCache:
             self.bank_sources[bank] = list(per_layer)
             self.bank_caches[bank] = cache
             self.banks.append((self.bank_sources[bank], cache))
+
+    def set_extra_metadata(self, name: str, per_layer: list) -> None:
+        """Attach a per-layer side tensor that does NOT vary per expert/slot
+        (issue #136) -- e.g. gptq_int4's ``g_idx``. Stored as-is (host or
+        device, whatever the caller passes), with none of ``set_bank_sources``'s
+        per-expert-row / LRU-slot-cache machinery: there is nothing to evict
+        or copy-on-miss for data that is identical for every expert of a
+        projection type. ``per_layer`` must have exactly ``num_layers``
+        entries, one per layer (matching every other bank's per-layer list
+        length contract), even though each entry itself has no expert axis.
+        """
+        if len(per_layer) != self.num_layers:
+            raise ValueError(f"extra metadata {name!r} has {len(per_layer)} layers, expected {self.num_layers}")
+        self.extra_metadata[name] = list(per_layer)
+
+    def get_extra_metadata(self, name: str, layer_id: int):
+        """The per-layer side tensor set by :meth:`set_extra_metadata`, for
+        this layer. Raises ``KeyError`` if ``name`` was never set."""
+        return self.extra_metadata[name][layer_id]
 
     def rebuild(self, cache_size: int) -> None:
         """Re-allocate the device slot pool at a new ``cache_size`` (issue #16).
@@ -506,4 +602,86 @@ class OffloadMoeCache:
         return self.device.type == "xpu" and is_xpu_available()
 
 
-__all__ = ["OffloadMoeCache", "_BANK_SCHEMAS"]
+# Bank name convention this port uses for the "gptq_int4" schema (issue
+# moe-quant-banks-schema, #136): three packed tensors per projection slot
+# (qweight/qzeros/scales), no g_idx bank -- g_idx is deterministic under
+# desc_act=False (the real checkpoint's setting, the only case this port
+# implements) and is reconstructed on the fly from group_size instead of
+# being stored per-expert (see gptq_linear.dequantize_gptq_int4_sequential_
+# groups). If #136 registers different bank names, update this tuple to
+# match -- it is the single place that name is spelled.
+GPTQ_INT4_BANK_NAMES: tuple[str, ...] = (
+    "qweight_gate_up",
+    "qzeros_gate_up",
+    "scales_gate_up",
+    "qweight_down",
+    "qzeros_down",
+    "scales_down",
+)
+
+
+class SlotWeightAccessor:
+    """Per-step accessor for one MoE layer's resident-slot expert weights,
+    abstracting the offload forward's ``gu[s_i, ...]`` / ``dn[s_i]`` bf16
+    indexing over a quantized bank format too (issue moe-quant-banks-
+    compute, #137).
+
+    For ``"bf16"`` this is a thin, zero-cost wrapper around the existing
+    plain-tensor indexing (behavior is unchanged from before this class
+    existed). For ``"gptq_int4"`` each distinct slot's packed
+    qweight/qzeros/scales are dequantized to bf16 **at most once per
+    instance** (a `_forward_offload_core` call handles one MoE layer for one
+    step) -- a decode step's working set is typically small (<= num_experts
+    active slots), so this is a bounded, cheap cost per step, never the
+    whole checkpoint at once (the RAM-saving point of #134's whole epic).
+    """
+
+    def __init__(self, cache: "OffloadMoeCache", intermediate: int) -> None:
+        self.quant_format = getattr(cache, "quant_format", "bf16")
+        self._intermediate = intermediate
+        self._cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        if self.quant_format == "gptq_int4":
+            self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
+            missing = [n for n in GPTQ_INT4_BANK_NAMES if n not in self._banks]
+            if missing:
+                raise ValueError(
+                    f"gptq_int4 schema is missing expected bank(s) {missing}; "
+                    f"registered banks are {sorted(self._banks)}"
+                )
+            self._group_size = int(getattr(cache, "gptq_group_size", 128))
+        else:
+            self._gu, self._dn = cache.bank_views()
+
+    def get(self, s_i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(gate_w, up_w, down_w)`` for slot ``s_i``, in ``[out, in]``
+        weight orientation (matching ``nn.Linear.weight`` / ``_expert_compute``'s
+        expected shape) -- gate/up are ``[I, H]``, down is ``[H, I]``."""
+        if self.quant_format != "gptq_int4":
+            i = self._intermediate
+            return self._gu[s_i, 0:i], self._gu[s_i, i : 2 * i], self._dn[s_i]
+        cached = self._cache.get(s_i)
+        if cached is not None:
+            return cached
+        from freetoken.kernel.triton.gptq_linear import dequantize_gptq_int4_sequential_groups as _dequant
+
+        b = self._banks
+        gate_up_dtype = b["scales_gate_up"].dtype
+        down_dtype = b["scales_down"].dtype
+        # dequantize_gptq_int4_sequential_groups returns [in_features, out_features]
+        # (nn.Linear's transpose); .T gives the [out, in] orientation this port's
+        # bf16 bank rows already use.
+        gu_dense = _dequant(
+            b["qweight_gate_up"][s_i], b["qzeros_gate_up"][s_i], b["scales_gate_up"][s_i],
+            group_size=self._group_size, out_dtype=gate_up_dtype,
+        ).T.contiguous()
+        dn_dense = _dequant(
+            b["qweight_down"][s_i], b["qzeros_down"][s_i], b["scales_down"][s_i],
+            group_size=self._group_size, out_dtype=down_dtype,
+        ).T.contiguous()
+        i = self._intermediate
+        result = (gu_dense[0:i], gu_dense[i : 2 * i], dn_dense)
+        self._cache[s_i] = result
+        return result
+
+
+__all__ = ["OffloadMoeCache", "SlotWeightAccessor", "GPTQ_INT4_BANK_NAMES", "_BANK_SCHEMAS"]

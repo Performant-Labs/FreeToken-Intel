@@ -134,3 +134,43 @@ def test_cache_budget_is_frozen():
     c = plan_cache_budget(**BASE)
     with pytest.raises(Exception):
         c.moe_cache_size = 123  # frozen dataclass -> assignment is rejected
+
+
+# -- bytes_per_slot_override (issue #16 / moe-quant-banks-schema, #136) -----
+#
+# A non-bf16 bank schema's real per-slot footprint (e.g. gptq_int4's packed
+# int32 rows) is a different shape the single-scalar `dtype_bytes` formula
+# cannot express. `bytes_per_slot_override` lets a caller supply the real
+# value directly instead. This module stays torch-free and does not import
+# freetoken.moe.offload_cache.gptq_int4_bytes_per_expert_slot (which does
+# import torch) -- these tests pass a plain int, exactly like a real caller
+# would after computing it elsewhere.
+
+
+def test_bytes_per_slot_override_is_used_instead_of_the_bf16_formula():
+    # A deliberately tiny override (far smaller than BYTES_PER_SLOT) so the
+    # planner's slot count visibly changes if -- and only if -- the override
+    # actually took effect.
+    tiny_override = BYTES_PER_SLOT // 8
+    c = plan_cache_budget(**{**BASE, "bytes_per_slot_override": tiny_override})
+    default = plan_cache_budget(**BASE)
+    assert c.moe_cache_bytes > 0
+    assert c.moe_cache_size > default.moe_cache_size  # more, smaller slots fit the same budget
+    # The budget/KV-floor policy still holds under the override.
+    assert c.kv_num_pages >= BASE["kv_reserve_tokens"]
+    assert c.moe_cache_bytes + c.kv_bytes <= c.budget_bytes
+
+
+def test_bytes_per_slot_override_none_matches_default_formula():
+    # Passing the bf16 formula's own value through the override must be a
+    # complete no-op versus not passing it at all.
+    explicit = plan_cache_budget(**{**BASE, "bytes_per_slot_override": BYTES_PER_SLOT})
+    default = plan_cache_budget(**BASE)
+    assert explicit == default
+
+
+def test_bytes_per_slot_override_rejects_non_positive():
+    with pytest.raises(ValueError, match="bytes_per_slot_override"):
+        plan_cache_budget(**{**BASE, "bytes_per_slot_override": 0})
+    with pytest.raises(ValueError, match="bytes_per_slot_override"):
+        plan_cache_budget(**{**BASE, "bytes_per_slot_override": -1})
