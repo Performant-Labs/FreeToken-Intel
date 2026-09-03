@@ -590,7 +590,7 @@ class _Qwen3MoE(nn.Module):
         # the whole checkpoint (the RAM-saving point of the whole epic, #134).
         from freetoken.moe.offload_cache import SlotWeightAccessor
 
-        slot_weights = SlotWeightAccessor(cache, intermediate)
+        slot_weights = SlotWeightAccessor(cache, intermediate, flat.dtype)
         dev = flat.device
         out = torch.zeros_like(flat)
         routed_cpu = torch.empty(B, k, dtype=torch.int64)
