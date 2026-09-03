@@ -37,6 +37,11 @@ class EngineConfig:
     xpu_graph_bs: List[int] | None = None
     xpu_graph_max_bs: int | None = None
     page_size: int = 1
+    # Radix prefix-cache reuse (issue `kvcache`, #12): off by default -- a
+    # new, real request-lifecycle change (admission match/lock, completion
+    # commit/unlock, eviction-on-pressure), not yet the default the way
+    # #173's plain per-request KV isolation fix is. See CacheManager.
+    enable_prefix_cache: bool = False
     memory_ratio: float = 0.9
     linear_state_cache_ratio: float = 2.0
     swa_full_tokens_ratio: float = 0.2

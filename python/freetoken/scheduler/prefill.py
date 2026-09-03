@@ -61,11 +61,19 @@ class PendingReq:
     input_ids: List[int]
     sampling_params: "SamplingParams"
     chunked_req: "ChunkedReq | None" = None
+    # How much of input_ids is already cached (issue `kvcache`, #12): a
+    # page-aligned prefix length from CacheManager.match, or 0 for a cache
+    # miss / prefix caching disabled. Only the [cached_len, input_len) tail
+    # counts against the per-step token budget and pool footprint -- the
+    # prefix's KV is already resident, reused via the matched slot indices
+    # on ``_cache_handle``, not recomputed.
+    cached_len: int = 0
     # Assigned by Scheduler.add when the request is queued: the page-table row
     # (table_idx) and the next free row to hand the request once it finishes
     # (next_table_idx). ``_``-prefixed so they stay out of the dataclass's
     # public surface; the adder reads them at admission time. ``cache_handle``
-    # is the prefix-cache ticket (kvcache issue's scope) -- None until #12.
+    # is the prefix-cache ticket (kvcache issue's scope) -- the matched
+    # RadixCacheHandle when cached_len > 0, else None.
     _table_idx: int = 0
     _next_table_idx: int = 0
     _cache_handle: object = None
@@ -80,7 +88,11 @@ class PendingReq:
 
 
 def make_pending_req(
-    uid: int, input_ids: List[int], sampling_params: "SamplingParams", cache_handle=None
+    uid: int,
+    input_ids: List[int],
+    sampling_params: "SamplingParams",
+    cache_handle=None,
+    cached_len: int = 0,
 ) -> PendingReq:
     """Build a :class:`PendingReq` from raw request fields.
 
@@ -89,8 +101,16 @@ def make_pending_req(
     :class:`~freetoken.scheduler.Scheduler` a :class:`PendingReq`. It lives here
     (not in the engine) so the wrap stays in the torch-free scheduler package --
     the engine imports it on the XPU path but the CPU-venv policy tests never do.
+    ``cached_len`` (issue #12) is the page-aligned prefix length the engine's
+    own ``CacheManager.match`` already found before calling this.
     """
-    return PendingReq(uid=uid, input_ids=list(input_ids), sampling_params=sampling_params, _cache_handle=cache_handle)
+    return PendingReq(
+        uid=uid,
+        input_ids=list(input_ids),
+        sampling_params=sampling_params,
+        _cache_handle=cache_handle,
+        cached_len=cached_len,
+    )
 
 
 class ChunkedReq(Req):
@@ -147,11 +167,13 @@ class PrefillAdder:
         # currency gates are the kvcache issue's scope).
         if self.running_count >= self.max_running_req:
             return None
-        # KV-pool gate: this request's full extend (prompt + requested output)
-        # must fit the pool budget, with headroom for the in-flight decode set.
-        # The flat Intel pool has no prefix caching, so every prompt token
-        # is new (cached_len == 0) and the extend is the whole prompt.
-        extend_len = req.input_len
+        # KV-pool gate: this request's REMAINING extend (prompt tail past any
+        # cache-matched prefix, plus requested output) must fit the pool
+        # budget, with headroom for the in-flight decode set. cached_len
+        # (issue #12 -- CacheManager.match, 0 when there is no match / prefix
+        # caching is disabled) is already resident and reused, not
+        # recomputed, so it costs no budget here.
+        extend_len = req.input_len - req.cached_len
         estimated_len = extend_len + req.output_len
         if self.reserved_size + estimated_len > self.cache_budget:
             return None
@@ -163,7 +185,7 @@ class PrefillAdder:
         # not-yet-admitted request is turned down after passing the pool gates.
         self.reserved_size += extend_len + req.output_len
         self.running_count += 1
-        return req.input_len  # cached_len (== 0, no prefix cache yet)
+        return req.cached_len
 
     def _undo_allocation(self, req: PendingReq) -> None:
         """Roll back the reservation :meth:`_try_allocate_one` made.
@@ -177,7 +199,7 @@ class PrefillAdder:
         is owned by the scheduler (reserved at add()) and the PendingReq stays
         queued with it, so a deferred prompt neither leaks a row nor needs one.
         """
-        self.reserved_size -= req.input_len + req.output_len
+        self.reserved_size -= (req.input_len - req.cached_len) + req.output_len
         self.running_count -= 1
 
     # -- sizing + construction ------------------------------------------------
@@ -283,7 +305,8 @@ class PrefillAdder:
         resource = self._try_allocate_one(pending_req)
         if resource is None:
             return None
-        # _try_allocate_one returns the (zero) cached_len; the table index is
+        # _try_allocate_one returns the request's cached_len (issue #12 --
+        # 0 for a cache miss / prefix caching disabled); the table index is
         # assigned by the scheduler at admission time (it owns the free list).
         # The adder only decides *whether* to admit and *how much* to extend.
         table_idx = pending_req._table_idx  # noqa: SLF001 - set by Scheduler.add
@@ -308,7 +331,7 @@ class PrefillAdder:
         # later pass. The table row is unaffected (scheduler-owned, pending
         # stays queued with it).
         req = self._add_one_req(
-            pending_req, table_idx, 0, next_table_idx, cache_handle, chunked=first_in_step
+            pending_req, table_idx, resource, next_table_idx, cache_handle, chunked=first_in_step
         )
         if req is None:
             self._undo_allocation(pending_req)

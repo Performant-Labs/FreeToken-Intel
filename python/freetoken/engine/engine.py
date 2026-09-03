@@ -46,6 +46,7 @@ from freetoken.engine.config import EngineConfig
 from freetoken.kvcache import create_kv_pool
 from freetoken.models.loader import load_model
 from freetoken.scheduler import Scheduler, SchedulerConfig, make_pending_req
+from freetoken.scheduler.cache import CacheManager
 from freetoken.scheduler.prefill import ChunkedReq
 from freetoken.utils.arch import is_xpu_available
 
@@ -177,6 +178,27 @@ class Engine:
             (self.max_running_req + 1, max_seq_len), dtype=torch.int64, device=device
         )
         self.kv_cache.attach_page_table(self.page_table)
+
+        # Radix prefix-cache reuse (issue `kvcache`, #12) -- off by default
+        # (EngineConfig.enable_prefix_cache). When on, add_request matches a
+        # new prompt against what's already cached (CacheManager.match) and
+        # a finished request's full sequence is committed into the tree
+        # (see step()) so a later request can reuse it instead of
+        # recomputing. _full_ids accumulates each live request's full token
+        # history (table_idx -> ids) across decode steps -- req.input_ids
+        # itself is replaced with just the latest token during decode (see
+        # step()'s own comment on that), so this is the only place the full
+        # sequence a finished request should commit is available.
+        self.cache_manager = CacheManager(device, self.page_size) if config.enable_prefix_cache else None
+        self._full_ids: dict[int, list[int]] = {}
+        # table_idx -> the (clamped, page-aligned) cached_len this row was
+        # ADMITTED with -- req.cached_len itself gets mutated mid-lifetime
+        # (snapped to the prompt boundary once the first prefill step
+        # completes, see step()'s own comment on that), so this is the only
+        # stable record of "how much of this row was an aliased reuse of
+        # ANOTHER node's slots, never this row's own MHAKVCache allocation
+        # at all" by the time step() needs it at completion.
+        self._admitted_cached_len: dict[int, int] = {}
 
         # Attention backend (reference pure-torch GQA under "auto").
         self.attn_backend = create_attention_backend(config.attention_backend, config)
@@ -341,36 +363,123 @@ class Engine:
         :class:`RuntimeError` when the request cap is reached so a caller can
         reject the request cleanly.
 
-        Also allocates this row's own disjoint KV-pool slot run (issue
-        `engine-kv-addressing`, #173) -- a chunked prompt's later
-        continuations reuse this SAME table_idx/allocation for the rest of
-        the request's lifetime (see ``scheduler/prefill.py``'s own
-        continuation handling), so one allocation here covers the whole
-        request; :meth:`_free_slot` releases it when the request finishes.
+        When prefix caching is on (issue `kvcache`, #12), the prompt is
+        matched against the cache BEFORE admission: a matched prefix is
+        locked (protected from eviction while this request depends on it)
+        and its length flows into the scheduler so ``PrefillAdder`` only
+        extends -- and only budgets -- the un-cached tail. Also allocates
+        this row's own disjoint KV-pool slot run (issue `engine-kv-
+        addressing`, #173) -- a chunked prompt's later continuations reuse
+        this SAME table_idx/allocation for the rest of the request's
+        lifetime, so one allocation here covers the whole request;
+        :meth:`_free_slot` releases it when the request finishes (or
+        :meth:`step` detaches it first, if this request's own final
+        sequence gets committed into the tree).
         """
-        pending = make_pending_req(req.uid, req.input_ids, req.sampling_params, req.cache_handle)
+        cached_len = 0
+        cache_handle = req.cache_handle
+        matched_indices = None
+        if self.cache_manager is not None:
+            ids_tensor = torch.tensor(req.input_ids, dtype=torch.int64, device=self.page_table.device)
+            cached_len, cache_handle = self.cache_manager.match(ids_tensor)
+            # Never match the WHOLE prompt: the model still needs to run at
+            # least one real forward step to produce the logits the first
+            # generated token is sampled from (a fully-matched prompt has
+            # nothing left to extend, so the prefill batch would carry zero
+            # tokens for this request -- confirmed directly: an unclamped
+            # full match produced an empty generation). Leave the last
+            # prompt token un-cached, same convention real serving engines
+            # (vLLM/sglang) use for this exact edge case. Re-align down to
+            # the page boundary afterward: clamping can land mid-page when
+            # page_size > 1 (page_size == 1 in every config tried so far,
+            # where this is a no-op), and the pool/tree's own addressing
+            # assumes cached_len is always a whole number of pages.
+            from freetoken.utils import align_down
+
+            cached_len = align_down(min(cached_len, len(req.input_ids) - 1), self.page_size)
+            self.cache_manager.lock(cache_handle)
+            matched_indices = cache_handle.get_matched_indices()
+            req.cache_handle = cache_handle
+            req.cached_len = cached_len
+        pending = make_pending_req(req.uid, req.input_ids, req.sampling_params, cache_handle, cached_len)
         uid = self.scheduler.add(pending)
         req.uid = uid
         req.table_idx = pending._table_idx  # noqa: SLF001
-        self._allocate_slot(req.table_idx)
+        if self.cache_manager is not None:
+            self._admitted_cached_len[req.table_idx] = cached_len
+        self._allocate_slot(req.table_idx, cached_len, matched_indices)
         return req
 
-    def _allocate_slot(self, table_idx: int) -> None:
+    def _allocate_slot(
+        self, table_idx: int, cached_len: int = 0, matched_indices: torch.Tensor | None = None
+    ) -> None:
         """Give page-table row ``table_idx`` its own disjoint KV-pool slot
-        run, real per-request isolation instead of the old shared identity
-        map (issue #173)."""
-        num_pages = -(-self.max_seq_len // self.page_size)  # ceil
-        slots = self.kv_cache.allocate(table_idx, num_pages=num_pages)
-        self.page_table[table_idx, : self.max_seq_len] = slots[: self.max_seq_len]
+        run for the un-cached tail, real per-request isolation instead of
+        the old shared identity map (issue #173) -- plus, when ``cached_len``
+        > 0 (issue #12), the matched (reused, tree-owned) slot indices for
+        the cached prefix, so attention over the full history reads the
+        already-computed K/V for those positions instead of a fresh
+        (garbage, never-written) allocation.
+
+        With prefix caching on (issue #12), a finished request's slots stay
+        tree-owned rather than returning to the pool's free list (see
+        :meth:`step`'s commit block), so the pool can run genuinely empty
+        even though most of its bytes are just cached, reusable data sitting
+        idle. If a fresh allocation doesn't fit, evict enough LRU
+        (unlocked) tree nodes to make room and retry once before giving up.
+        """
+        if cached_len:
+            self.page_table[table_idx, :cached_len] = matched_indices[:cached_len]
+        remaining = self.max_seq_len - cached_len
+        num_pages = -(-remaining // self.page_size)  # ceil
+        try:
+            slots = self.kv_cache.allocate(table_idx, num_pages=num_pages)
+        except RuntimeError:
+            if self.cache_manager is None:
+                raise
+            need = num_pages * self.page_size
+            to_evict = min(need, self.cache_manager.evictable_size)
+            if to_evict <= 0:
+                raise
+            evicted = self.cache_manager.evict(to_evict)
+            self.kv_cache.free_slots(evicted)
+            slots = self.kv_cache.allocate(table_idx, num_pages=num_pages)
+        self.page_table[table_idx, cached_len : self.max_seq_len] = slots[:remaining]
 
     def abort_request(self, uid: int) -> bool:
-        """Free a request's page slot and drop it from the scheduler (any phase)."""
+        """Free a request's page slot and drop it from the scheduler (any phase).
+
+        An aborted request's partial sequence is never committed into the
+        prefix cache (issue #12) -- only a request that actually finishes
+        does (see :meth:`step`) -- but a matched handle it was holding
+        (locked at admission, in :meth:`add_request`) still needs
+        unlocking, or those tree nodes stay pinned (never evictable) forever.
+        """
+        if self.cache_manager is not None:
+            handle = self._find_cache_handle(uid)
+            if handle is not None:
+                self.cache_manager.unlock(handle)
         before = set(self.scheduler._free_slots)  # noqa: SLF001
         ok = self.scheduler.abort(uid)
         if ok:
             for table_idx in set(self.scheduler._free_slots) - before:  # noqa: SLF001
                 self._free_slot(table_idx)
+                self._full_ids.pop(table_idx, None)
+                self._admitted_cached_len.pop(table_idx, None)
         return ok
+
+    def _find_cache_handle(self, uid: int):
+        """The live request's locked prefix-cache handle (issue #12), if
+        any -- looked up by uid across the pending queue (including a
+        chunked continuation) and the decode set, since ``Scheduler.abort``
+        itself does not hand the request back to the caller."""
+        for pending in self.scheduler.prefill_manager.pending_list:
+            if pending.uid == uid:
+                return pending.chunked_req.cache_handle if pending.chunked_req is not None else pending._cache_handle  # noqa: SLF001
+        for req in self.scheduler.decode_manager.running_reqs:
+            if req.uid == uid:
+                return req.cache_handle
+        return None
 
     def _free_slot(self, table_idx: int) -> None:
         # Return this row's KV-pool slot run so a later request admitted to
@@ -489,6 +598,16 @@ class Engine:
             # The batch phase is uniform, so the append rule is uniform too.
             req.input_ids = [tok] if batch.phase == "decode" else list(req.input_ids) + [tok]
             req.device_len += 1
+            if self.cache_manager is not None:
+                # Track this request's FULL token history for a later commit
+                # into the prefix cache (issue #12) -- req.input_ids itself
+                # is replaced with just the latest token during decode (see
+                # the comment on that a few lines below), so it alone can't
+                # supply the full sequence once this request finishes.
+                if batch.phase == "decode":
+                    self._full_ids[req.table_idx].append(tok)
+                else:
+                    self._full_ids[req.table_idx] = list(req.input_ids)
             # The FINAL chunk of a chunked prefill -- the one that just
             # completed the prompt -- is a plain Req (promoted out of the
             # ChunkedReq chain) whose cached_len is > 0 (it resumed from a
@@ -516,6 +635,56 @@ class Engine:
             if req.aborted:
                 finished.append(req)
 
+        # Commit each finished request's full sequence into the prefix cache
+        # (issue #12) BEFORE the scheduler frees its row below -- a later
+        # request can then reuse it instead of recomputing. Ownership of the
+        # committed slots transfers to the tree: detach (not free) releases
+        # this table_idx's own bookkeeping so a future, unrelated request
+        # can reuse the row, without returning the now-tree-owned slots to
+        # the pool's free list (only the tree's own eviction does that).
+        if self.cache_manager is not None:
+            for req in finished:
+                full_ids = self._full_ids.pop(req.table_idx, None)
+                admitted_cached_len = self._admitted_cached_len.pop(req.table_idx, 0)
+                if req.cache_handle is not None:
+                    self.cache_manager.unlock(req.cache_handle)
+                if full_ids:
+                    ids_tensor = torch.tensor(full_ids, dtype=torch.int64, device=self.device)
+                    indices = self.page_table[req.table_idx, : len(full_ids)].clone()
+                    insert_result = self.cache_manager.commit(ids_tensor, indices)
+                    # Ownership of the committed slots transfers to the tree
+                    # -- detach (not the normal _free_slot/free path below)
+                    # releases only this table_idx's bookkeeping, so a
+                    # future unrelated request can reuse the row, without
+                    # returning the now-tree-owned slots to the pool's free
+                    # list (only the tree's own eviction does that).
+                    self.kv_cache.detach(req.table_idx)
+                    # Not everything this row's own MHAKVCache allocation
+                    # (the [admitted_cached_len, max_seq_len) range --
+                    # [0, admitted_cached_len) was never this row's own
+                    # allocation at all, it was an aliased reuse of ANOTHER
+                    # node's slots) ends up tree-owned:
+                    # insert_result.cached_len (InsertResult's own "length
+                    # already in cache before insertion" -- base.py) is how
+                    # much of what we offered the tree already had
+                    # elsewhere -- always >= admitted_cached_len (our own
+                    # reused prefix is guaranteed still there, since we
+                    # locked it), so [admitted_cached_len,
+                    # insert_result.cached_len) is real, valid, but
+                    # redundant data (freeable), and [insert_result.
+                    # cached_len, len(full_ids)) is what the tree just
+                    # newly adopted (do NOT free -- it owns those now).
+                    # This row's never-actually-written tail (allocated up
+                    # front for the whole max_seq_len, past however many
+                    # tokens this request actually generated) was never
+                    # part of either span. Both freeable ranges must return
+                    # to the pool's free list, or they leak: allocated
+                    # forever, owned by neither this (now-gone) request nor
+                    # the tree.
+                    redundant = self.page_table[req.table_idx, admitted_cached_len : insert_result.cached_len]
+                    never_written = self.page_table[req.table_idx, len(full_ids) : self.max_seq_len]
+                    self.kv_cache.free_slots(torch.cat([redundant, never_written]))
+
         # Record the step in the scheduler: promote finished prefills into the
         # decode set, refresh the decode set, and free the rows of requests that
         # completed (hit max_tokens / eos). Diff the scheduler's own free-list
@@ -523,7 +692,9 @@ class Engine:
         # reflects THIS step's stop-condition checks) so the KV-pool release
         # exactly matches whichever table_idx rows the scheduler itself
         # actually freed (issue #173) -- the single source of truth for row
-        # lifetime.
+        # lifetime. A row already detached above (committed into the tree)
+        # makes this a harmless no-op for that table_idx (MHAKVCache.free on
+        # an already-detached req_id is a no-op).
         before = set(self.scheduler._free_slots)  # noqa: SLF001
         self.scheduler.complete(batch)
         for table_idx in set(self.scheduler._free_slots) - before:  # noqa: SLF001
