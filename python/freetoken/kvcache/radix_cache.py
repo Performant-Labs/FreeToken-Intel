@@ -49,6 +49,19 @@ class RadixTreeNode:
         RadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
 
+        # Secondary "currency" for hybrid models (HybridRadixCache, issue
+        # `semantic-cache-hybrid-tree`, #169): an optional GDN (Gated Delta
+        # Net) recurrent-state snapshot slot attached at this node's END
+        # boundary, with its own ref count. None for the plain KV radix
+        # (this class is shared by both -- HybridRadixCache is a separate
+        # class built on top of the same node/walk/split logic, so the
+        # production KV-only radix stays completely unaffected). split_at
+        # leaves the new prefix node's mamba_value None ("a snapshot cannot
+        # be split") -- the snapshot stays on the original (suffix) node,
+        # whose end boundary is unchanged.
+        self.mamba_value: int | None = None
+        self.mamba_ref_count: int = 0
+
         # these fields should be updated later
         self._key: torch.Tensor
         self._value: torch.Tensor
