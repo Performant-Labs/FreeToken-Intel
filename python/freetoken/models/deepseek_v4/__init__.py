@@ -60,6 +60,54 @@ does not fit that contract (which assumes the stored K/V IS what gets
 dot-producted against Q) -- and calls ``kv_cache.read_kv``/``write_kv``
 directly, mirroring how ``qwen3_5_moe``'s ``_GatedDeltaNet`` (linear
 attention) already bypasses the same machinery for the same reason.
+
+**DeepSeek Sparse Attention (DSA)** (issue `models-dsa`, #191, on top of
+MLA above): grounded directly against HF transformers' real
+``modeling_deepseek_v32.py`` (DeepSeek-V3.2-Exp -- fetched and read this
+session, not guessed). Active only when the checkpoint's config declares
+``index_topk`` (real DeepSeek-V3.2/V4 field); every #190-only checkpoint
+with no such field is completely unaffected (dense causal MLA, unchanged).
+
+* **The indexer**: a small, separately-trained module per layer --
+  ``wq_b`` (reads the SAME compressed query residual MLA's own
+  ``q_a_layernorm(q_a_proj(hidden_states))`` already computes, not a
+  separate query path), ``wk`` + ``k_norm`` (one shared "head", MQA-style,
+  mirroring MLA's own K compression shape), ``weights_proj`` (combines
+  ``index_n_heads`` indexer heads into one score). Real math:
+  ``scores = relu((q_idx @ k_idx^T) * head_dim**-0.5)``,
+  ``index_scores = (weights_proj(hidden) * n_heads**-0.5) @ scores``.
+* **Indexer RoPE**: non-interleaved (half-split ``rotate_half``, the exact
+  convention this port's own MLA/Qwen3.5/GLM4 RoPE already uses) over the
+  same ``qk_rope_head_dim`` width as MLA's own rotary portion -- the real
+  modeling file explicitly notes this differs from ITS OWN main-attention
+  RoPE (which uses an interleaved-pairs convention this port has never
+  needed, so nothing to port there).
+* **Indexer cache -- a deliberate, novel-to-this-port reuse, not what the
+  real reference does**: the real HF reference caches the indexer key in
+  its own dedicated buffer (and, per an explicit ``# TODO`` in that same
+  real file, currently gives up on MLA's compressed-cache optimization
+  entirely once DSA is active). This port does neither: MLA's own pool
+  slot already carries an unused, same-shaped, all-zero V buffer (see
+  above) -- the indexer key (``index_head_dim`` <= the pool's
+  ``kv_lora_rank + qk_rope_head_dim`` row width for every real DeepSeek-V3/
+  V3.2 config) is stored there instead of thrown away, zero new kvcache
+  plumbing, MLA's own compressed-cache win fully preserved. A real
+  engineering choice, not a reference-matching one -- documented here so
+  it is never mistaken for the real upstream cache design.
+* **Top-k masking**: ``topk = min(index_topk, written)`` (naturally a
+  no-op once the real sequence is shorter than ``index_topk``); the
+  resulting sparse boolean mask is ANDed with the existing causal mask
+  (layered ON TOP, never a replacement).
+* **Open question, explicitly flagged by the research this was grounded
+  against, not resolved here**: GLM-5.2's own real config additionally
+  carries ``indexer_types``/``index_topk_freq``/``index_skip_topk_offset``
+  fields with NO corresponding logic anywhere in the real DeepSeek
+  reference this was grounded against -- they appear to be a GLM-5.2-
+  specific "shared indexer across layers" extension. This module
+  implements DeepSeek's own real, authoritative "full indexer every
+  layer" behavior only; GLM-5.2's own alternation semantics are a
+  separate, not-yet-researched follow-up for whoever wires
+  ``glm_moe_dsa`` (#22).
 """
 from __future__ import annotations
 
@@ -88,7 +136,6 @@ def parse_config(hf_config, model_path: str | None = None, **_kwargs) -> ModelCo
     ``config.num_attention_heads`` (read directly by the attention class,
     which never asks the pool about it) and is unaffected.
     """
-    del model_path
     # Prefer direct attribute access over to_dict(): the installed
     # transformers' real DeepseekV4Config.to_dict() silently drops
     # intermediate_size (confirmed directly -- getattr has it, to_dict()
@@ -106,6 +153,7 @@ def parse_config(hf_config, model_path: str | None = None, **_kwargs) -> ModelCo
         "v_head_dim", "attention_bias", "intermediate_size",
         "max_position_embeddings", "tie_word_embeddings", "rope_theta",
         "rope_scaling", "hidden_act", "torch_dtype", "dtype", "rms_norm_eps",
+        "index_topk", "index_head_dim", "index_n_heads",
     )}
     kv_lora_rank = int(src.get("kv_lora_rank") or 0)
     qk_rope_head_dim = int(src.get("qk_rope_head_dim") or 0)
@@ -132,7 +180,43 @@ def parse_config(hf_config, model_path: str | None = None, **_kwargs) -> ModelCo
     cfg.attrs["v_head_dim"] = int(src.get("v_head_dim") or 0)
     cfg.attrs["attention_bias"] = bool(src.get("attention_bias", False))
     cfg.attrs["rms_norm_eps"] = float(src.get("rms_norm_eps") or 1e-6)
+    # DSA (issue #191): only set when the checkpoint's own config.json FILE
+    # explicitly declares index_topk. Neither getattr(hf_config, ...) NOR
+    # hf_config.to_dict() are reliable "was it explicit" signals here:
+    # confirmed directly, the installed transformers' real DeepseekV4Config
+    # class defaults index_topk to a real non-None value (512), and
+    # to_dict() serializes that default too -- both would silently turn
+    # DSA "on" for a plain-MLA checkpoint whose config.json never mentions
+    # it at all, breaking the "every #190-only checkpoint is unaffected"
+    # guarantee this gate exists for. Read the actual JSON file instead
+    # (mirrors qwen3_moe's own _probe_head_dim, which reads raw checkpoint
+    # bytes for the same class-of-reason: a parsed config object's
+    # attribute access isn't trustworthy for this specific question).
+    # Without a model_path (a mock/unit-test hf_config with no backing
+    # file -- every model package's own test suite uses this shape) fall
+    # back to the plain to_dict() output, which is NOT polluted for a
+    # hand-built mock object (only a real HF config CLASS has non-None
+    # defaults to leak).
+    file_raw = _raw_checkpoint_json(model_path) if model_path else raw
+    if file_raw.get("index_topk"):
+        cfg.attrs["index_topk"] = int(file_raw["index_topk"])
+        cfg.attrs["index_head_dim"] = int(file_raw.get("index_head_dim") or raw.get("index_head_dim") or 0)
+        cfg.attrs["index_n_heads"] = int(file_raw.get("index_n_heads") or raw.get("index_n_heads") or 1)
     return cfg
+
+
+def _raw_checkpoint_json(model_path: str) -> dict:
+    import json
+    import os
+
+    path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 
 
 def iter_weights(model_path: str, device: torch.device, **_kwargs):
@@ -217,11 +301,35 @@ class _DeepseekV4MLA(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
         self.scale = self.qk_head_dim ** -0.5
 
+        # DSA (issue #191): built only when the checkpoint's real config
+        # sets index_topk -- see this module's own docstring for the full
+        # real-math grounding and the deliberate V-buffer cache reuse.
+        self.index_topk = config.attrs.get("index_topk")
+        if self.index_topk:
+            self.index_head_dim = config.attrs["index_head_dim"]
+            self.index_n_heads = config.attrs["index_n_heads"]
+            pool_row_width = self.kv_lora_rank + self.qk_rope_head_dim
+            if self.index_head_dim > pool_row_width:
+                raise ValueError(
+                    f"index_head_dim ({self.index_head_dim}) exceeds this pool's row "
+                    f"width ({pool_row_width}) -- the V-buffer reuse this port's DSA "
+                    "relies on (see module docstring) needs the indexer key to fit "
+                    "inside MLA's own (otherwise-unused) V slot."
+                )
+            q_resid_width = self.q_lora_rank if self.q_lora_rank else hidden
+            self.wq_b = nn.Linear(q_resid_width, self.num_heads * self.index_head_dim, bias=False, dtype=dtype)
+            self.wk = nn.Linear(hidden, self.index_head_dim, bias=False, dtype=dtype)
+            self.indexer_k_norm = nn.LayerNorm(self.index_head_dim, eps=eps, dtype=dtype)
+            self.weights_proj = nn.Linear(hidden, self.num_heads, bias=False, dtype=dtype)
+            self.index_scale = self.index_head_dim ** -0.5
+
     def forward(self, hidden_states, positions, table_idx, ctx, batch):
         T = hidden_states.shape[0]
 
+        q_resid = None
         if self.q_lora_rank:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states))
+            q = self.q_b_proj(q_resid)
         else:
             q = self.q_proj(hidden_states)
         q = q.view(T, self.num_heads, self.qk_head_dim)
@@ -244,14 +352,63 @@ class _DeepseekV4MLA(nn.Module):
         # unmodified. write_kv wants head-major [num_kv_heads, T, head_dim].
         cache_row = torch.cat([kv_latent, k_rot], dim=-1)  # [T, kv_lora_rank + rope]
         k_for_pool = cache_row.unsqueeze(0)  # [1, T, D] -- head-major, 1 head
-        v_dummy = torch.zeros_like(k_for_pool)  # V half is unused for MLA -- see docstring
-        ctx.kv_cache.write_kv(k_for_pool, v_dummy, positions, self.layer_id)
+        pool_row_width = k_for_pool.shape[-1]
+
+        if self.index_topk:
+            # DSA indexer key (issue #191): its own small wk projection +
+            # LayerNorm, then the SAME rope (same qk_rope_head_dim slice,
+            # same cos/sin already computed above for MLA) applied to just
+            # the indexer key's own rope portion. Stored in MLA's own
+            # otherwise-unused V buffer slot (padded with zeros past
+            # index_head_dim) -- see module docstring.
+            k_idx = self.indexer_k_norm(self.wk(hidden_states))  # [T, index_head_dim]
+            k_idx_rot, k_idx_pass = k_idx.split([self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim], dim=-1)
+            k_idx_rot_f = k_idx_rot.to(torch.float32)
+            k_idx_rot = (k_idx_rot_f * cos + _rotate_half(k_idx_rot_f) * sin).to(k_idx.dtype)
+            k_idx = torch.cat([k_idx_rot, k_idx_pass], dim=-1)  # [T, index_head_dim]
+            v_for_pool = F.pad(k_idx, (0, pool_row_width - self.index_head_dim)).unsqueeze(0)
+        else:
+            v_for_pool = torch.zeros_like(k_for_pool)  # V half is unused for plain MLA -- see docstring
+        ctx.kv_cache.write_kv(k_for_pool, v_for_pool, positions, self.layer_id)
 
         written = req_written_len(ctx, batch, table_idx)
         read_pos = torch.arange(written, device=hidden_states.device)
-        cached_tok, _ = ctx.kv_cache.read_kv(table_idx, read_pos, self.layer_id)  # [written, 1, D]
+        cached_tok, cached_v_tok = ctx.kv_cache.read_kv(table_idx, read_pos, self.layer_id)  # [written, 1, D] each
         cached = cached_tok.squeeze(1)  # [written, kv_lora_rank + rope]
         hist_latent, hist_k_rot = cached.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
+        index_mask = None
+        if self.index_topk:
+            hist_k_idx = cached_v_tok.squeeze(1)[:, : self.index_head_dim]  # [written, index_head_dim]
+            q_idx = self.wq_b(q_resid if q_resid is not None else hidden_states).view(T, self.num_heads, self.index_head_dim)
+            q_idx_rot, q_idx_pass = q_idx.split([self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim], dim=-1)
+            q_idx_rot_f = q_idx_rot.to(torch.float32)
+            q_idx_rot = (q_idx_rot_f * cos[:, None, :] + _rotate_half(q_idx_rot_f) * sin[:, None, :]).to(q_idx.dtype)
+            q_idx = torch.cat([q_idx_rot, q_idx_pass], dim=-1)  # [T, heads, index_head_dim]
+
+            # scores = relu((q_idx . k_idx) * scale) per (query, head, key);
+            # weights_proj combines the index_n_heads-worth of per-head
+            # scores into one score per (query, key) -- real math, see
+            # module docstring.
+            raw = torch.einsum("thd,kd->htk", q_idx.float(), hist_k_idx.float()) * self.index_scale
+            raw = F.relu(raw)  # [heads, T, written]
+            w = self.weights_proj(hidden_states).float() * (self.num_heads ** -0.5)  # [T, heads]
+            index_scores = torch.einsum("th,htk->tk", w, raw)  # [T, written]
+            # Causal-mask BEFORE top-k: a query must never select a future
+            # key (an un-masked pick that the later AND-with-causal-mask
+            # step would exclude anyway) -- without this, a query whose
+            # top-index_topk scores happen to all be future positions ends
+            # up with an all-excluded (all -inf softmax) row, a real NaN
+            # bug, not just a suboptimal selection. Guarantees every
+            # query's own position is always a selectable (score, not
+            # necessarily chosen) candidate.
+            causal_idx = positions[:, None] >= read_pos[None, :]
+            index_scores = index_scores.masked_fill(~causal_idx, float("-inf"))
+
+            topk = min(self.index_topk, written)
+            _, topk_idx = torch.topk(index_scores, topk, dim=-1)  # [T, topk]
+            index_mask = torch.zeros(T, written, dtype=torch.bool, device=hidden_states.device)
+            index_mask.scatter_(1, topk_idx, True)
 
         # Explicit (non-absorbed) decompression: expand the shared latent
         # into real per-head k_nope/value, then broadcast the (already-
@@ -266,6 +423,11 @@ class _DeepseekV4MLA(nn.Module):
         q_pos = positions
         key_pos = read_pos
         allowed = q_pos[None, :, None] >= key_pos[None, None, :]
+        if index_mask is not None:
+            # DSA: the sparse top-k mask is ANDed onto the causal mask
+            # (layered on top, never a replacement) -- real math, see
+            # module docstring.
+            allowed = allowed & index_mask[None, :, :]
         scores = torch.where(allowed, scores, torch.full_like(scores, float("-inf")))
         probs = torch.softmax(scores, dim=-1)
         out = torch.einsum("htk,khd->thd", probs, hist_v)  # [T, heads, v_head_dim]
