@@ -88,6 +88,21 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
         "qzeros_down",
         "scales_down",
     ),
+    # "mxfp4" (issue moe-quant-banks-mxfp4, #153): OCP Microscaling MXFP4 --
+    # each projection packs into two per-expert tensors (uint8 fp4-nibble
+    # blocks + uint8 E8M0 shared-exponent scale), half of GPTQ's four, and
+    # with no g_idx-equivalent side table (MXFP4's scale is fully local to
+    # its own 32-element block, never shared across a whole projection) --
+    # see freetoken.kernel.triton.mxfp4_linear.dequantize_mxfp4_blocks and
+    # freetoken.models.weight.MxfpExpertBank. Four banks total, all
+    # genuinely one-row-per-expert, so (like gptq_int4) they fit
+    # set_bank_sources/copy_missing/rebuild unchanged.
+    "mxfp4": (
+        "blocks_gate_up",
+        "scales_gate_up",
+        "blocks_down",
+        "scales_down",
+    ),
     "int8_channel": (
         "weight_gate_up",
         "scale_gate_up",
@@ -677,7 +692,7 @@ class SlotWeightAccessor:
                     "gptq_int4 forward pass runs (SlotWeightAccessor refuses to guess)"
                 )
             self._group_size = int(group_size)
-        elif self.quant_format == "int8_channel":
+        elif self.quant_format in ("mxfp4", "int8_channel"):
             self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
         else:
             self._gu, self._dn = cache.bank_views()
@@ -686,10 +701,13 @@ class SlotWeightAccessor:
         """``(gate_w, up_w, down_w)`` for slot ``s_i``, in ``[out, in]``
         weight orientation (matching ``nn.Linear.weight`` / ``_expert_compute``'s
         expected shape) -- gate/up are ``[I, H]``, down is ``[H, I]``."""
+        if self.quant_format == "bf16":
+            i = self._intermediate
+            return self._gu[s_i, 0:i], self._gu[s_i, i : 2 * i], self._dn[s_i]
+        cached = self._cache.get(s_i)
+        if cached is not None:
+            return cached
         if self.quant_format == "int8_channel":
-            cached = self._cache.get(s_i)
-            if cached is not None:
-                return cached
             from freetoken.kernel.triton.int8_linear import dequantize_int8_channel as _dequant
 
             b = self._banks
@@ -702,12 +720,29 @@ class SlotWeightAccessor:
             result = (gu_dense[0:i], gu_dense[i : 2 * i], dn_dense)
             self._cache[s_i] = result
             return result
-        if self.quant_format != "gptq_int4":
+        if self.quant_format == "mxfp4":
+            from freetoken.kernel.triton.mxfp4_linear import dequantize_mxfp4_blocks
+
+            b = self._banks
+            # dequantize_mxfp4_blocks already returns [out_features, K] --
+            # gate_up's out_features axis is the bank row's leading axis
+            # (unlike GPTQ's dequantize_gptq_int4_sequential_groups, which
+            # returns [in_features, out_features] and needs a .T), so the
+            # bf16 bank rows' [out, in] orientation falls out directly.
+            # out_dtype is self._dtype (the model's activation dtype), NOT
+            # any checkpoint-stored scales dtype -- see the class docstring
+            # for the real bug (#138) this exact mistake caused for GPTQ.
+            gu_dense = dequantize_mxfp4_blocks(
+                b["blocks_gate_up"][s_i], b["scales_gate_up"][s_i], out_dtype=self._dtype,
+            )
+            dn_dense = dequantize_mxfp4_blocks(
+                b["blocks_down"][s_i], b["scales_down"][s_i], out_dtype=self._dtype,
+            )
             i = self._intermediate
-            return self._gu[s_i, 0:i], self._gu[s_i, i : 2 * i], self._dn[s_i]
-        cached = self._cache.get(s_i)
-        if cached is not None:
-            return cached
+            result = (gu_dense[0:i], gu_dense[i : 2 * i], dn_dense)
+            self._cache[s_i] = result
+            return result
+
         from freetoken.kernel.triton.gptq_linear import dequantize_gptq_int4_sequential_groups as _dequant
 
         b = self._banks
