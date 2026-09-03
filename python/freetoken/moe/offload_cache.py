@@ -820,4 +820,4 @@ class SlotWeightAccessor:
         return result
 
 
-__all__ = ["OffloadMoeCache", "SlotWeightAccessor", "GPTQ_INT4_BANK_NAMES", "_BANK_SCHEMAS"]
+__all__ = ["OffloadMoeCache", "SlotWeightAccessor", "_BANK_SCHEMAS"]
