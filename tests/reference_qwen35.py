@@ -65,7 +65,11 @@ def ref_gated_deltanet(hidden, positions, la, slot_state, dtype):
         )
     else:
         seq = torch.cat([conv_state.unsqueeze(0), mixed], dim=-1)
-    conv = F.conv1d(seq, w, padding=0, groups=la.conv_dim)[:, :, :T]  # [1, C, T]
+    # The real HF reference's causal_conv1d_fn/causal_conv1d_update apply the
+    # model's activation (config.hidden_act, "silu" for this checkpoint)
+    # elementwise to the WHOLE conv output before the q/k/v split (issue #147 --
+    # this was missing from both the port and this "reference" until fixed).
+    conv = F.silu(F.conv1d(seq, w, padding=0, groups=la.conv_dim)[:, :, :T])  # [1, C, T]
     conv_state_new = seq[:, :, -ring:].clone()
 
     z = la.in_proj_z(hidden)  # [T,value_dim]

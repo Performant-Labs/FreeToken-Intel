@@ -801,6 +801,12 @@ class _GatedDeltaNet:
         The ring holds the trailing (kernel-1) positions; the new ring is the
         trailing (kernel-1) of the concatenated (old ring + new tokens) sequence,
         and it is written back in place so the next step reads it.
+
+        The reference's ``causal_conv1d_fn``/``causal_conv1d_update`` apply the
+        model's activation (``config.hidden_act``, ``"silu"`` for this
+        checkpoint) elementwise to the WHOLE conv output (query, key, and value
+        channels alike) before the q/k/v split -- this was missing here (issue
+        #147), a real bug affecting every linear-attention layer, every token.
         """
         B, C, T = mixed_qkv.shape
         w = self.conv1d.weight  # [C, 1, K] (groups=C -> each channel is 1 input)
@@ -810,14 +816,15 @@ class _GatedDeltaNet:
                 [torch.zeros(B, C, ring_len, device=mixed_qkv.device, dtype=mixed_qkv.dtype), mixed_qkv],
                 dim=-1,
             )
-            return F.conv1d(padded, w, padding=0, groups=C)[:, :, :T]
+            out = F.conv1d(padded, w, padding=0, groups=C)[:, :, :T]
+            return F.silu(out)
         # Old ring (K-1) + new tokens -> conv output for the new tokens only; the
         # new ring is the trailing (K-1) of that concatenation.
         seq = torch.cat([slot.conv_state.unsqueeze(0), mixed_qkv], dim=-1)  # [B, C, K-1+T]
         out = F.conv1d(seq, w, padding=0, groups=C)[:, :, -T:]
         if T > 0:
             slot.conv_state.copy_(seq[:, :, -ring_len:][0])
-        return out
+        return F.silu(out)
 
     def _delta_rule(self, q, k, v, g, beta, slot, out_dtype=None):
         """Recurrent Gated-Delta-Net over the (post-conv) tokens.
