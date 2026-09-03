@@ -232,6 +232,7 @@ def load_model(
                     down_banks,
                     moe_backend=moe_backend,
                     moe_cache_size=moe_cache_size,
+                    model_path=model_path,
                 )
             else:
                 _place_expert_weights(model, gate_up_banks, down_banks)
@@ -268,6 +269,7 @@ def load_model(
                     down_banks,
                     moe_backend=moe_backend,
                     moe_cache_size=moe_cache_size,
+                    model_path=model_path,
                 )
             else:
                 _place_expert_weights(model, gate_up_banks, down_banks)
@@ -375,6 +377,7 @@ def _attach_offload_cache(
     down_banks,
     moe_backend: str = "offload",
     moe_cache_size: int | None = None,
+    model_path: str | None = None,
 ) -> None:
     """Build the LRU slot pool and wire it into the offload model (ADR 0002).
 
@@ -389,6 +392,7 @@ def _attach_offload_cache(
     while the model's blocks are indexed by *absolute layer id*, so we also give
     the model the ``moe_layer_id`` map (layer_id -> MoE index) the forward uses.
     """
+    from freetoken.models.weight import GptqExpertBank
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     num_experts = int(getattr(model_config, "num_experts", 0) or 0)
@@ -409,17 +413,51 @@ def _attach_offload_cache(
         cache_size = moe_cache_size
     else:
         cache_size = num_experts + max(2, num_moe)
+    # A GPTQ-quantized checkpoint's banks (issue moe-quant-banks-e2e, #138)
+    # are GptqExpertBank, not a plain tensor/_PlainBank -- detected from the
+    # bank shape itself (load_moe_expert_sources already dispatched to
+    # stream_moe_expert_sources_gptq for these), not re-derived from the
+    # checkpoint path here.
+    is_gptq = bool(gate_up_banks) and isinstance(gate_up_banks[0], GptqExpertBank)
     cache = OffloadMoeCache(
         num_layers=num_moe,
         num_experts=num_experts,
         cache_size=cache_size,
         device=device,
+        quant_format="gptq_int4" if is_gptq else "bf16",
     )
-    # The banks are indexed by MoE-layer order (moe_layers), matching the cache's
-    # 0-based MoE-layer ids.
-    gu = [b.tensor if hasattr(b, "tensor") else b for b in gate_up_banks]
-    dn = [b.tensor if hasattr(b, "tensor") else b for b in down_banks]
-    cache.set_bank_sources({"gate_up": gu, "down": dn})
+    if is_gptq:
+        # Six packed banks (issue moe-quant-banks-schema, #136's schema) --
+        # every bank is one row per expert, so set_bank_sources' generic
+        # per-expert-row contract applies unchanged. g_idx is NOT a bank (it
+        # is shared across every expert of a projection type, see
+        # GptqExpertBank's own docstring): it goes through extra_metadata
+        # instead, one shared [K] tensor per layer per projection type.
+        cache.set_bank_sources(
+            {
+                "qweight_gate_up": [b.qweight for b in gate_up_banks],
+                "qzeros_gate_up": [b.qzeros for b in gate_up_banks],
+                "scales_gate_up": [b.scales for b in gate_up_banks],
+                "qweight_down": [b.qweight for b in down_banks],
+                "qzeros_down": [b.qzeros for b in down_banks],
+                "scales_down": [b.scales for b in down_banks],
+            }
+        )
+        cache.set_extra_metadata("g_idx_gate_up", [b.g_idx for b in gate_up_banks])
+        cache.set_extra_metadata("g_idx_down", [b.g_idx for b in down_banks])
+        # SlotWeightAccessor (#137) refuses to guess this -- the loader (here)
+        # is the one place that has both the checkpoint path and the cache.
+        if model_path is None:
+            raise ValueError("_attach_offload_cache needs model_path to read a GPTQ checkpoint's group_size")
+        from freetoken.models.weight import checkpoint_gptq_group_size
+
+        cache.gptq_group_size = checkpoint_gptq_group_size(model_path)
+    else:
+        # The banks are indexed by MoE-layer order (moe_layers), matching the
+        # cache's 0-based MoE-layer ids.
+        gu = [b.tensor if hasattr(b, "tensor") else b for b in gate_up_banks]
+        dn = [b.tensor if hasattr(b, "tensor") else b for b in down_banks]
+        cache.set_bank_sources({"gate_up": gu, "down": dn})
 
     model.moe_cache = cache
     # Record the resolved backend on the model. The block's MoE forward reads

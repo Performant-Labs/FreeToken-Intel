@@ -297,12 +297,27 @@ def iter_weights(
 
     # Bank-only mode (the offload-cache path, #135): do NOT eagerly dequantize
     # GPTQ-packed expert tensors -- pass them through raw so a packed-bank
-    # builder can keep them packed in host RAM. Every other call shape keeps
-    # today's eager-dequant behavior (see the docstring above for why that is
-    # fine: the dense-placement call never sees expert tensors regardless).
+    # builder can keep them packed in host RAM.
+    #
+    # The dense-placement call (include_moe_experts=False) never *yields* an
+    # expert tensor (the `expert` filter below drops it) -- but a naive
+    # `_dequantize_gptq_stream(raw_stream)` here would still eagerly
+    # dequantize every routed expert's GPTQ tensors before that filter ever
+    # runs, reintroducing the exact whole-checkpoint eager-dequant RAM blowup
+    # issue #135 eliminated for the bank-fabricator call, just on this call
+    # shape instead (found by issue moe-quant-banks-e2e (#138)'s end-to-end
+    # test: a real load_model() call crashed trying to dequantize experts the
+    # dense placement was always going to discard). Fix: drop routed-expert
+    # GPTQ components from the stream *before* they ever reach the dequant
+    # buffer, so they are never assembled/dequantized at all on this path.
     bank_only = include_moe_experts and not include_non_moe
     raw_stream = _iter_safetensors(model_path, device=device)
-    stream = raw_stream if bank_only else _dequantize_gptq_stream(raw_stream)
+    if bank_only:
+        stream = raw_stream
+    elif not include_moe_experts:
+        stream = _dequantize_gptq_stream(_drop_routed_expert_gptq_components(raw_stream))
+    else:
+        stream = _dequantize_gptq_stream(raw_stream)
 
     for raw_name, tensor in stream:
         # Drop the vision tower and the MTP head outright -- neither is part
@@ -369,6 +384,24 @@ def _iter_safetensors(model_path, device):
     from freetoken.models.weight import iter_safetensors
 
     yield from iter_safetensors(model_path, device=device)
+
+
+def _drop_routed_expert_gptq_components(pairs):
+    """Filter a raw ``(name, tensor)`` stream, dropping routed-expert GPTQ
+    components (``.qweight``/``.qzeros``/``.scales``/``.g_idx``) outright --
+    for the dense-placement call, these are discarded by the main loop's
+    ``expert`` filter anyway, so this stops them from ever reaching
+    :func:`_dequantize_gptq_stream`'s buffer-and-dequantize logic (see the
+    call site's comment, issue #138). Everything else (including a
+    GPTQ-quantized *non*-expert tensor, if a future checkpoint ever has one --
+    none does today, per the real checkpoint's ``quantization_config.dynamic``
+    exclusions) passes through unchanged, still eligible for the normal
+    eager-dequant path.
+    """
+    for name, tensor in pairs:
+        if name.endswith(_GPTQ_SUFFIXES) and ".experts." in name:
+            continue
+        yield name, tensor
 
 
 def _dequantize_gptq_stream(pairs):
