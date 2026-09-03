@@ -392,7 +392,7 @@ def _attach_offload_cache(
     while the model's blocks are indexed by *absolute layer id*, so we also give
     the model the ``moe_layer_id`` map (layer_id -> MoE index) the forward uses.
     """
-    from freetoken.models.weight import GptqExpertBank
+    from freetoken.models.weight import GptqExpertBank, Int8ExpertBank
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     num_experts = int(getattr(model_config, "num_experts", 0) or 0)
@@ -419,14 +419,32 @@ def _attach_offload_cache(
     # stream_moe_expert_sources_gptq for these), not re-derived from the
     # checkpoint path here.
     is_gptq = bool(gate_up_banks) and isinstance(gate_up_banks[0], GptqExpertBank)
+    # A per-channel-INT8 checkpoint's banks (issue moe-quant-banks-int8, #154)
+    # are Int8ExpertBank, detected the same way is_gptq is -- from the bank
+    # type itself, not re-derived from the checkpoint path here.
+    is_int8 = bool(gate_up_banks) and isinstance(gate_up_banks[0], Int8ExpertBank)
     cache = OffloadMoeCache(
         num_layers=num_moe,
         num_experts=num_experts,
         cache_size=cache_size,
         device=device,
-        quant_format="gptq_int4" if is_gptq else "bf16",
+        quant_format="gptq_int4" if is_gptq else ("int8_channel" if is_int8 else "bf16"),
     )
-    if is_gptq:
+    if is_int8:
+        # Four packed banks (issue moe-quant-banks-schema-int8's schema) --
+        # every bank is one row per expert, so set_bank_sources' generic
+        # per-expert-row contract applies unchanged. Unlike gptq_int4 there
+        # is no shared per-projection side tensor (no g_idx equivalent): a
+        # per-channel scale is already one row per expert.
+        cache.set_bank_sources(
+            {
+                "weight_gate_up": [b.weight for b in gate_up_banks],
+                "scale_gate_up": [b.scale for b in gate_up_banks],
+                "weight_down": [b.weight for b in down_banks],
+                "scale_down": [b.scale for b in down_banks],
+            }
+        )
+    elif is_gptq:
         # Six packed banks (issue moe-quant-banks-schema, #136's schema) --
         # every bank is one row per expert, so set_bank_sources' generic
         # per-expert-row contract applies unchanged. g_idx is NOT a bank (it
