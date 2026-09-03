@@ -766,6 +766,31 @@ class _LinearStatePool:
         return len(self._layers[layer_id])
 
 
+def _pool_slot(pool, layer_id: int, slot_idx: int) -> "_LinearStateSlot | None":
+    """Duck-type a per-request state slot out of either pool shape.
+
+    ``pool`` is either this model's own :class:`_LinearStatePool` (a plain
+    dict of pre-allocated ``_LinearStateSlot``s, the default -- unchanged
+    behavior for every non-hybrid-cache-managed run) or a real
+    :class:`freetoken.kvcache.linear_state_pool.LinearStatePool` (the
+    ping-pong/COW-capable stacked-tensor pool, issue `semantic-cache-e2e`
+    #172 -- the engine assigns this to ``ctx.linear_state_pool`` only when
+    prefix caching + a hybrid model are both on). Wrapping the new pool's
+    per-slot tensor VIEWS (not copies) in a ``_LinearStateSlot`` lets
+    ``_conv``/``_delta_rule`` read/write either pool identically -- their
+    ``.copy_()`` calls land directly on the new pool's own backing storage.
+    """
+    if pool is None:
+        return None
+    if hasattr(pool, "get"):  # this model's own _LinearStatePool
+        if layer_id not in pool:
+            return None
+        return pool.get(layer_id, slot_idx)
+    if pool.is_linear_layer(layer_id):  # freetoken.kvcache.linear_state_pool.LinearStatePool
+        return _LinearStateSlot(pool.recurrent_state(layer_id, slot_idx), pool.conv_state(layer_id, slot_idx))
+    return None
+
+
 class _GatedDeltaNet:
     """A Qwen3.5/3.6 linear-attention (Gated-Delta-Net) layer.
 
@@ -920,15 +945,19 @@ class _GatedDeltaNet:
             slot.state.copy_(s[0])
         return out.transpose(1, 2).contiguous().to(out_dtype)
 
-    def forward(self, hidden_states, positions, table_idx, ctx, batch) -> torch.Tensor:
+    def forward(self, hidden_states, positions, table_idx, ctx, batch, linear_slot_idx=None) -> torch.Tensor:
         # ``hidden_states`` is this request's token slice [T, H] (the decoder
         # layer hands it a 2-D per-request slice, mirroring qwen3_moe); positions
         # is that slice's [T]. T is this request's new-token count.
+        # ``linear_slot_idx`` (issue `semantic-cache-e2e`, #172) is this
+        # request's OWN GDN-state pool slot -- distinct from ``table_idx``
+        # (the KV page-table row) once a hybrid engine with prefix caching
+        # assigns one (Req.linear_slot_idx). Falls back to table_idx (the
+        # pre-#172 1:1 behavior) when not set, so a non-hybrid-managed run
+        # is unaffected.
         T = hidden_states.shape[0]
-        slot = None
-        pool = ctx.linear_state_pool
-        if pool is not None and self.layer_id in pool:
-            slot = pool.get(self.layer_id, table_idx)
+        slot_idx = linear_slot_idx if linear_slot_idx is not None else table_idx
+        slot = _pool_slot(ctx.linear_state_pool, self.layer_id, slot_idx)
         # Mixed qkv projection + causal conv (the conv ring is per-request).
         mixed_qkv = self.in_proj_qkv(hidden_states).unsqueeze(0).transpose(1, 2)  # [1, conv_dim, T]
         z = self.in_proj_z(hidden_states)  # [T, value_dim]
@@ -1711,11 +1740,12 @@ class _Qwen35DecoderLayer:
             )
         self.mlp = _Qwen35MoE(config, device, dtype, layer_id)
 
-    def forward(self, hidden_states, positions, table_idx, ctx, batch) -> torch.Tensor:
+    def forward(self, hidden_states, positions, table_idx, ctx, batch, linear_slot_idx=None) -> torch.Tensor:
         residual = hidden_states
         if self.linear_attn is not None:
             hidden_states = self.linear_attn(
-                self.input_layernorm(hidden_states), positions, table_idx, ctx, batch
+                self.input_layernorm(hidden_states), positions, table_idx, ctx, batch,
+                linear_slot_idx=linear_slot_idx,
             )
         else:
             hidden_states = self.self_attn(
@@ -1844,12 +1874,21 @@ class Qwen3_5MoEForCausalLM:
         reqs = batch.reqs
         num_tokens = input_ids.shape[0]
 
-        # The linear layers read per-request recurrent state from the pool; the
-        # engine assigns each request a linear_slot_idx (== table_idx here) and
-        # points ctx.linear_state_pool at this model's pool.
-        ctx.linear_state_pool = self.linear_state_pool
+        # The linear layers read per-request recurrent state from the pool.
+        # Default: the model's own pool, one slot per table_idx (1:1, no
+        # ping-pong). A hybrid engine running with prefix caching on
+        # (issue `semantic-cache-e2e`, #172) instead assigns a real
+        # ping-pong-capable LinearStatePool (freetoken.kvcache.
+        # linear_state_pool) to ctx.linear_state_pool, and a real
+        # free-list-allocated req.linear_slot_idx, BEFORE the first
+        # forward -- both are left alone here when already set, so that
+        # path's own slot lifetime (allocated at admission, freed at
+        # completion) is authoritative rather than being reset every step.
+        if ctx.linear_state_pool is None:
+            ctx.linear_state_pool = self.linear_state_pool
         for req in reqs:
-            req.linear_slot_idx = req.table_idx
+            if req.linear_slot_idx is None:
+                req.linear_slot_idx = req.table_idx
 
         hidden = self.embed_tokens(input_ids)  # [num_tokens, hidden]
         out = torch.empty((batch.size, self.config.hidden_size), device=hidden.device, dtype=hidden.dtype)
@@ -1871,7 +1910,7 @@ class Qwen3_5MoEForCausalLM:
             h = hidden[token_slice]
             pos = positions[token_slice]
             for layer in self.layers:
-                h = layer(h, pos, req.table_idx, ctx, batch)
+                h = layer(h, pos, req.table_idx, ctx, batch, linear_slot_idx=req.linear_slot_idx)
             # Keep only the last position of this request (next-token logits).
             out[i] = self.norm(h)[-1]
             offset += ext

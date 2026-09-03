@@ -211,14 +211,37 @@ class Engine:
         # set, step()'s decode loop watches for it and records
         # req.toolcall_anchor_len the first time it appears -- the deepest
         # reuse boundary that survives a client-side rewrite of the echoed
-        # tool call. Actually FREEZING the GDN state at that boundary
-        # (CacheManager.snapshot_toolcall_anchor) needs the model wired to
-        # a real ping-pong-capable LinearStatePool, which qwen3_5_moe does
-        # not do yet (it still uses its own, older, non-ping-pong
-        # _LinearStatePool) -- that wiring is issue #172's own scope, so for
-        # now, only ever gets read by tests and by whatever future PR does
-        # that wiring, not by a live snapshot call yet.
+        # tool call.
         self.toolcall_anchor_id: int | None = None
+
+        # GDN (Gated-Delta-Net) ping-pong state pool (issue
+        # `semantic-cache-e2e`, #172): only built for a HYBRID model
+        # (qwen3_5_moe-style, mixed linear/full-attention layers) running
+        # with prefix caching on -- a plain (non-hybrid) model never has
+        # anything to build here, and prefix caching off means no request's
+        # KV ever gets reused, so the parallel GDN-state reuse this pool
+        # exists for has nothing to attach to either. When built, this
+        # REPLACES the model's own default per-request-1:1 pool
+        # (self.model.linear_state_pool) as ctx.linear_state_pool -- see
+        # qwen3_5_moe.Qwen3_5MoEForCausalLM.forward's own comment on why it
+        # leaves an already-set ctx.linear_state_pool alone.
+        self.linear_state_pool = None
+        if self.cache_manager is not None:
+            self.linear_state_pool = self._build_hybrid_linear_pool(self.model, config, device, dtype)
+        # tuple(prompt token ids up to a committed anchor) -> the ping-pong
+        # track slot holding that anchor's frozen GDN state. A later
+        # request whose prompt shares that exact prefix (add_request looks
+        # this up after its own KV-prefix match) restores from it instead
+        # of recomputing (Req.mamba_restore_src). Deliberate scope cut vs
+        # a full HybridRadixCache-donation integration (the tree-based
+        # ownership/eviction #169 already built for the KV+mamba-node
+        # case): this dict is a flat, never-evicted lookaside -- proving
+        # the restore MECHANISM end-to-end (this issue's own accept bar)
+        # doesn't need the tree's eviction/ownership machinery, and wiring
+        # HybridRadixCache into CacheManager in place of the plain
+        # RadixPrefixCache it wraps today is real, separable follow-up
+        # work of its own.
+        self._mamba_anchor_snapshots: dict[tuple[int, ...], int] = {}
 
         # Attention backend (reference pure-torch GQA under "auto").
         self.attn_backend = create_attention_backend(config.attention_backend, config)
@@ -234,6 +257,8 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache
         self.ctx.attn_backend = self.attn_backend
         self.ctx.page_table = self.page_table
+        if self.linear_state_pool is not None:
+            self.ctx.linear_state_pool = self.linear_state_pool
         # ADR 0002: when the MoE experts are host-offloaded, the model's forward
         # serves them through the LRU slot pool the loader attached.
         if getattr(self.model, "moe_offload", False) and getattr(self.model, "moe_cache", None) is not None:
@@ -369,6 +394,45 @@ class Engine:
             eos_token_id = eos_token_id[0] if eos_token_id else None
         return Sampler(eos_token_id=eos_token_id if eos_token_id is not None else -1, device=device)
 
+    @staticmethod
+    def _build_hybrid_linear_pool(model, config, device, dtype):
+        """A real ping-pong-capable ``LinearStatePool`` sized off the model's
+        own GDN layers (issue `semantic-cache-e2e`, #172), or ``None`` for a
+        non-hybrid model (no ``linear_attn`` layers at all).
+
+        Dims are read directly off the model's own ``_GatedDeltaNet``
+        instances (mirrors ``qwen3_5_moe``'s own ``_register_linear_pool``)
+        rather than duplicated from config parsing -- every linear layer in
+        this model family shares one head/dim configuration, so the first
+        one found is representative. ``num_slots`` reserves slot 0
+        (padding, see ``LinearStatePool``'s own convention) plus 3 slots per
+        possible concurrent request: 1 live working slot + 2 ping-pong
+        track slots (this issue's own tool-call-anchor snapshot needs both,
+        see ``Req.mamba_ping_pong``).
+        """
+        linear_layers = [
+            layer.linear_attn for layer in getattr(model, "layers", []) if getattr(layer, "linear_attn", None) is not None
+        ]
+        if not linear_layers:
+            return None
+
+        from freetoken.kvcache.linear_state_pool import LinearStatePool
+
+        ref = linear_layers[0]
+        num_slots = 3 * config.max_running_req + 1
+        return LinearStatePool(
+            num_layers=len(linear_layers),
+            num_key_heads=ref.num_k_heads,
+            num_value_heads=ref.num_v_heads,
+            key_head_dim=ref.head_k_dim,
+            value_head_dim=ref.head_v_dim,
+            conv_kernel_dim=ref.conv_kernel,
+            num_slots=num_slots,
+            dtype=dtype or torch.bfloat16,
+            device=device,
+            layer_ids=[layer.linear_attn.layer_id for layer in model.layers if getattr(layer, "linear_attn", None) is not None],
+        )
+
     # -- request admission ---------------------------------------------------
 
     def add_request(self, req: Req) -> Req:
@@ -421,7 +485,35 @@ class Engine:
             matched_indices = cache_handle.get_matched_indices()
             req.cache_handle = cache_handle
             req.cached_len = cached_len
-        pending = make_pending_req(req.uid, req.input_ids, req.sampling_params, cache_handle, cached_len)
+        if self.linear_state_pool is not None:
+            # A real free-list slot, distinct from table_idx: 1 live working
+            # slot + 2 ping-pong track slots this request's own tool-call
+            # anchor (if any) may later freeze into (issue #172).
+            live, track0, track1 = self.linear_state_pool.alloc(3)
+            req.linear_slot_idx = live
+            req.mamba_ping_pong = (track0, track1)
+            # A client-side rewrite of an earlier finished request's tool
+            # call: if this prompt's KV-matched prefix (cached_len, from
+            # the plain radix match above) reaches at least as far as a
+            # recorded anchor snapshot for the SAME token prefix, restore
+            # that GDN state into this request's live slot instead of
+            # starting from zero -- the actual copy happens once, in
+            # step()'s prefill bookkeeping (mirrors upstream's own
+            # restore-before-forward timing).
+            if cached_len:
+                snap = self._mamba_anchor_snapshots.get(tuple(int(t) for t in req.input_ids[:cached_len]))
+                if snap is not None:
+                    req.mamba_restore_src = snap
+        pending = make_pending_req(
+            req.uid,
+            req.input_ids,
+            req.sampling_params,
+            cache_handle,
+            cached_len,
+            linear_slot_idx=req.linear_slot_idx,
+            mamba_ping_pong=req.mamba_ping_pong,
+            mamba_restore_src=req.mamba_restore_src,
+        )
         uid = self.scheduler.add(pending)
         req.uid = uid
         req.table_idx = pending._table_idx  # noqa: SLF001
@@ -479,6 +571,30 @@ class Engine:
             handle = self._find_cache_handle(uid)
             if handle is not None:
                 self.cache_manager.unlock(handle)
+        if self.linear_state_pool is not None:
+            # An aborted request never reaches step()'s finish-handling
+            # (issue #172's own donation/free path), so its live +
+            # ping-pong slots would otherwise leak forever. Nothing to
+            # preserve here (an abort never donates a snapshot). Read the
+            # slot ids off the PendingReq itself (stable for the request's
+            # whole lifetime, see its own docstring) rather than the
+            # per-step Req -- correct whether the request has started
+            # prefilling yet or not.
+            linear_slot_idx = mamba_ping_pong = None
+            for pending in self.scheduler.prefill_manager.pending_list:
+                if pending.uid == uid:
+                    linear_slot_idx, mamba_ping_pong = pending.linear_slot_idx, pending.mamba_ping_pong
+                    break
+            else:
+                for req in self.scheduler.decode_manager.running_reqs:
+                    if req.uid == uid:
+                        linear_slot_idx, mamba_ping_pong = req.linear_slot_idx, req.mamba_ping_pong
+                        break
+            if linear_slot_idx is not None:
+                to_free = [linear_slot_idx]
+                if mamba_ping_pong is not None:
+                    to_free.extend(mamba_ping_pong)
+                self.linear_state_pool.free(to_free)
         before = set(self.scheduler._free_slots)  # noqa: SLF001
         ok = self.scheduler.abort(uid)
         if ok:
@@ -593,6 +709,21 @@ class Engine:
         # prefill and decode requests slices each request's tokens by its own count.
         batch.extend_lens = torch.tensor(extend_lens, dtype=torch.int64, device=device)
 
+        if self.linear_state_pool is not None:
+            # Restore a frozen tool-call-anchor GDN snapshot into this
+            # request's live slot, once, right before the forward that will
+            # read it (issue #172 -- mirrors upstream's own restore-before-
+            # forward timing, see CacheManager.snapshot_toolcall_anchor's
+            # docstring for why this port's synchronous engine needs no
+            # stream-ordering guard). A request never gets a second
+            # mamba_restore_src (add_request sets it at most once, from a
+            # fresh admission), so clearing it here is enough to make the
+            # copy exactly-once for the request's lifetime.
+            for req in batch.reqs:
+                if req.mamba_restore_src is not None:
+                    self.linear_state_pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
+                    req.mamba_restore_src = None
+
         with self.ctx.forward_batch(batch):
             self.attn_backend.prepare_metadata(batch)
             logits = self.model(batch.input_ids, batch.positions, batch.out_loc)
@@ -644,6 +775,38 @@ class Engine:
                 and req.toolcall_anchor_len is None
             ):
                 req.toolcall_anchor_len = req.device_len
+            # Freeze the GDN state at the anchor into an idle ping-pong
+            # track slot (issue #172), and remember it by the exact prompt
+            # PREFIX it was taken at (self._full_ids -- the full history,
+            # not req.input_ids, which decode has already trimmed to just
+            # the latest token) so a later request whose prompt shares that
+            # prefix can restore it (add_request's own lookup).
+            #
+            # NOT on the detection step itself: the anchor token has only
+            # just been SAMPLED there (from the logits this step already
+            # computed) -- the recurrent core has not yet forward-processed
+            # it, so the GDN state at that instant is only "as of the
+            # prompt", one token short of what toolcall_anchor_len claims.
+            # That forward happens at the START of the NEXT step (whichever
+            # batch's positions include position toolcall_anchor_len - 1),
+            # after which device_len has been bumped a second time -- so
+            # device_len == toolcall_anchor_len + 1 is exactly "the anchor
+            # token has now actually been consumed", confirmed directly (an
+            # unguarded, immediate snapshot produced a state one token
+            # stale, diverging a restored run from a cold recompute of the
+            # same prompt).
+            if (
+                self.linear_state_pool is not None
+                and req.mamba_ping_pong is not None
+                and req.toolcall_anchor_len is not None
+                and req.mamba_last_track_seqlen is None
+                and req.device_len == req.toolcall_anchor_len + 1
+            ):
+                dst = req.mamba_ping_pong[req.mamba_next_track_idx]
+                self.cache_manager.snapshot_toolcall_anchor([req], self.linear_state_pool)
+                if req.mamba_last_track_seqlen == req.toolcall_anchor_len:
+                    prefix = tuple(self._full_ids[req.table_idx][: req.toolcall_anchor_len])
+                    self._mamba_anchor_snapshots[prefix] = dst
             # The FINAL chunk of a chunked prefill -- the one that just
             # completed the prompt -- is a plain Req (promoted out of the
             # ChunkedReq chain) whose cached_len is > 0 (it resumed from a
@@ -720,6 +883,19 @@ class Engine:
                     redundant = self.page_table[req.table_idx, admitted_cached_len : insert_result.cached_len]
                     never_written = self.page_table[req.table_idx, len(full_ids) : self.max_seq_len]
                     self.kv_cache.free_slots(torch.cat([redundant, never_written]))
+                if self.linear_state_pool is not None and req.linear_slot_idx is not None:
+                    # Return this request's live slot, plus whichever
+                    # ping-pong track slot was NOT donated as an anchor
+                    # snapshot (issue #172) -- a donated slot stays
+                    # allocated, owned by self._mamba_anchor_snapshots,
+                    # until a later request restores from it (there is no
+                    # eviction of these yet, see this dict's own docstring
+                    # in __init__ -- a known, documented scope cut).
+                    donated = set(self._mamba_anchor_snapshots.values())
+                    to_free = [req.linear_slot_idx]
+                    if req.mamba_ping_pong is not None:
+                        to_free.extend(s for s in req.mamba_ping_pong if s not in donated)
+                    self.linear_state_pool.free(to_free)
 
         # Record the step in the scheduler: promote finished prefills into the
         # decode set, refresh the decode set, and free the rows of requests that
