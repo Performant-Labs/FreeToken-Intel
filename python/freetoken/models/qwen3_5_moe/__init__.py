@@ -114,8 +114,18 @@ def parse_config(
     use_cpu_moe: bool = False,
     use_hybrid: bool = False,
     moe_cpu_layers: str | None = None,
+    model_path: str | None = None,
 ) -> ModelConfig:
     """Build a :class:`ModelConfig` from a (multimodal) Qwen3.5/3.6 HF config.
+
+    ``model_path`` is accepted (and unused) to match ``models/loader.py``'s
+    ``load_model``, which calls every architecture's ``parse_config`` with
+    ``model_path=model_path`` unconditionally (``qwen3_moe``'s sibling uses
+    it to probe ``head_dim`` from the checkpoint when the config omits it;
+    this family's config always carries ``head_dim`` explicitly, so there is
+    nothing to probe) -- without this parameter every qwen3_5/3.6 checkpoint
+    failed to load at all with ``TypeError: parse_config() got an unexpected
+    keyword argument 'model_path'``.
 
     Torch-free. The language tower is nested under ``text_config`` (the config is
     multimodal); when the given config is already the flat text object (no
