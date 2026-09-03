@@ -52,6 +52,13 @@ __all__ = ["parse_config", "iter_weights", "Qwen3_5MoEForCausalLM"]
 _LANGUAGE_PREFIX = "model.language_model."
 _LANGUAGE_TARGET = "model."
 _VISUAL_PREFIX = "model.visual."
+_MTP_PREFIX = "mtp."
+
+# GPTQ's four per-projection component tensors (AutoGPTQ layout, see
+# freetoken.kernel.triton.gptq_linear). A checkpoint with no GPTQ tensors at
+# all (the common case) never populates the buffer these key off of, so
+# _dequantize_gptq_stream is a no-op passthrough for a plain bf16 checkpoint.
+_GPTQ_SUFFIXES = (".qweight", ".qzeros", ".scales", ".g_idx")
 
 # The one checkpoint weight that the routed-expert bank fabricator expects to be
 # an *untransposed* [n_experts, hidden, inter] (see qwen3_moe._transpose_down):
@@ -242,9 +249,25 @@ def iter_weights(
 
     * ``model.visual.*`` (the vision tower) is **dropped** -- text serving does
       not run the image encoder.
+    * ``mtp.*`` (the multi-token-prediction head, a separate top-level
+      namespace not nested under ``model.language_model.*``) is **dropped** --
+      this port's engine does not run MTP.
     * ``model.language_model.*`` is **remapped** to ``model.*`` so the loader's
       MoE-bank plumbing (and the forward pass) see the same key shape as the
       dense qwen3_moe model.
+    * A **GPTQ-quantized** checkpoint (e.g. the official
+      ``Qwen/Qwen3.5-35B-A3B-GPTQ-Int4``) stores each quantized projection as
+      four tensors -- ``.qweight`` / ``.qzeros`` / ``.scales`` / ``.g_idx`` --
+      instead of one plain ``.weight``. Those four are buffered here (by their
+      shared name prefix) and, once complete, dequantized via
+      :func:`freetoken.kernel.triton.gptq_linear.dequantize_gptq_int4` into a
+      single dense ``.weight`` tensor before entering the rest of this
+      function -- everything below (routing, remapping, host placement) sees
+      the exact same shape it would for a plain bf16 checkpoint. Per the real
+      checkpoint's ``quantization_config.dynamic`` exclusions, only the routed
+      experts' ``gate_proj``/``up_proj``/``down_proj`` are ever quantized this
+      way; attention, the shared expert, embeddings, and ``lm_head`` stay
+      plain bf16/fp16 tensors and pass through unchanged.
     * Routed experts (``.experts.*``) go to **host** (offload banks); everything
       else -- including the always-on shared expert and the linear-attention
       weights -- goes to the dense ``device``.
@@ -258,10 +281,10 @@ def iter_weights(
     _cfg = _cfg_for_path(model_path)
     routed = _expert_source_names(_cfg) if _cfg is not None else None
 
-    for raw_name, tensor in _iter_safetensors(model_path, device=device):
-        # Drop the vision tower outright (text serving does not run the
-        # image encoder).
-        if raw_name.startswith(_VISUAL_PREFIX):
+    for raw_name, tensor in _dequantize_gptq_stream(_iter_safetensors(model_path, device=device)):
+        # Drop the vision tower and the MTP head outright -- neither is part
+        # of the text-serving forward pass this port runs.
+        if raw_name.startswith(_VISUAL_PREFIX) or raw_name.startswith(_MTP_PREFIX):
             continue
         # Remap the language tower to the plain model.* prefix so the loader's
         # MoE-bank plumbing (and the forward pass) see the same key shape as the
@@ -309,6 +332,47 @@ def _iter_safetensors(model_path, device):
     from freetoken.models.weight import iter_safetensors
 
     yield from iter_safetensors(model_path, device=device)
+
+
+def _dequantize_gptq_stream(pairs):
+    """Wrap a raw ``(name, tensor)`` stream, buffering and dequantizing any
+    GPTQ-packed projections (four tensors -- ``.qweight``/``.qzeros``/
+    ``.scales``/``.g_idx`` -- sharing one name prefix) into a single dense
+    ``<prefix>.weight`` tensor, matching the shape a plain bf16 checkpoint's
+    stream already has. Every other tensor passes through unchanged, so this
+    is a no-op for a checkpoint with no GPTQ tensors at all.
+
+    Buffers by prefix rather than assuming the four components arrive
+    consecutively (safetensors preserves each shard's own key order, but
+    that order is not a documented guarantee, and different components of
+    one projection could in principle live in different shards).
+    """
+    import torch
+
+    from freetoken.kernel.triton.gptq_linear import dequantize_gptq_int4
+
+    pending: Dict[str, Dict[str, Any]] = {}
+    for name, tensor in pairs:
+        matched_suffix = next((s for s in _GPTQ_SUFFIXES if name.endswith(s)), None)
+        if matched_suffix is None:
+            yield name, tensor
+            continue
+        prefix = name[: -len(matched_suffix)]
+        parts = pending.setdefault(prefix, {})
+        parts[matched_suffix] = tensor
+        if len(parts) < len(_GPTQ_SUFFIXES):
+            continue
+        del pending[prefix]
+        # dequantize_gptq_int4 returns [in_features, out_features]; nn.Linear's
+        # weight convention (what every non-quantized tensor in this stream
+        # already is) is [out_features, in_features].
+        dense = dequantize_gptq_int4(
+            parts[".qweight"], parts[".qzeros"], parts[".scales"], parts[".g_idx"], out_dtype=torch.bfloat16
+        ).T.contiguous()
+        yield prefix + ".weight", dense
+    if pending:
+        incomplete = {prefix: sorted(parts) for prefix, parts in pending.items()}
+        raise ValueError(f"GPTQ tensor stream ended with incomplete projection(s): {incomplete}")
 
 
 # Forward side (the real hybrid model the engine runs, #18 / #14)
