@@ -611,16 +611,28 @@ class SlotWeightAccessor:
     For ``"bf16"`` this is a thin, zero-cost wrapper around the existing
     plain-tensor indexing (behavior is unchanged from before this class
     existed). For ``"gptq_int4"`` each distinct slot's packed
-    qweight/qzeros/scales are dequantized to bf16 **at most once per
-    instance** (a `_forward_offload_core` call handles one MoE layer for one
-    step) -- a decode step's working set is typically small (<= num_experts
-    active slots), so this is a bounded, cheap cost per step, never the
-    whole checkpoint at once (the RAM-saving point of #134's whole epic).
+    qweight/qzeros/scales are dequantized **at most once per instance** (a
+    `_forward_offload_core` call handles one MoE layer for one step) -- a
+    decode step's working set is typically small (<= num_experts active
+    slots), so this is a bounded, cheap cost per step, never the whole
+    checkpoint at once (the RAM-saving point of #134's whole epic).
+
+    ``dtype`` is the dequant output dtype -- must match the activation
+    tensor's dtype (``flat``, whatever ``moe_backend="offload"`` loaded the
+    model with -- bf16 by convention, but not guaranteed), NOT the
+    checkpoint's own stored scales dtype (a real bug this class had until
+    issue #138's real-checkpoint validation caught it: the official
+    Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 checkpoint stores ``scales`` as fp16,
+    so dequantizing to "whatever scales.dtype is" silently produced fp16
+    expert weights that then crashed matmul-ing against the bf16
+    activations everywhere else in the model -- caught as a real forward
+    pass failure against the real checkpoint, not by any synthetic test).
     """
 
-    def __init__(self, cache: "OffloadMoeCache", intermediate: int) -> None:
+    def __init__(self, cache: "OffloadMoeCache", intermediate: int, dtype: torch.dtype) -> None:
         self.quant_format = getattr(cache, "quant_format", "bf16")
         self._intermediate = intermediate
+        self._dtype = dtype
         self._cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         if self.quant_format == "gptq_int4":
             self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
@@ -663,18 +675,18 @@ class SlotWeightAccessor:
         from freetoken.kernel.triton.gptq_linear import dequantize_gptq_int4_sequential_groups as _dequant
 
         b = self._banks
-        gate_up_dtype = b["scales_gate_up"].dtype
-        down_dtype = b["scales_down"].dtype
         # dequantize_gptq_int4_sequential_groups returns [in_features, out_features]
         # (nn.Linear's transpose); .T gives the [out, in] orientation this port's
-        # bf16 bank rows already use.
+        # bf16 bank rows already use. out_dtype is self._dtype (the model's
+        # activation dtype), NOT the checkpoint's own scales.dtype -- see the
+        # class docstring for the real bug this was.
         gu_dense = _dequant(
             b["qweight_gate_up"][s_i], b["qzeros_gate_up"][s_i], b["scales_gate_up"][s_i],
-            group_size=self._group_size, out_dtype=gate_up_dtype,
+            group_size=self._group_size, out_dtype=self._dtype,
         ).T.contiguous()
         dn_dense = _dequant(
             b["qweight_down"][s_i], b["qzeros_down"][s_i], b["scales_down"][s_i],
-            group_size=self._group_size, out_dtype=down_dtype,
+            group_size=self._group_size, out_dtype=self._dtype,
         ).T.contiguous()
         i = self._intermediate
         result = (gu_dense[0:i], gu_dense[i : 2 * i], dn_dense)

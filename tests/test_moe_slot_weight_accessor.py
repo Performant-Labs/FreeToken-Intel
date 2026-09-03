@@ -79,22 +79,55 @@ def test_gptq_get_matches_direct_dequant_for_each_expert():
         k_gu=hidden, n_gu=2 * inter, k_dn=inter, n_dn=hidden, group_size=group_size,
         num_experts=num_experts, cache_size=num_experts,
     )
-    accessor = SlotWeightAccessor(cache, intermediate=inter)
+    accessor = SlotWeightAccessor(cache, intermediate=inter, dtype=torch.float32)
 
     for e in range(num_experts):
         slot = int(cache.slot_for_id[0, e].item())
         gate_w, up_w, down_w = accessor.get(slot)
         gu_qw, gu_qz, gu_sc, dn_qw, dn_qz, dn_sc = projections[e]
 
-        # SlotWeightAccessor dequantizes to the bank's own scales dtype (matching
-        # the real checkpoint's fp16/bf16 scales, not a hardcoded dtype); the
-        # fixture's scales are float32, so the expected value must match that.
-        expected_gu = dequantize_gptq_int4_sequential_groups(gu_qw, gu_qz, gu_sc, group_size=group_size, out_dtype=gu_sc.dtype).T
-        expected_dn = dequantize_gptq_int4_sequential_groups(dn_qw, dn_qz, dn_sc, group_size=group_size, out_dtype=dn_sc.dtype).T
+        # SlotWeightAccessor dequantizes to the dtype it was constructed with
+        # (torch.float32 here) -- NOT the bank's own scales dtype (a real bug
+        # this class had until issue #138's real-checkpoint validation caught
+        # it: the official Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 checkpoint stores
+        # scales as fp16 while the rest of the model runs bf16, so dequantizing
+        # to "whatever scales.dtype is" silently produced fp16 expert weights
+        # that then crashed matmul-ing against bf16 activations everywhere else
+        # in the model).
+        expected_gu = dequantize_gptq_int4_sequential_groups(gu_qw, gu_qz, gu_sc, group_size=group_size, out_dtype=torch.float32).T
+        expected_dn = dequantize_gptq_int4_sequential_groups(dn_qw, dn_qz, dn_sc, group_size=group_size, out_dtype=torch.float32).T
 
         torch.testing.assert_close(gate_w, expected_gu[0:inter])
         torch.testing.assert_close(up_w, expected_gu[inter : 2 * inter])
         torch.testing.assert_close(down_w, expected_dn)
+
+
+def test_gptq_get_dtype_matches_requested_dtype_not_scales_dtype():
+    """The real bug found by issue #138's real-checkpoint validation: the
+    official Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 checkpoint stores `scales` as
+    fp16, but the rest of the model (dense weights, activations) runs bf16
+    when moe_backend="offload" loads with dtype=torch.bfloat16 -- an earlier
+    version of SlotWeightAccessor dequantized to "whatever scales.dtype is"
+    (fp16 here), producing a real RuntimeError at the expert matmul
+    ("expected m1 and m2 to have the same dtype, but got: BFloat16 !=
+    Half"), caught on real hardware, not by any synthetic test until now.
+    Builds a fixture whose scales bank is deliberately float16 -- a
+    different dtype than the bfloat16 requested at construction -- and
+    asserts the *output* matches the requested dtype, not the scales'."""
+    hidden, inter, group_size = 16, 8, 8
+    cache, _ = _cache_with_gptq_bank(
+        k_gu=hidden, n_gu=2 * inter, k_dn=inter, n_dn=hidden, group_size=group_size,
+        num_experts=1, cache_size=1,
+    )
+    # Force the scales bank to a dtype that must NOT leak into the output.
+    cache.bank_caches["scales_gate_up"] = cache.bank_caches["scales_gate_up"].to(torch.float16)
+    cache.bank_caches["scales_down"] = cache.bank_caches["scales_down"].to(torch.float16)
+
+    accessor = SlotWeightAccessor(cache, intermediate=inter, dtype=torch.bfloat16)
+    gate_w, up_w, down_w = accessor.get(0)
+    assert gate_w.dtype == torch.bfloat16
+    assert up_w.dtype == torch.bfloat16
+    assert down_w.dtype == torch.bfloat16
 
 
 def test_gptq_get_shapes_match_out_in_convention():
@@ -103,7 +136,7 @@ def test_gptq_get_shapes_match_out_in_convention():
         k_gu=hidden, n_gu=2 * inter, k_dn=inter, n_dn=hidden, group_size=group_size,
         num_experts=1, cache_size=1,
     )
-    accessor = SlotWeightAccessor(cache, intermediate=inter)
+    accessor = SlotWeightAccessor(cache, intermediate=inter, dtype=torch.float32)
     gate_w, up_w, down_w = accessor.get(0)
     assert gate_w.shape == (inter, hidden)
     assert up_w.shape == (inter, hidden)
@@ -119,7 +152,7 @@ def test_gptq_get_caches_per_slot_within_one_instance():
         k_gu=hidden, n_gu=2 * inter, k_dn=inter, n_dn=hidden, group_size=group_size,
         num_experts=1, cache_size=1,
     )
-    accessor = SlotWeightAccessor(cache, intermediate=inter)
+    accessor = SlotWeightAccessor(cache, intermediate=inter, dtype=torch.float32)
     first = accessor.get(0)
     second = accessor.get(0)
     for a, b in zip(first, second):
@@ -141,7 +174,7 @@ def test_gptq_accessor_refuses_to_guess_group_size():
         "qweight_down": [dn_qw.unsqueeze(0)], "qzeros_down": [dn_qz.unsqueeze(0)], "scales_down": [dn_sc.unsqueeze(0)],
     })
     with pytest.raises(ValueError, match="gptq_group_size"):
-        SlotWeightAccessor(cache, intermediate=inter)
+        SlotWeightAccessor(cache, intermediate=inter, dtype=torch.float32)
 
 
 def test_bf16_accessor_behavior_unchanged():
@@ -155,7 +188,7 @@ def test_bf16_accessor_behavior_unchanged():
     cache.materialize_layer(0)
     cache.copy_missing()
 
-    accessor = SlotWeightAccessor(cache, intermediate=inter)
+    accessor = SlotWeightAccessor(cache, intermediate=inter, dtype=torch.float32)
     gu, dn = cache.bank_views()
     for e in range(E):
         slot = int(cache.slot_for_id[0, e].item())
