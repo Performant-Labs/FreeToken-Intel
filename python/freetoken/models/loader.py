@@ -467,19 +467,35 @@ def _attach_offload_cache(
             }
         )
     elif is_int8:
-        # Four packed banks (issue moe-quant-banks-schema-int8's schema) --
+        # Four packed banks (issue moe-quant-banks-int8, #154's
+        # _BANK_SCHEMAS["int8_channel"] -- corrected to compressed-tensors'
+        # real pack-quantized format, verified against rj1013/
+        # gemma-4-26B-A4B-it_q8; see Int8ExpertBank's own docstring) --
         # every bank is one row per expert, so set_bank_sources' generic
-        # per-expert-row contract applies unchanged. Unlike gptq_int4 there
-        # is no shared per-projection side tensor (no g_idx equivalent): a
-        # per-channel scale is already one row per expert.
+        # per-expert-row contract applies unchanged. K (real logical
+        # in-features) is shared across every expert of a projection type
+        # (an architecture constant, gate_up's == hidden_size, down's ==
+        # moe_intermediate_size) -- set as two plain scalar cache attributes
+        # (SlotWeightAccessor refuses to guess them), the same pattern as
+        # gptq_group_size below, since K is derivable from the parsed model
+        # config rather than needing a per-layer extra_metadata side table.
         cache.set_bank_sources(
             {
-                "weight_gate_up": [b.weight for b in gate_up_banks],
-                "scale_gate_up": [b.scale for b in gate_up_banks],
-                "weight_down": [b.weight for b in down_banks],
-                "scale_down": [b.scale for b in down_banks],
+                "weight_packed_gate_up": [b.weight_packed for b in gate_up_banks],
+                "weight_scale_gate_up": [b.weight_scale for b in gate_up_banks],
+                "weight_packed_down": [b.weight_packed for b in down_banks],
+                "weight_scale_down": [b.weight_scale for b in down_banks],
             }
         )
+        gate_up_ks = {b.k for b in gate_up_banks}
+        down_ks = {b.k for b in down_banks}
+        if len(gate_up_ks) != 1 or len(down_ks) != 1:
+            raise ValueError(
+                f"int8_channel: K differs across layers -- gate_up {gate_up_ks}, down {down_ks} "
+                "(K is an architecture constant, expected identical across every layer)"
+            )
+        cache.int8_k_gate_up = next(iter(gate_up_ks))
+        cache.int8_k_down = next(iter(down_ks))
     elif is_gptq:
         # Six packed banks (issue moe-quant-banks-schema, #136's schema) --
         # every bank is one row per expert, so set_bank_sources' generic
