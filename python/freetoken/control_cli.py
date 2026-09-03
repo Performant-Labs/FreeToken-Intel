@@ -19,22 +19,44 @@ from freetoken.daemon.client import DaemonClient, DaemonConnectionError, DEFAULT
 
 
 def _parse_args(argv: list[str], prog: str) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog=prog, description="Query and manage a running ft daemon.")
-    parser.add_argument(
+    # --daemon-url is registered on both the top-level parser AND (via this
+    # shared parent) each subparser: argparse only accepts a parent parser's
+    # own options *before* the subcommand name, so `ft ctl status
+    # --daemon-url <url>` -- the natural place to put it -- would otherwise
+    # fail with "unrecognized arguments" (PR-Agent review, PR #128); only
+    # `ft ctl --daemon-url <url> status` would have worked. Registering it on
+    # both accepts the flag in either position.
+    # Two separate parent parsers, not one reused: the subparser copy's
+    # default must be argparse.SUPPRESS, not the real default. If it also
+    # defaulted to DEFAULT_BASE_URL, `ft ctl --daemon-url X status` (flag
+    # given at the top level, not repeated after the subcommand) would parse
+    # the top level's --daemon-url correctly and then have the subparser's
+    # own re-parse immediately clobber it back to the default -- SUPPRESS
+    # means "leave the namespace's existing value alone if not given here".
+    top_level_daemon_url = argparse.ArgumentParser(add_help=False)
+    top_level_daemon_url.add_argument(
         "--daemon-url",
         default=DEFAULT_BASE_URL,
         help=f"daemon control-plane base URL (default: {DEFAULT_BASE_URL})",
     )
+    sub_daemon_url = argparse.ArgumentParser(add_help=False)
+    sub_daemon_url.add_argument("--daemon-url", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
+    parser = argparse.ArgumentParser(
+        prog=prog, description="Query and manage a running ft daemon.", parents=[top_level_daemon_url]
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("status", help="Show whether ft serve is running, and its metadata")
+    sub.add_parser("status", parents=[sub_daemon_url], help="Show whether ft serve is running, and its metadata")
 
-    start_p = sub.add_parser("start", help="Start ft serve under the daemon's supervision")
+    start_p = sub.add_parser(
+        "start", parents=[sub_daemon_url], help="Start ft serve under the daemon's supervision"
+    )
     start_p.add_argument("model", help="model reference (HF repo id, FTW path, or registered name)")
     start_p.add_argument("--host", default="127.0.0.1")
     start_p.add_argument("--port", type=int, default=8080)
 
-    sub.add_parser("stop", help="Stop the supervised ft serve process")
+    sub.add_parser("stop", parents=[sub_daemon_url], help="Stop the supervised ft serve process")
 
     return parser.parse_args(argv)
 

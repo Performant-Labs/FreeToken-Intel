@@ -82,3 +82,44 @@ def test_unreachable_daemon_exits_one(monkeypatch, capsys):
 
 def test_missing_subcommand_exits_two():
     assert main([]) == 2
+
+
+def test_daemon_url_accepted_after_the_subcommand(monkeypatch):
+    """PR-Agent review, PR #128: argparse only accepts a parent parser's own
+    options before the subcommand by default, so `ft ctl status --daemon-url
+    <url>` (the natural place to put it) used to fail with "unrecognized
+    arguments"."""
+    from freetoken import control_cli
+
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, base_url):
+            captured["base_url"] = base_url
+
+        def status(self):
+            return {"running": False}
+
+    monkeypatch.setattr(control_cli, "DaemonClient", _FakeClient)
+    assert main(["status", "--daemon-url", "http://example:9"], out=io.StringIO()) == 0
+    assert captured["base_url"] == "http://example:9"
+
+
+def test_daemon_url_before_subcommand_is_not_clobbered_by_the_subparser_default(monkeypatch):
+    """A regression this fix could plausibly introduce: the subparser's own
+    --daemon-url copy re-parsing over the top-level value with its own
+    default instead of leaving it alone."""
+    from freetoken import control_cli
+
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, base_url):
+            captured["base_url"] = base_url
+
+        def status(self):
+            return {"running": False}
+
+    monkeypatch.setattr(control_cli, "DaemonClient", _FakeClient)
+    assert main(["--daemon-url", "http://example:9", "status"], out=io.StringIO()) == 0
+    assert captured["base_url"] == "http://example:9"
