@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 
-from freetoken.daemon import DEFAULT_HOST, DEFAULT_PORT, main
+from freetoken.daemon import DEFAULT_HOST, DEFAULT_PORT, _is_loopback_host, main
 
 
 def test_help_exits_zero():
@@ -44,3 +44,30 @@ def test_custom_host_and_port_parsed(monkeypatch):
 def test_module_level_defaults():
     assert DEFAULT_HOST == "127.0.0.1"
     assert DEFAULT_PORT == 8500
+
+
+def test_is_loopback_host():
+    assert _is_loopback_host("127.0.0.1")
+    assert _is_loopback_host("::1")
+    assert _is_loopback_host("localhost")
+    assert not _is_loopback_host("0.0.0.0")
+    assert not _is_loopback_host("192.168.1.5")
+    assert not _is_loopback_host("example.com")
+
+
+def test_non_loopback_host_warns(monkeypatch, capsys):
+    import freetoken.daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "create_app", lambda: object())
+    assert main(["--host", "0.0.0.0"]) == 0
+    err = capsys.readouterr().err
+    assert "not loopback" in err
+    assert "not real authentication" in err
+
+
+def test_loopback_host_does_not_warn(monkeypatch, capsys):
+    import freetoken.daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "create_app", lambda: object())
+    assert main(["--host", "127.0.0.1"]) == 0
+    assert capsys.readouterr().err == ""
