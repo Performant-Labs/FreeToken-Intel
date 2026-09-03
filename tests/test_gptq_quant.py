@@ -25,12 +25,6 @@ def _pack_nibbles(codes: list[int]) -> int:
     for i, c in enumerate(codes):
         assert 0 <= c < 16
         word |= c << (4 * i)
-    # A packed word with bit 31 set (e.g. every nibble = 8) is a legitimate
-    # int32 bit pattern, but torch.tensor(..., dtype=torch.int32) rejects a
-    # Python int >= 2**31 as an overflow -- fold to the equivalent
-    # two's-complement negative value first (see also test_weight_gptq_banks).
-    if word >= 1 << 31:
-        word -= 1 << 32
     return word
 
 
@@ -42,9 +36,8 @@ def test_dequantize_matches_hand_packed_known_encoding():
     assert qweight.shape == (1, N)
 
     # Zero-point 8 (the standard symmetric midpoint) for every output channel:
-    # this checkpoint format (issue #147) stores the true zero-point directly,
-    # so the raw nibble is 8, not the legacy AutoGPTQ-v1 stored-minus-one 7.
-    qzeros = torch.tensor([[_pack_nibbles([8] * 8)]], dtype=torch.int32)
+    # AutoGPTQ stores (zero_point - 1) packed, so the raw nibble is 7.
+    qzeros = torch.tensor([[_pack_nibbles([7] * 8)]], dtype=torch.int32)
     assert qzeros.shape == (1, N // 8)
 
     scales = torch.full((1, N), 0.5)
@@ -64,7 +57,7 @@ def test_dequantize_respects_per_group_scale_and_zero():
     codes = [1] * 8  # every row's weight code is 1 (arbitrary, constant)
     qweight = torch.tensor([[_pack_nibbles(codes)] * N], dtype=torch.int32)
     qzeros = torch.tensor(
-        [[_pack_nibbles([8] * 8)], [_pack_nibbles([4] * 8)]], dtype=torch.int32
+        [[_pack_nibbles([7] * 8)], [_pack_nibbles([3] * 8)]], dtype=torch.int32
     )  # group0 zero=8, group1 zero=4
     scales = torch.tensor([[1.0] * N, [10.0] * N])
     g_idx = torch.tensor([i // group_size for i in range(K)], dtype=torch.int32)
@@ -110,7 +103,7 @@ def test_gptq_linear_matches_manual_dequant_matmul():
     K, N, group_size = 8, 8, 8
     codes = [(k * 3) % 16 for k in range(8)]
     qweight = torch.tensor([[_pack_nibbles(codes)] * N], dtype=torch.int32)
-    qzeros = torch.tensor([[_pack_nibbles([8] * 8)]], dtype=torch.int32)
+    qzeros = torch.tensor([[_pack_nibbles([7] * 8)]], dtype=torch.int32)
     scales = torch.full((1, N), 0.25)
     g_idx = torch.zeros(K, dtype=torch.int32)
 
@@ -145,7 +138,7 @@ def test_sequential_groups_rejects_nothing_extra_and_shapes_correctly():
     K, N, group_size = 8, 8, 8
     codes = [(k * 3) % 16 for k in range(8)]
     qweight = torch.tensor([[_pack_nibbles(codes)] * N], dtype=torch.int32)
-    qzeros = torch.tensor([[_pack_nibbles([8] * 8)]], dtype=torch.int32)
+    qzeros = torch.tensor([[_pack_nibbles([7] * 8)]], dtype=torch.int32)
     scales = torch.full((1, N), 0.25)
 
     out = dequantize_gptq_int4_sequential_groups(qweight, qzeros, scales, group_size=group_size)
