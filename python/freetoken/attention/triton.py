@@ -126,6 +126,14 @@ class TritonAttentionBackend(BaseAttnBackend):
         # Read once here and passed into _attend_one, so the mask in both call paths
         # (per-request and whole-batch) is identical.
         window = int(attn_spec.sliding_window) if (attn_spec is not None and attn_spec.sliding_window) else 0
+        # Attention sinks (gpt-oss, issue `models-gpt-oss` #23): a learned
+        # per-head logit that participates in the softmax as an extra
+        # always-attended column (inflating the denominator only -- it
+        # never contributes a value vector), confirmed against the real
+        # transformers gpt_oss modeling code. None for every model that
+        # doesn't set attn_spec.sinks (every existing backend behavior is
+        # unchanged).
+        sinks = attn_spec.sinks if (attn_spec is not None and attn_spec.sinks is not None) else None
 
         if table_idx is not None:
             req = next((r for r in batch.reqs if r.table_idx == table_idx), batch.reqs[0])
@@ -155,7 +163,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             # process -- the original nondeterminism).
             written = req.device_len if is_decode else req.cached_len + ext
             q_pos = self._request_positions(batch, table_idx, ext)
-            out[:] = self._attend_one(req, q, q_pos, written, repeat, scale, window, layer_id)
+            out[:] = self._attend_one(req, q, q_pos, written, repeat, scale, window, layer_id, sinks)
             return out
 
         # Whole-batch call (table_idx is None): q/k/v span all requests, so walk
@@ -178,11 +186,11 @@ class TritonAttentionBackend(BaseAttnBackend):
             written = req.device_len if is_decode else req.cached_len + ext
             qh = q[:, token_idx : token_idx + ext, :]
             q_pos = batch.positions[token_idx : token_idx + ext]
-            out[:, token_idx : token_idx + ext, :] = self._attend_one(req, qh, q_pos, written, repeat, scale, window, layer_id)
+            out[:, token_idx : token_idx + ext, :] = self._attend_one(req, qh, q_pos, written, repeat, scale, window, layer_id, sinks)
             token_idx += ext
         return out
 
-    def _attend_one(self, req, qh, q_pos, written, repeat, scale, window: int = 0, layer_id: int = 0) -> torch.Tensor:
+    def _attend_one(self, req, qh, q_pos, written, repeat, scale, window: int = 0, layer_id: int = 0, sinks=None) -> torch.Tensor:
         """Attend a block of query rows against one request's KV history.
 
         Reads exactly ``[0, written)`` -- the cheap, shape-varies-per-step
@@ -230,7 +238,19 @@ class TritonAttentionBackend(BaseAttnBackend):
             allowed = allowed & ((q_pos[None, :, None] - key_pos[None, None, :]) < window)
         scores = torch.matmul(qh, k_all.transpose(-1, -2)) * scale
         scores = torch.where(allowed, scores, torch.full_like(scores, float("-inf")))
-        return torch.matmul(torch.softmax(scores, dim=-1), v_all)  # [heads, qlen, D]
+        if sinks is not None:
+            # Attention sinks (gpt-oss, #23): one learned scalar per head,
+            # concatenated as an extra always-attended column so it inflates
+            # the softmax denominator but never contributes a value vector
+            # (confirmed against the real transformers gpt_oss modeling
+            # code's own `eager_attention_forward`: sinks -> cat -> softmax
+            # -> drop the last column).
+            sink_col = sinks.to(scores.dtype).view(-1, 1, 1).expand(scores.shape[0], scores.shape[1], 1)
+            combined = torch.cat([scores, sink_col], dim=-1)
+            probs = torch.softmax(combined, dim=-1)[..., :-1]
+        else:
+            probs = torch.softmax(scores, dim=-1)
+        return torch.matmul(probs, v_all)  # [heads, qlen, D]
 
     def _request_positions(self, batch, table_idx: int, ext: int) -> torch.Tensor:
         """This request's new-token positions (for the causal mask).
