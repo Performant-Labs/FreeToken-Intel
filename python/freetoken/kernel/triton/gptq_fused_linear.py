@@ -20,17 +20,31 @@ torch 2.13.0+xpu):
   :func:`gptq_linear.dequantize_gptq_int4_sequential_groups` + a plain
   matmul on float32 synthetic fixtures across several shapes (aligned and
   ragged K/N, single- and multi-group).
-* Performance: with the ``BLOCK_M=16, BLOCK_N=16`` config this module
-  defaults to, the fused kernel beats the existing dequant-then-matmul
-  fallback for decode-realistic small batches (M=1: ~0.09ms vs ~0.13ms;
-  M=4: ~0.09ms vs ~0.12ms on a 2048x768, group_size=128 expert projection)
-  -- the case that matters most for MoE decode, where each activated
-  expert typically sees only a handful of routed tokens per step. Larger
-  ``BLOCK_M``/``BLOCK_N`` tile configs were all measured SLOWER (by 5-25x)
-  at every batch size tried, and the fused kernel itself falls behind the
-  fallback once M grows into prefill-sized batches (M=32: ~0.26ms fused vs
-  ~0.13ms fallback) -- so this is not (yet) a universal replacement; see
-  ``fused_gptq_linear``'s own docstring for when to prefer it.
+* Performance: a small tile-config sweep (``BLOCK_M`` in 1/2/4/8/16/32,
+  ``BLOCK_N`` in 16/32/64) on a 2048x768, group_size=128 expert projection
+  found ``BLOCK_M=8, BLOCK_N=16`` (this module's default) consistently
+  near-optimal for every ``M`` up to 32, and the fused kernel wins big over
+  the dequant-then-matmul fallback there -- exactly the MoE decode-step
+  regime, where ``_expert_compute``'s call site already batches by
+  (expert, resident slot), so ``M`` there is "how many routed tokens hit
+  this one expert this step", typically small:
+
+  ============  ============  ============
+  M             fallback (ms)  fused (ms)
+  ============  ============  ============
+  1              0.122          0.031
+  4              0.122          0.031
+  8              0.122          0.033
+  16             0.120          0.065
+  32             0.120          0.063
+  64             0.123          0.132
+  128            0.129          0.251
+  ============  ============  ============
+
+  Past M~=64 the fused kernel falls behind the fallback (which is backed by
+  a heavily-tuned oneDNN/oneMKL GEMM) -- so this is not a universal
+  replacement; see :func:`prefer_fused_over_dequant` for the measured
+  crossover this module encodes.
 
 Design: the K-loop iterates one full quantization group per step
 (``GROUP_SIZE`` must be a multiple of 8, the int4 packing factor -- true of
@@ -122,7 +136,7 @@ def fused_gptq_linear(
     *,
     group_size: int,
     bias: torch.Tensor | None = None,
-    block_m: int = 16,
+    block_m: int = 8,
     block_n: int = 16,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
@@ -137,12 +151,12 @@ def fused_gptq_linear(
     ``group_size`` must be a multiple of 8 (the int4 packing factor) -- true
     of every real GPTQ checkpoint's ``group_size`` (128 is standard).
 
-    Defaults (``block_m=16, block_n=16``) are the measured-best config for
-    decode-realistic small batches (M<=4-ish) on the real B70 -- see this
-    module's own docstring for the numbers. For prefill-sized batches
-    (larger M), the plain dequant-then-matmul fallback
-    (:func:`gptq_linear.gptq_linear`) currently measures faster; callers
-    driving both batch regimes should pick per call, not hardcode one path.
+    Defaults (``block_m=8, block_n=16``) are the measured-best tile config
+    for M<=32 on the real B70 -- see this module's own docstring for the
+    sweep. Above that M, :func:`prefer_fused_over_dequant` says to prefer
+    the plain dequant-then-matmul fallback (:func:`gptq_linear.gptq_linear`)
+    instead; callers driving both batch regimes should pick per call via
+    that helper, not hardcode one path.
     """
     if group_size % _P != 0:
         raise ValueError(f"group_size {group_size} must be a multiple of {_P} (the int4 packing factor)")
@@ -180,3 +194,29 @@ def fused_gptq_linear(
     if bias is not None:
         result = result + bias
     return result
+
+
+# Measured crossover (this module's own docstring sweep, 2048x768,
+# group_size=128 on the real B70): the fused kernel wins clearly through
+# M=32 and starts losing to the fallback by M=64. Not re-measured per
+# checkpoint shape -- a real per-(N, K, group_size) profile, mirroring
+# freetoken.engine.cache_budget's own measured-not-guessed philosophy,
+# would replace this fixed threshold if a real checkpoint's numbers ever
+# disagree with it.
+_FUSED_MAX_M = 32
+
+
+def prefer_fused_over_dequant(m: int) -> bool:
+    """Whether :func:`fused_gptq_linear` (native GEMM) is expected to beat
+    :func:`gptq_linear.gptq_linear` (dequant-then-matmul) for a batch of
+    ``m`` rows -- see this module's own docstring for the measured numbers
+    this threshold is drawn from.
+
+    Not wired into any forward path yet (issue #139): the offload cache's
+    ``SlotWeightAccessor`` currently always dequantizes to a dense tensor
+    first (see its own docstring), so a caller wanting the fused kernel
+    today must bypass it and call :func:`fused_gptq_linear` directly against
+    the packed bank views. Exposed here so that future wiring has a real,
+    measured dispatch rule to start from instead of a guess.
+    """
+    return m <= _FUSED_MAX_M
