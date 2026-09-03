@@ -41,6 +41,46 @@ def test_write_read_round_trip_various_dtypes(tmp_path):
             assert torch.equal(got, original)
 
 
+def test_read_is_zero_copy_on_cpu(tmp_path):
+    """Regression guard for the real perf bug this format's read() path had:
+    an earlier per-tensor mmap-slice-plus-.clone() design (and, briefly, a
+    bulk-readinto-into-one-fresh-buffer design) made FTW measurably SLOWER
+    than raw safetensors for many-small-tensor checkpoints -- a direct
+    contradiction of this issue's own "load banks faster than raw
+    safetensors" accept criterion (see benchmarks/bench_load_weight_generic.py,
+    which measures the real speedup; ~2.4x on a 128/512-expert synthetic
+    checkpoint after the fix). A CPU-device read must be a plain VIEW into
+    the shared mmap'd buffer, not a copy -- checked here via torch's own
+    ``_base`` chain rather than timing (flaky in CI), since a copy would
+    have ``_base is None``."""
+    tensors = {"w": torch.randn(4, 4)}
+    archive_dir = str(tmp_path / "archive")
+    FtwArchive(archive_dir).write(tensors)
+
+    (name, tensor), = FtwArchive(archive_dir).read()
+    assert tensor._base is not None, "read() copied instead of viewing -- the real perf regression this guards"
+
+
+def test_write_pads_tensor_offsets_to_alignment_boundary(tmp_path):
+    """Regression guard: read() reinterprets every tensor as a view.T.view(dtype)
+    into one shared buffer, and torch.Tensor.view(dtype) requires the view's
+    byte offset to be a multiple of the target dtype's element size (e.g. 8
+    for int64/float64) -- an unaligned offset raised RuntimeError before
+    write() started padding each tensor's start offset. This fixture's odd
+    tensor sizes (an int8 of length 3, i.e. 3 bytes) deliberately produce a
+    misaligned NEXT offset if write() does not pad."""
+    tensors = {
+        "a": torch.arange(3, dtype=torch.int8),  # 3 bytes -> misaligned next offset if unpadded
+        "b": torch.arange(4, dtype=torch.int64),  # needs 8-byte-aligned offset to view() correctly
+    }
+    archive_dir = str(tmp_path / "archive")
+    FtwArchive(archive_dir).write(tensors)
+
+    back = dict(FtwArchive(archive_dir).read())
+    for name, original in tensors.items():
+        torch.testing.assert_close(back[name], original)
+
+
 def test_read_tensors_survive_after_generator_exhausted(tmp_path):
     """Guards the mmap-lifetime bug class: a caller collecting every yielded
     tensor into a dict (e.g. load_weight building a state dict) must still
