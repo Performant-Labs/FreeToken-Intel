@@ -581,8 +581,16 @@ class _Qwen3MoE(nn.Module):
         #    An expert the pool evicted maps to -1 -> clamped to 0, valid=False.
         slots = cache.slot_for_id[layer_id].to("cpu").tolist()
         S = cache.cache_size
-        gu, dn = cache.bank_views()  # ([S, 2I, H], [S, H, I])
         intermediate = int(model.config.moe_intermediate_size)
+        # SlotWeightAccessor abstracts gu[s_i, ...]/dn[s_i] bf16 indexing over a
+        # quantized bank format too (issue moe-quant-banks-compute, #137): for
+        # "bf16" this is the exact same plain-tensor indexing as before (zero
+        # behavior change); for "gptq_int4" it dequantizes each distinct
+        # resident slot at most once per step, from the packed banks, never
+        # the whole checkpoint (the RAM-saving point of the whole epic, #134).
+        from freetoken.moe.offload_cache import SlotWeightAccessor
+
+        slot_weights = SlotWeightAccessor(cache, intermediate)
         dev = flat.device
         out = torch.zeros_like(flat)
         routed_cpu = torch.empty(B, k, dtype=torch.int64)
@@ -638,10 +646,11 @@ class _Qwen3MoE(nn.Module):
         #    the loop).
         for j, s_i, rows in groups:
             idx = torch.tensor(rows, dtype=torch.long, device=dev)
+            gate_w, up_w, down_w = slot_weights.get(s_i)
             y = top_w.index_select(0, idx)[:, j, None] * _expert_compute(
-                gu[s_i, 0:intermediate],
-                gu[s_i, intermediate : 2 * intermediate],
-                dn[s_i],
+                gate_w,
+                up_w,
+                down_w,
                 flat.index_select(0, idx),
             )
             out.index_add_(0, idx, y)
@@ -672,11 +681,26 @@ class _Qwen3MoE(nn.Module):
         cleanly to the offload path there. The split applies to the routed-expert
         decode step, where the q* balance lives.
         """
-        # The fetch fraction f (share of misses PCIe-fetched, the rest on CPU).
-        # Read through the model (the loader stores it there); a test-harness
-        # model that sets none falls back to the block-local 0.0 (pure offload),
-        # the correct no-split default.
+        # Issue moe-quant-banks-compute (#137): the CPU half's math
+        # (_cpu_subset_math) reads model.moe_cache.bank_sources["gate_up"] /
+        # ["down"] directly -- the "bf16" schema's bank names -- and runs
+        # plain-float matmuls on them. A "gptq_int4" cache's bank_sources use
+        # different names entirely (qweight_gate_up, ...), so that lookup
+        # would KeyError. Rather than teach the CPU half to dequantize too
+        # (real, separable follow-up work -- the CPU path has none of the
+        # slot-cache/copy_missing machinery SlotWeightAccessor hooks into, so
+        # it would need its own dequant-and-cache logic), this format is
+        # excluded from the hybrid split for now: force fetch_frac to 1.0 so
+        # every miss rides PCIe through the (already gptq_int4-aware)
+        # offload path below. A documented, deliberate tradeoff (this
+        # issue's own accept criteria explicitly allows it as a first cut),
+        # not a silent gap -- gptq_int4 previously would have crashed loudly
+        # here (KeyError) rather than produced wrong numbers, and now simply
+        # never reaches that code path.
+        cache_quant_format = getattr(getattr(model, "moe_cache", None), "quant_format", "bf16")
         fetch_frac = float(getattr(model, "moe_hybrid_fetch_fraction", 0.0) or 0.0)
+        if cache_quant_format == "gptq_int4":
+            fetch_frac = 1.0
         if fetch_frac <= 0.0:
             # No usable profile -> every miss rides PCIe (pure offload).
             return self._forward_offload(flat, top_idx, top_w, model, batch)

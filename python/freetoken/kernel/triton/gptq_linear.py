@@ -99,6 +99,31 @@ def dequantize_gptq_int4(
     )
 
 
+def dequantize_gptq_int4_sequential_groups(
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    group_size: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """:func:`dequantize_gptq_int4`, but for the ``desc_act=False`` case (the
+    real checkpoint's own setting, and the only case this port implements) --
+    computes ``g_idx`` implicitly as ``k // group_size`` instead of requiring
+    the caller to have one in hand.
+
+    ``g_idx`` is deterministic and identical for every expert of a given
+    projection type/layer under ``desc_act=False`` (it depends only on ``K``
+    and ``group_size``, both architecture constants) -- offload-cache bank
+    schemas (issue moe-quant-banks-schema, #136) can therefore skip storing
+    it per-expert entirely and this helper reconstructs it on the fly, once
+    per call, at negligible cost (a single ``[K]`` int32 tensor).
+    """
+    k = qweight.shape[0] * (32 // _BITS)
+    g_idx = torch.arange(k, device=qweight.device, dtype=torch.int32) // group_size
+    return dequantize_gptq_int4(qweight, qzeros, scales, g_idx, out_dtype=out_dtype)
+
+
 def gptq_linear(
     x: torch.Tensor,
     qweight: torch.Tensor,

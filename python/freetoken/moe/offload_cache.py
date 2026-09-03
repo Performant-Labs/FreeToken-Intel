@@ -602,24 +602,6 @@ class OffloadMoeCache:
         return self.device.type == "xpu" and is_xpu_available()
 
 
-# Bank name convention this port uses for the "gptq_int4" schema (issue
-# moe-quant-banks-schema, #136): three packed tensors per projection slot
-# (qweight/qzeros/scales), no g_idx bank -- g_idx is deterministic under
-# desc_act=False (the real checkpoint's setting, the only case this port
-# implements) and is reconstructed on the fly from group_size instead of
-# being stored per-expert (see gptq_linear.dequantize_gptq_int4_sequential_
-# groups). If #136 registers different bank names, update this tuple to
-# match -- it is the single place that name is spelled.
-GPTQ_INT4_BANK_NAMES: tuple[str, ...] = (
-    "qweight_gate_up",
-    "qzeros_gate_up",
-    "scales_gate_up",
-    "qweight_down",
-    "qzeros_down",
-    "scales_down",
-)
-
-
 class SlotWeightAccessor:
     """Per-step accessor for one MoE layer's resident-slot expert weights,
     abstracting the offload forward's ``gu[s_i, ...]`` / ``dn[s_i]`` bf16
@@ -642,13 +624,29 @@ class SlotWeightAccessor:
         self._cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         if self.quant_format == "gptq_int4":
             self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
-            missing = [n for n in GPTQ_INT4_BANK_NAMES if n not in self._banks]
-            if missing:
+            # g_idx is deliberately not a bank (see _BANK_SCHEMAS["gptq_int4"]'s
+            # own comment) -- get() below reconstructs it implicitly from
+            # group_size, correct for this port's only supported case
+            # (desc_act=False, the real checkpoint's own setting).
+            #
+            # No default here on purpose: a wrong-but-plausible group_size
+            # (e.g. silently falling back to some other checkpoint's value)
+            # would dequantize with the wrong group boundaries and produce
+            # silently-wrong-but-finite numbers, not a crash -- caught during
+            # this class's own test-writing, when a fixture forgot to set it
+            # and got a real, non-obvious 50%-of-elements mismatch instead of
+            # an error. The loader (issue #135 / #138) must set
+            # ``cache.gptq_group_size`` from the checkpoint's own
+            # ``quantization_config.group_size`` before any gptq_int4 forward
+            # runs.
+            group_size = getattr(cache, "gptq_group_size", None)
+            if group_size is None:
                 raise ValueError(
-                    f"gptq_int4 schema is missing expected bank(s) {missing}; "
-                    f"registered banks are {sorted(self._banks)}"
+                    "OffloadMoeCache.gptq_group_size is not set -- the loader must set it "
+                    "from the checkpoint's quantization_config.group_size before any "
+                    "gptq_int4 forward pass runs (SlotWeightAccessor refuses to guess)"
                 )
-            self._group_size = int(getattr(cache, "gptq_group_size", 128))
+            self._group_size = int(group_size)
         else:
             self._gu, self._dn = cache.bank_views()
 
