@@ -557,6 +557,7 @@ def _ensure_torch() -> None:
         "_Qwen35Attention",
         "_Qwen35MoE",
         "_Qwen35Expert",
+        "_Qwen35MxfpExpert",
         "_Qwen35DecoderLayer",
         "Qwen3_5MoEForCausalLM",
     )
@@ -1681,6 +1682,55 @@ class _Qwen35Expert:
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _Qwen35MxfpExpert:
+    """A single MXFP4-quantized MoE expert, fully XPU-resident (issue
+    `moe-fused-mxfp4`, #180, part of the `quant-xpu` epic, #10).
+
+    Unlike :class:`_Qwen35Expert` (plain bf16 ``gate_proj``/``up_proj``/
+    ``down_proj`` ``nn.Linear``s), this holds the checkpoint's packed MXFP4
+    ``blocks``/``scales`` (the same per-expert tensors
+    :class:`freetoken.models.weight.MxfpExpertBank` streams for the offload
+    backend, moved onto the device instead of staying on host) and never
+    materializes a dequantized weight: :func:`freetoken.kernel.triton.
+    fused_mxfp4_linear.fused_mxfp4_expert_forward` runs the native packed
+    GEMM directly, the same kernel the offload backend's dequant-at-compute
+    path (#163) uses -- this is its fully-resident sibling, with no host
+    round-trip / LRU slot pool at all.
+    """
+
+    def __init__(
+        self,
+        blocks_gate_up: torch.Tensor,
+        scales_gate_up: torch.Tensor,
+        blocks_down: torch.Tensor,
+        scales_down: torch.Tensor,
+        intermediate: int,
+    ) -> None:
+        super().__init__()
+        # persistent=False: these are checkpoint-derived, streamed by the
+        # loader every load, never part of a state_dict this port saves/
+        # restores (matching every other quant bank's own storage -- the
+        # offload cache's host banks aren't state_dict members either).
+        self.register_buffer("blocks_gate_up", blocks_gate_up, persistent=False)
+        self.register_buffer("scales_gate_up", scales_gate_up, persistent=False)
+        self.register_buffer("blocks_down", blocks_down, persistent=False)
+        self.register_buffer("scales_down", scales_down, persistent=False)
+        self.intermediate = intermediate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.fused_mxfp4_linear import fused_mxfp4_expert_forward
+
+        return fused_mxfp4_expert_forward(
+            x,
+            self.blocks_gate_up,
+            self.scales_gate_up,
+            self.blocks_down,
+            self.scales_down,
+            intermediate=self.intermediate,
+            out_dtype=x.dtype,
+        )
 
 
 def _make_shared_config(config: ModelConfig, shared_inter: int) -> ModelConfig:

@@ -235,7 +235,7 @@ def load_model(
                     model_path=model_path,
                 )
             else:
-                _place_expert_weights(model, gate_up_banks, down_banks)
+                _place_expert_weights_any(model, gate_up_banks, down_banks, device)
             expert_sources = (gate_up_banks, down_banks)
         else:
             expert_sources = ([], [])
@@ -272,7 +272,7 @@ def load_model(
                     model_path=model_path,
                 )
             else:
-                _place_expert_weights(model, gate_up_banks, down_banks)
+                _place_expert_weights_any(model, gate_up_banks, down_banks, device)
             expert_sources = (gate_up_banks, down_banks)
         else:
             expert_sources = ([], [])
@@ -367,6 +367,65 @@ def _place_expert_weights(model, gate_up_banks, down_banks) -> None:
                 experts[e].gate_proj.weight.copy_(gu[e, 0:intermediate])
                 experts[e].up_proj.weight.copy_(gu[e, intermediate : 2 * intermediate])
                 experts[e].down_proj.weight.copy_(dn[e])
+
+
+def _place_mxfp4_expert_weights(model, gate_up_banks, down_banks, device) -> None:
+    """Build fully XPU-resident MXFP4 expert modules from packed banks
+    (issue `moe-fused-mxfp4`, #180, part of the `quant-xpu` epic, #10).
+
+    The in-VRAM (``moe_backend="fused"``) sibling of :func:`_attach_offload_
+    cache`'s MXFP4 detection: instead of handing the packed
+    :class:`~freetoken.models.weight.MxfpExpertBank` rows to a host-side LRU
+    slot pool, this REPLACES each MoE layer's ``experts`` ``ModuleList``
+    (already built by the model's constructor as plain bf16
+    ``_Qwen35Expert``s -- thrown away here, a known minor inefficiency, not
+    a correctness issue) with :class:`~freetoken.models.qwen3_5_moe.
+    _Qwen35MxfpExpert` instances holding this expert's own packed
+    ``blocks``/``scales`` moved onto ``device``. Every other expert-type
+    dispatch (``_forward_inram``'s ``self.experts[e](...)`` call) is
+    unchanged -- ``_Qwen35MxfpExpert.forward`` has the identical ``(x) ->
+    tensor`` signature.
+    """
+    import torch.nn as nn
+
+    from freetoken.models.qwen3_5_moe import _Qwen35MxfpExpert
+
+    intermediate = int(getattr(model.config, "moe_intermediate_size", 0))
+    for layer_id in _moe_layers(model.config):
+        moe = getattr(getattr(model, "layers", [None] * (layer_id + 1))[layer_id], "mlp", None)
+        if getattr(moe, "experts", None) is None:
+            continue
+        gu_bank = gate_up_banks[layer_id]
+        dn_bank = down_banks[layer_id]
+        num_experts = gu_bank.blocks.shape[0]
+        moe.experts = nn.ModuleList(
+            _Qwen35MxfpExpert(
+                gu_bank.blocks[e].to(device),
+                gu_bank.scales[e].to(device),
+                dn_bank.blocks[e].to(device),
+                dn_bank.scales[e].to(device),
+                intermediate=intermediate,
+            )
+            for e in range(num_experts)
+        )
+
+
+def _place_expert_weights_any(model, gate_up_banks, down_banks, device) -> None:
+    """Dispatch the in-VRAM (``moe_backend="fused"``) expert placement by
+    bank type (issue #180): a plain bf16 stacked tensor goes through
+    :func:`_place_expert_weights` unchanged (every existing bf16 test);
+    a packed :class:`~freetoken.models.weight.MxfpExpertBank` (the only
+    quant format wired to the fused path so far -- FP8/#181 and INT8/#182
+    are the sibling issues that add their own branch here) goes through
+    :func:`_place_mxfp4_expert_weights` instead.
+    """
+    from freetoken.models.weight import MxfpExpertBank
+
+    first = next((b for b in gate_up_banks if b is not None), None)
+    if isinstance(first, MxfpExpertBank):
+        _place_mxfp4_expert_weights(model, gate_up_banks, down_banks, device)
+    else:
+        _place_expert_weights(model, gate_up_banks, down_banks)
 
 
 def _attach_offload_cache(
