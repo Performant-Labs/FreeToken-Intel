@@ -11,7 +11,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from freetoken.kernel.triton.gptq_linear import dequantize_gptq_int4, gptq_linear
+from freetoken.kernel.triton.gptq_linear import (
+    dequantize_gptq_int4,
+    dequantize_gptq_int4_sequential_groups,
+    gptq_linear,
+)
 
 
 def _pack_nibbles(codes: list[int]) -> int:
@@ -110,3 +114,33 @@ def test_gptq_linear_matches_manual_dequant_matmul():
 
     out = gptq_linear(x, qweight, qzeros, scales, g_idx)
     torch.testing.assert_close(out, ref)
+
+
+def test_sequential_groups_matches_explicit_g_idx():
+    """dequantize_gptq_int4_sequential_groups (issue #137's compute-time
+    dequant helper -- no stored g_idx) must match dequantize_gptq_int4 given
+    the equivalent explicit g_idx=[k // group_size for k in range(K)]."""
+    K, N, group_size = 16, 8, 4
+    torch.manual_seed(0)
+    codes = [(k * 5) % 16 for k in range(8)]
+    qweight = torch.tensor([[_pack_nibbles(codes)] * N for _ in range(K // 8)], dtype=torch.int32)
+    n_groups = K // group_size
+    qzeros = torch.tensor([[_pack_nibbles([3 + g] * 8)] for g in range(n_groups)], dtype=torch.int32)  # [n_groups, N//8]
+    scales = torch.stack([torch.full((N,), 0.1 * (g + 1)) for g in range(n_groups)])
+    explicit_g_idx = torch.tensor([k // group_size for k in range(K)], dtype=torch.int32)
+
+    expected = dequantize_gptq_int4(qweight, qzeros, scales, explicit_g_idx, out_dtype=torch.float32)
+    got = dequantize_gptq_int4_sequential_groups(qweight, qzeros, scales, group_size=group_size, out_dtype=torch.float32)
+    torch.testing.assert_close(got, expected)
+
+
+def test_sequential_groups_rejects_nothing_extra_and_shapes_correctly():
+    K, N, group_size = 8, 8, 8
+    codes = [(k * 3) % 16 for k in range(8)]
+    qweight = torch.tensor([[_pack_nibbles(codes)] * N], dtype=torch.int32)
+    qzeros = torch.tensor([[_pack_nibbles([7] * 8)]], dtype=torch.int32)
+    scales = torch.full((1, N), 0.25)
+
+    out = dequantize_gptq_int4_sequential_groups(qweight, qzeros, scales, group_size=group_size)
+    assert out.shape == (K, N)
+    assert out.dtype == torch.bfloat16
