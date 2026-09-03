@@ -183,6 +183,20 @@ class Scheduler:
         # never freed; a decode request that just hit its stop condition was in
         # running_before and is dropped from running_after, so its row is freed.
         freed = [req.table_idx for req in running_before.keys() - running_after.keys()]
+        # A request that finishes ENTIRELY within its own prefill step (e.g.
+        # output_len small enough that the very first sampled token already
+        # satisfies max_device_len) never enters running_before at all --
+        # filter_reqs() above adds it to the decode set and immediately drops
+        # it again (can_decode is False) within this SAME call, so the
+        # before/after diff never observes it. Found via a real test (issue
+        # `engine-kv-addressing`, #173): a single-token-output request's
+        # table_idx was never returned to the free list, leaking it forever.
+        # Scan the batch directly for any aborted request the diff missed.
+        seen = set(freed)
+        for req in batch.reqs:
+            if req.aborted and req.table_idx not in seen:
+                freed.append(req.table_idx)
+                seen.add(req.table_idx)
         if freed:
             self._free_slots.extend(freed)
             self._free_slots.sort()

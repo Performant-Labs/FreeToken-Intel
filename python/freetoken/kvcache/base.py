@@ -214,10 +214,22 @@ class BaseKVCachePool:
 def create_kv_pool(model_config, page_size: int, num_pages: int, device, dtype) -> BaseKVCachePool:
     """Build the engine's KV pool from a parsed ModelConfig.
 
-    (The production pool family -- radix / hybrid-SWA -- is a separate issue;
-    the Intel engine loop uses this flat paged pool.)
+    Builds :class:`~freetoken.kvcache.mha_pool.MHAKVCache` (real per-request
+    free-list page allocation), not the plain :class:`BaseKVCachePool` --
+    issue `engine-kv-addressing` (#173) found that the flat pool's identity
+    ``page_table`` (every row mapped to the SAME slot range) makes two
+    requests decoding concurrently at overlapping relative positions read
+    and write the exact same ``k_buffer``/``v_buffer`` slots, silently
+    corrupting each other's attention context. ``MHAKVCache`` keeps the
+    exact same buffer layout the attention backends read; it only adds the
+    free-list allocator ``engine.py`` uses to give each request its own
+    disjoint slot run. (The radix / hybrid-SWA prefix-cache family is a
+    separate issue, #12/#32 -- this only fixes per-request isolation, not
+    cross-request page reuse.)
     """
-    return BaseKVCachePool(model_config, page_size, num_pages, device, dtype)
+    from .mha_pool import MHAKVCache
+
+    return MHAKVCache(model_config, page_size, num_pages, device, dtype)
 
 
 __all__ = ["BaseKVCachePool", "BaseCacheHandle", "create_kv_pool"]
