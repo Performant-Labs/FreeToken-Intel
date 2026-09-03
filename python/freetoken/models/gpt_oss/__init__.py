@@ -318,6 +318,22 @@ class _GptOssMoE(nn.Module):
 
     def __init__(self, config: ModelConfig, device, dtype, layer_id: int) -> None:
         super().__init__()
+        # Fail loud, not silently wrong (real bug found and fixed while
+        # building deepseek_v4's own MoE, #192, which shares this exact
+        # shape -- also fixed at the root cause in loader.py's own
+        # offload-eligibility gate): this block always builds real,
+        # device-resident expert modules and never reads the offload
+        # cache -- if the engine's moe_backend resolution ever picks
+        # offload/cpu/hybrid for this architecture, every expert would
+        # stay at its random constructor init forever. Raise clearly
+        # instead of returning silently-wrong logits.
+        if bool(getattr(config, "use_offload_moe", False)) or bool(getattr(config, "use_cpu_moe", False)) or bool(getattr(config, "use_hybrid", False)):
+            raise NotImplementedError(
+                "GptOssForCausalLM only supports the in-VRAM (fused) MoE backend "
+                "-- offload/cpu/hybrid are not wired yet (see the module's own "
+                "docstring). Pass moe_backend=\"fused\" explicitly (EngineConfig's "
+                "\"auto\" default does not know this architecture can't offload)."
+            )
         self.layer_id = layer_id
         self.top_k = config.num_experts_per_tok
         bias = bool(config.attrs.get("attention_bias", True))

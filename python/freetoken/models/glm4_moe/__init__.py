@@ -319,6 +319,24 @@ class _Glm4MoE(nn.Module):
 
     def __init__(self, config: ModelConfig, device, dtype, layer_id: int) -> None:
         super().__init__()
+        # Fail loud, not silently wrong (real bug found and fixed while
+        # building deepseek_v4's own MoE, #192, which shares this exact
+        # shape): this block always builds real, device-resident expert
+        # modules and never reads the offload cache -- if the engine's
+        # moe_backend resolution (EngineConfig's own "auto" default) ever
+        # picks offload/cpu/hybrid for this architecture, every expert
+        # stays at its random constructor init forever (nothing overwrites
+        # it, since the offload/cpu code path never touches .experts at
+        # all). Confirmed directly: "auto" resolves to "offload" even on a
+        # CPU-only run, which this block never supported. Raise clearly
+        # instead of returning silently-wrong logits.
+        if bool(getattr(config, "use_offload_moe", False)) or bool(getattr(config, "use_cpu_moe", False)) or bool(getattr(config, "use_hybrid", False)):
+            raise NotImplementedError(
+                "Glm4MoeForCausalLM only supports the in-VRAM (fused) MoE backend "
+                "-- offload/cpu/hybrid are not wired yet (see the module's own "
+                "docstring). Pass moe_backend=\"fused\" explicitly (EngineConfig's "
+                "\"auto\" default does not know this architecture can't offload)."
+            )
         self.layer_id = layer_id
         self.gate = _Glm4TopkRouter(config, dtype)
         self.experts = nn.ModuleList(

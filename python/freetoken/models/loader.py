@@ -200,7 +200,28 @@ def load_model(
     model.moe_hybrid_fetch_fraction = (
         float(load_hybrid_fetch_fraction(_qf) or 0.0) if use_hybrid else 0.0
     )
-    offload = is_moe and use_offload and moe_backend in ("offload", "cpu", "hybrid")
+    # Real bug found and fixed while building issue #192 (DeepSeek-V4):
+    # only _CPU_MOE_CAPABLE_ARCHS' own MoE block actually branches on
+    # use_offload_moe/use_cpu_moe/use_hybrid to build a router-only (no
+    # resident experts) module -- glm4_moe/gpt_oss/deepseek_v4's own MoE
+    # blocks always build real, device-resident expert modules
+    # unconditionally (in-VRAM/fused only, a deliberate, documented scope
+    # cut in each of their own module docstrings). Without this arch
+    # gate, EngineConfig's own "auto" default resolving to "offload"
+    # (confirmed directly: it does, even on a CPU-only run) would route
+    # those experts through _attach_offload_cache instead of
+    # _place_expert_weights_any -- .experts never receives its checkpoint
+    # weights at all and silently keeps its random constructor init
+    # forever (no crash, no warning, just wrong logits from every routed
+    # expert). Gating this decision on real architecture support turns
+    # that into a safe, correct fallback to the fused path these models
+    # actually implement.
+    offload = (
+        is_moe
+        and use_offload
+        and moe_backend in ("offload", "cpu", "hybrid")
+        and _arch in _CPU_MOE_CAPABLE_ARCHS
+    )
     if dummy:
         # Offline path: no checkpoint is read, so the model's MoE experts must
         # come from fabricated banks. To make this *reproducible* (the engine's
