@@ -196,6 +196,40 @@ def fused_gptq_linear(
     return result
 
 
+def fused_gptq_expert_forward(
+    x: torch.Tensor,
+    qweight_gate_up: torch.Tensor,
+    qzeros_gate_up: torch.Tensor,
+    scales_gate_up: torch.Tensor,
+    qweight_down: torch.Tensor,
+    qzeros_down: torch.Tensor,
+    scales_down: torch.Tensor,
+    *,
+    group_size: int,
+    intermediate: int,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """One MoE expert's SwiGLU forward (``down(silu(gate(x)) * up(x))``)
+    entirely against packed GPTQ banks, via two :func:`fused_gptq_linear`
+    calls -- never materializing a dense gate/up/down weight (issue #139).
+
+    Same math as the plain-tensor ``_expert_compute`` helper duplicated in
+    ``qwen3_moe``/``qwen3_5_moe`` (``down(silu(gate(x)) * up(x))``, gate/up
+    fused as one bank whose output columns split ``[0:intermediate]`` /
+    ``[intermediate:2*intermediate]``), but each of the two GEMMs runs
+    fused against the packed tensors from
+    :meth:`freetoken.moe.offload_cache.SlotWeightAccessor.get_gptq_packed`
+    instead of a pre-dequantized dense weight.
+    """
+    out_dtype = out_dtype if out_dtype is not None else x.dtype
+    gu = fused_gptq_linear(
+        x, qweight_gate_up, qzeros_gate_up, scales_gate_up, group_size=group_size, out_dtype=torch.float32
+    )
+    gate, up = gu[:, :intermediate], gu[:, intermediate:]
+    h = (torch.nn.functional.silu(gate) * up).to(out_dtype)
+    return fused_gptq_linear(h, qweight_down, qzeros_down, scales_down, group_size=group_size, out_dtype=out_dtype)
+
+
 # Measured crossover (this module's own docstring sweep, 2048x768,
 # group_size=128 on the real B70): the fused kernel wins clearly through
 # M=32 and starts losing to the fallback by M=64. Not re-measured per

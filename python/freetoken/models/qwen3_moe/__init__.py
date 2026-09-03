@@ -333,29 +333,6 @@ class _Qwen3Attention(nn.Module):
         return self.o_proj(out.transpose(0, 1).contiguous().reshape(bsz, -1))
 
 
-def _expert_compute(gate_w: torch.Tensor, up_w: torch.Tensor, down_w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Run one expert on a [t, H] input using *detached* projection weights.
-
-    The expert weights live in the host-offload banks (ADR 0002) and are handed
-    in as plain tensors (views of the XPU slot pool), so this is a hand-rolled
-    SwiGLU -- not an ``nn.Linear`` -- over the gathered per-expert input:
-    ``down(silu(gate(x)) * up(x))``. The bank rows are stored in *weight*
-    orientation (``[out, in]``, matching ``nn.Linear.weight``): gate/up are
-    ``[I, H]`` and down is ``[H, I]``. The projection is therefore
-    ``x @ w.t()`` -- the same ``F.linear`` form the in-VRAM ``_Qwen3Expert``
-    uses -- so the math is identical to the resident path, which the reference
-    test compares against.
-    """
-    # gate_w [I, H], up_w [I, H], down_w [H, I]; x [t, H].
-    # Every projection is ``x @ w.t()`` (F.linear form). The down step is
-    # ``h @ down_w.t()`` (NOT ``down_w.t() @ h``): in this torch XPU build the
-    # ``@`` operator requires ``left.cols == right.rows``, so the leading
-    # ``[t, *]`` operand must be on the left. ``h @ down_w.t()`` is exactly
-    # ``F.linear(h, down_w)`` -- the in-VRAM expert's down projection.
-    inter = gate_w.shape[0]
-    return (F.silu(x @ gate_w.t()) * (x @ up_w.t())) @ down_w.t()
-
-
 class _Qwen3Expert(nn.Module):
     """A single MoE expert: gate/up/down projections (SwiGLU).
 
@@ -646,12 +623,8 @@ class _Qwen3MoE(nn.Module):
         #    the loop).
         for j, s_i, rows in groups:
             idx = torch.tensor(rows, dtype=torch.long, device=dev)
-            gate_w, up_w, down_w = slot_weights.get(s_i)
-            y = top_w.index_select(0, idx)[:, j, None] * _expert_compute(
-                gate_w,
-                up_w,
-                down_w,
-                flat.index_select(0, idx),
+            y = top_w.index_select(0, idx)[:, j, None] * slot_weights.expert_forward(
+                s_i, flat.index_select(0, idx)
             )
             out.index_add_(0, idx, y)
         return out

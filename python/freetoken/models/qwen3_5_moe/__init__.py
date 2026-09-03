@@ -1043,15 +1043,6 @@ def _rope_for_positions(
     return cos, sin
 
 
-def _expert_compute(gate_w, up_w, down_w, x):
-    """Run one expert on a [t, H] input using *detached* projection weights
-    (the offload bank rows, in [out, in] weight orientation): gate/up are
-    [I, H], down is [H, I], so each projection is ``x @ w.t()``. Returns
-    ``down(silu(gate(x)) * up(x))``."""
-    inter = gate_w.shape[0]
-    return (F.silu(x @ gate_w.t()) * (x @ up_w.t())) @ down_w.t()
-
-
 class _Qwen35MoE:
     """A Qwen3.5/3.6 MoE block: a 256-way top-8 router + an always-on shared
     expert. The router + shared expert are dense (on the device); the routed
@@ -1588,12 +1579,8 @@ class _Qwen35MoE:
         # loop. index_add_ accumulates exactly as `out[sel] += ...` did.
         for j, s_i, rows in groups:
             idx = torch.tensor(rows, dtype=torch.long, device=dev)
-            gate_w, up_w, down_w = slot_weights.get(s_i)
-            y = top_w.index_select(0, idx)[:, j, None] * _expert_compute(
-                gate_w,
-                up_w,
-                down_w,
-                flat.index_select(0, idx),
+            y = top_w.index_select(0, idx)[:, j, None] * slot_weights.expert_forward(
+                s_i, flat.index_select(0, idx)
             )
             out.index_add_(0, idx, y)
         # NB: we do NOT write the slot ids back into top_idx here (the old code did
