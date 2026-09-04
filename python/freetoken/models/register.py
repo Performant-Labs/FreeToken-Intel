@@ -25,6 +25,12 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3_5_moe", "Qwen3_5MoEForCausalLM"
     ),
     "DeepseekV4ForCausalLM": ModelSpec("freetoken.models.deepseek_v4", "DeepseekV4ForCausalLM"),
+    # The real checkpoint's own config.json declares "DeepseekV2ForCausalLM"
+    # (confirmed against the real downloaded DeepSeek-Coder-V2-Lite-Base
+    # checkpoint) -- register under that real architecture name, not this
+    # port's own package/class name (kept as DeepseekV2LiteForCausalLM to
+    # disambiguate from any future DeepSeek-V2-Chat/-236B port).
+    "DeepseekV2ForCausalLM": ModelSpec("freetoken.models.deepseek_v2_lite", "DeepseekV2LiteForCausalLM"),
     "GptOssForCausalLM": ModelSpec("freetoken.models.gpt_oss", "GptOssForCausalLM"),
     "Glm4MoeForCausalLM": ModelSpec("freetoken.models.glm4_moe", "Glm4MoeForCausalLM"),
     "GlmMoeDsaForCausalLM": ModelSpec("freetoken.models.glm_moe_dsa", "GlmMoeDsaForCausalLM"),
