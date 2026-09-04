@@ -188,12 +188,20 @@ class _Qwen3Attention(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
 
     def _rope(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        # Half-split (rotate_half) RoPE -- matches ``cos``/``sin``'s own
+        # ``cat(freqs, freqs)`` construction below and the real HF Qwen3
+        # convention (confirmed against a real downloaded checkpoint's
+        # generated text; the previous ``x[..., ::2]``/``x[..., 1::2]``
+        # interleaved split did not match this cos/sin layout and produced
+        # degenerate output -- see qwen3_5_moe's own ``_rotate_half``,
+        # which already documents this is NOT the interleaved variant).
         freqs = torch.outer(pos.to(torch.float32), self.inv_freq)  # [N, D/2]
         emb = torch.cat((freqs, freqs), dim=-1)  # [N, D]
         cos = emb.cos()[None, :, :]
         sin = emb.sin()[None, :, :]
         x_f = x.to(torch.float32)
-        x1, x2 = x_f[..., ::2], x_f[..., 1::2]
+        half = x_f.shape[-1] // 2
+        x1, x2 = x_f[..., :half], x_f[..., half:]
         rotated = torch.cat((-x2, x1), dim=-1)
         return (x_f * cos + rotated * sin).to(x.dtype)
 
@@ -204,7 +212,19 @@ class _Qwen3Attention(nn.Module):
         v = self.v_proj(hidden_states).view(bsz, self.num_kv_heads, self.head_dim).transpose(0, 1)
         q = self._rope(self.q_norm(q), positions)
         k = self._rope(self.k_norm(k), positions)
-        ctx.kv_cache.write_kv(k, v, positions, self.layer_id)
+        # write_kv's third argument is out_loc -- PHYSICAL pool slots, not
+        # logical token positions. These only coincide under an identity
+        # page table; MHAKVCache's real per-request free-list allocator is
+        # NOT identity (slot 0 is a reserved dummy/padding slot, so the
+        # first real token of any request lands on slot >= 1, never slot 0
+        # -- see kvcache/mha_pool.py). Passing raw `positions` here silently
+        # wrote every token to the wrong slot on real hardware: a real
+        # checkpoint's generation was degenerate garbage even after the
+        # rope fix, traced to this exact line via a `read_kv` == pre-write
+        # `v` round-trip check that failed only under MHAKVCache, not the
+        # identity-mapped BaseKVCachePool used in isolated tests.
+        out_loc = ctx.page_table[table_idx, positions.long()]
+        ctx.kv_cache.write_kv(k, v, out_loc, self.layer_id)
         out = ctx.attn_backend.forward(q, k, v, self.layer_id, batch, table_idx=table_idx)
         return self.o_proj(out.transpose(0, 1).contiguous().reshape(bsz, -1))
 

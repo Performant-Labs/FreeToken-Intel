@@ -177,3 +177,68 @@ def test_engine_greedy_is_deterministic(tmp_path):
     b = build()
     assert a == b
     assert len(a[0]) == 3
+
+
+def test_write_kv_uses_physical_pool_slots_not_logical_positions(tmp_path):
+    """Real bug found running a real trained checkpoint's generation through
+    the actual Engine (not a synthetic fixture): ``write_kv``'s third
+    argument is ``out_loc`` -- PHYSICAL pool slots -- not logical token
+    positions. These only coincide under an identity page table.
+    ``MHAKVCache`` (the real per-request free-list allocator every live
+    Engine uses, not ``BaseKVCachePool``) reserves slot 0 as a dummy/padding
+    slot, so the first real token of any request lands on slot >= 1, never
+    slot 0 -- the two spaces are NOT identity for any real request. Passing
+    raw ``positions`` here silently wrote every token to the wrong physical
+    slot: real (non-synthetic) generation was degenerate garbage even after
+    an unrelated RoPE-orientation bug was independently fixed, traced to
+    this exact call via a ``read_kv`` == pre-write value round-trip check
+    that failed only under the real ``MHAKVCache`` allocator, never under a
+    synthetic fixture's identity-mapped pool -- which is why no existing
+    synthetic-checkpoint test (including this file's own
+    ``test_engine_generate_prefill_and_decode``/``test_engine_greedy_is_deterministic``,
+    both of which only assert "produces some deterministic in-range token",
+    not correctness against a reference) ever caught it.
+
+    This pins the fix directly: after a real Engine's real per-request slot
+    allocation (never slot 0 for a real request's first token), the value
+    written into the pool and the value read back for that same position
+    must be byte-identical -- proof ``write_kv`` received real physical
+    slots, not raw positions.
+    """
+    model_path = _write_tiny_checkpoint(tmp_path)
+    engine = Engine(_engine_config(model_path, device=DEVICE))
+
+    # Spy on the KV pool's own write_kv -- the ONLY reliable way to see what
+    # out_loc argument the model code actually passed (not what a test
+    # independently recomputes, which would pass vacuously regardless of
+    # the model code's real behavior).
+    captured = {}
+    pool = engine.ctx.kv_cache
+    orig_pool_write_kv = pool.write_kv
+
+    def spy_write_kv(k, v, out_loc, layer_id=0):
+        if layer_id == 0 and "out_loc" not in captured:
+            captured["out_loc"] = out_loc.clone()
+        return orig_pool_write_kv(k, v, out_loc, layer_id)
+
+    pool.write_kv = spy_write_kv
+    try:
+        _add_prompt(engine, output_len=1)
+        engine.generate()
+    finally:
+        pool.write_kv = orig_pool_write_kv
+
+    table_idx = 0
+    positions = torch.arange(3)  # the prompt is 3 tokens, see _add_prompt
+    expected_slots = engine.ctx.page_table[table_idx, positions.long()]
+
+    # A real request's first token never lands on the reserved slot 0 --
+    # confirms the allocator genuinely isn't identity for this run.
+    assert 0 not in expected_slots.tolist()
+    # The actual out_loc write_kv received must be the PHYSICAL pool slots
+    # from the page table, not the raw logical positions [0, 1, 2] -- this
+    # is what the real bug got wrong (verified this assertion fails without
+    # the fix: reverting the out_loc translation makes captured["out_loc"]
+    # equal positions instead of the real allocated slots).
+    assert captured["out_loc"].equal(expected_slots)
+    assert not captured["out_loc"].equal(positions)
