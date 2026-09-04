@@ -589,26 +589,582 @@ class PLELayer(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Not yet implemented: full model wiring (#209).
+# Full model wiring (#209): config parsing, the decoder layer combining
+# hyper-connections + GDN/QSA attention + PLE (on its own layer subset) +
+# MoE, and the causal-LM wrapper.
+#
+# Router shape confirmed from upstream's own moe.py: `Qwen4ExpMoE` subclasses
+# `Qwen3_5MoE` (this port's own qwen3_5_moe MoE block) -- a plain softmax-topk
+# router + an always-on sigmoid-gated shared expert, NOT the DeepSeek-V3-style
+# grouped/sigmoid/bias-corrected router deepseek_v4/glm_moe_dsa/glm4_moe use.
+# This module ships its own small self-contained MoE block with that same
+# router math (in-VRAM only, mirroring _GlmMoeDsaMoE's simple style) rather
+# than reusing qwen3_5_moe's own `_Qwen35MoE` directly -- that class carries
+# offload/cpu/hybrid backend branches this model does not implement, and
+# duplicating just the needed math avoids importing that complexity.
+#
+# GDN (linear-attention layers) reuses this port's own PROVEN GDN block
+# (`_GatedDeltaNet` from `qwen3_5_moe`, #170/#172) directly -- same math,
+# just a different config source for the head-count/kernel-size fields.
+#
+# The decoder-layer forward CONTRACT this port's engine uses elsewhere
+# (`layer(hidden_states, positions, table_idx, ctx, batch, ...)`, one
+# request's token slice at a time -- see glm_moe_dsa/qwen3_5_moe) is
+# preserved; only the mid-layer residual shape changes (hyper-connections'
+# ``R [T, hc_count*hidden]`` instead of a single ``[T, hidden]`` stream),
+# entirely internal to this package -- no other model's decoder-layer loop
+# is touched.
 # --------------------------------------------------------------------------- #
 
-from freetoken._stub import unimplemented
+# qwen3_5_moe's forward-side classes are declared torch-free (plain, baseless)
+# at module scope and only rebound to real nn.Module subclasses inside its own
+# `_ensure_torch()` (normally triggered by building a Qwen3_5MoEForCausalLM,
+# which this module never does) -- call it ourselves before grabbing
+# `_GatedDeltaNet`/`_LinearStatePool`, or they stay the pre-rebind plain
+# classes whose bodies reference an unbound `nn`/`torch`/`F` module global.
+import freetoken.models.qwen3_5_moe as _qwen35_mod
+
+_qwen35_mod._ensure_torch()
+_GatedDeltaNet = _qwen35_mod._GatedDeltaNet
+_LinearStatePool = _qwen35_mod._LinearStatePool
+from freetoken.models.weight import iter_safetensors
+from freetoken.utils import cached_load_hf_config
 
 
-def parse_config(*args, **kwargs):
-    unimplemented("parse_config", "models-qwen4-e2e")
+def _raw_checkpoint_json(model_path: str) -> dict:
+    import json
+    import os
+
+    path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 
 
-def iter_weights(*args, **kwargs):
-    unimplemented("iter_weights", "models-qwen4-e2e")
+def _layer_types(num_layers: int, explicit, interval: int) -> list:
+    if explicit is not None:
+        return list(explicit)
+    return ["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(num_layers)]
 
 
-class Qwen4ExpForCausalLM:
-    def __init__(self, *args, **kwargs) -> None:
-        pass
+def parse_config(hf_config, model_path: str | None = None, **_kwargs):
+    """Build a :class:`ModelConfig` for Qwen3.8-Flash-Next.
 
-    def forward(self, *args, **kwargs):
-        unimplemented("Qwen4ExpForCausalLM.forward", "models-qwen4-e2e")
+    No real public checkpoint exists for this architecture (confirmed: not
+    in upstream's own docs/scripts, and `transformers` 5.15.1 has no
+    registered ``qwen4_exp``/``qwen4next`` config class the way it
+    surprisingly did for DeepSeek-V4/GLM-5.2's config classes) -- this
+    parses the checkpoint's own config.json using upstream's real field
+    names (``config.py``/``args.py``), the same ``file_raw`` defensive
+    pattern established for deepseek_v4/glm_moe_dsa (this session found
+    real HF config classes leaking non-None defaults through both
+    ``getattr`` and ``to_dict()``; reading the checkpoint's own file avoids
+    that class of bug even though there is no installed HF class here to
+    leak from).
+    """
+    from freetoken.models.config import ModelConfig
+
+    raw = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
+    file_raw = _raw_checkpoint_json(model_path) if model_path else raw
+
+    def field(name, default=None):
+        val = getattr(hf_config, name, None)
+        return val if val is not None else raw.get(name, default)
+
+    num_layers = int(field("num_hidden_layers"))
+    hidden_size = int(field("hidden_size"))
+    num_heads = int(field("num_attention_heads"))
+    num_kv_heads = int(field("num_key_value_heads", num_heads))
+    head_dim = int(field("head_dim", hidden_size // num_heads))
+    rope_theta = float(field("rope_theta", 10000.0))
+
+    layer_types = _layer_types(
+        num_layers, file_raw.get("layer_types"), int(field("full_attention_interval", 4))
+    )
+
+    cfg = ModelConfig(
+        architectures=["Qwen4ExpForCausalLM"],
+        hidden_size=hidden_size,
+        vocab_size=int(field("vocab_size")),
+        num_layers=num_layers,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        num_experts=int(field("num_experts", 0) or 0),
+        num_experts_per_tok=int(field("num_experts_per_tok", 0) or 0),
+        moe_intermediate_size=int(field("moe_intermediate_size", 0) or 0),
+        is_moe=bool(field("num_experts", 0)),
+        tie_word_embeddings=bool(field("tie_word_embeddings", False)),
+        rope_theta=rope_theta,
+        dtype=field("torch_dtype") or field("dtype"),
+    )
+    cfg.attrs["rms_norm_eps"] = float(field("rms_norm_eps", 1e-5))
+    cfg.attrs["rotary_dim"] = int(field("rotary_dim", head_dim))
+    cfg.attrs["layer_types"] = layer_types
+    cfg.attrs["shared_expert_intermediate_size"] = int(
+        field("shared_expert_intermediate_size", cfg.moe_intermediate_size)
+    )
+
+    cfg.attrs["hc_count"] = int(field("hc_count"))
+    cfg.attrs["hc_lowrank"] = int(field("hc_lowrank"))
+
+    cfg.attrs["index_head_dim"] = int(field("indexer_head_dim"))
+    cfg.attrs["index_n_heads"] = int(field("indexer_n_heads"))
+    cfg.attrs["index_ratio"] = int(field("indexer_compress_ratio"))
+    cfg.attrs["index_budget"] = int(field("indexer_budget"))
+
+    # PLE (upstream stores ple_layer_ids one-indexed); the disk backend
+    # (#207's own established constraint, ~47.7GiB real table) expects
+    # exactly one PLE layer, so this port only supports that shape.
+    ple_layer_ids_1idx = file_raw.get("ple_layer_ids") or []
+    ple_layer_ids = [int(i) - 1 for i in ple_layer_ids_1idx]
+    for lid in ple_layer_ids:
+        if layer_types[lid] != "linear_attention":
+            raise ValueError(f"PLE must sit on a linear_attention layer, got layer {lid}")
+    cfg.attrs["ple_layer_ids"] = ple_layer_ids
+    if ple_layer_ids:
+        cfg.attrs["ple_embed_dim"] = int(field("ple_embed_dim"))
+        cfg.attrs["ple_conv_kernel_size"] = int(field("ple_conv_kernel_size"))
+        cfg.attrs["ngram_size"] = int(field("ngram_size"))
+        cfg.attrs["heads_per_ngram"] = int(field("heads_per_ngram"))
+        cfg.attrs["ngram_vocab_size_base"] = int(field("ngram_vocab_size_base"))
+        eos = field("eos_token_id", 0)
+        cfg.attrs["ngram_boundary_token_id"] = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
+
+    cfg.attrs["linear_num_key_heads"] = int(field("linear_num_key_heads"))
+    cfg.attrs["linear_num_value_heads"] = int(field("linear_num_value_heads"))
+    cfg.attrs["linear_key_head_dim"] = int(field("linear_key_head_dim"))
+    cfg.attrs["linear_value_head_dim"] = int(field("linear_value_head_dim"))
+    cfg.attrs["linear_conv_kernel_dim"] = int(field("linear_conv_kernel_dim"))
+
+    return cfg
+
+
+def iter_weights(model_path: str, device: torch.device, *, include_moe_experts: bool = True, include_non_moe: bool = True):
+    """Yields the checkpoint's tensors on their destination device. Same
+    dense/expert split convention as every other MoE model here (deepseek_v4,
+    glm_moe_dsa) -- routed experts stay host-resident (in-VRAM MoE only, no
+    offload backend for this architecture, see ``_Qwen4ExpMoE``)."""
+    embed_tokens_weight = None
+    saw_lm_head = False
+    for name, tensor in iter_safetensors(model_path, device):
+        is_expert = ".experts." in name
+        if is_expert and not include_moe_experts:
+            continue
+        if not is_expert and not include_non_moe:
+            continue
+        dest = torch.device("cpu") if is_expert else device
+        placed = tensor.to(dest)
+        if name == "model.embed_tokens.weight":
+            embed_tokens_weight = placed
+        elif name == "lm_head.weight":
+            saw_lm_head = True
+        yield name, placed
+
+    if include_non_moe and not saw_lm_head and embed_tokens_weight is not None:
+        hf_config = cached_load_hf_config(model_path)
+        if bool(getattr(hf_config, "tie_word_embeddings", False)):
+            yield "lm_head.weight", embed_tokens_weight
+
+
+def _xpu_available() -> bool:
+    try:
+        return bool(torch.xpu.is_available())
+    except Exception:
+        return False
+
+
+class _Qwen4ExpTopkRouter(nn.Module):
+    """Plain softmax top-k router (Qwen3.5/3.6's own -- NOT the DeepSeek-V3
+    grouped/sigmoid/bias-corrected router every other MoE model in this port
+    uses; confirmed from upstream's own moe.py, see module note above)."""
+
+    def __init__(self, hidden_size: int, num_experts: int, top_k: int, dtype) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype)
+
+    def forward(self, hidden_states: torch.Tensor):
+        logits = self.gate(hidden_states)
+        probs = F.softmax(logits, dtype=torch.float32, dim=-1)
+        top_w, top_idx = torch.topk(probs, self.top_k, dim=-1)
+        top_w = top_w / top_w.sum(dim=-1, keepdim=True)
+        return top_idx, top_w.to(hidden_states.dtype)
+
+
+class _Qwen4ExpExpert(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, dtype) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False, dtype=dtype)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False, dtype=dtype)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _Qwen4ExpMoE(nn.Module):
+    """Softmax-topk router + always-on sigmoid-gated shared expert (see
+    module note: upstream's real ``Qwen4ExpMoE`` subclasses ``Qwen3_5MoE``).
+    In-VRAM only -- no offload/cpu/hybrid backend for this architecture."""
+
+    def __init__(self, config, dtype, layer_id: int) -> None:
+        super().__init__()
+        if bool(getattr(config, "use_offload_moe", False)) or bool(getattr(config, "use_cpu_moe", False)) or bool(getattr(config, "use_hybrid", False)):
+            raise NotImplementedError(
+                "Qwen4ExpForCausalLM only supports the in-VRAM (fused) MoE backend "
+                "-- offload/cpu/hybrid are not wired yet. Pass moe_backend=\"fused\" "
+                "explicitly (EngineConfig's \"auto\" default does not know this "
+                "architecture can't offload)."
+            )
+        self.layer_id = layer_id
+        self.gate = _Qwen4ExpTopkRouter(config.hidden_size, config.num_experts, config.num_experts_per_tok, dtype)
+        self.experts = nn.ModuleList(
+            _Qwen4ExpExpert(config.hidden_size, config.moe_intermediate_size, dtype) for _ in range(config.num_experts)
+        )
+        shared_inter = config.attrs["shared_expert_intermediate_size"]
+        self.shared_expert = _Qwen4ExpExpert(config.hidden_size, shared_inter, dtype)
+        self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False, dtype=dtype)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        top_idx, top_w = self.gate(hidden_states)
+        shared = torch.sigmoid(self.shared_expert_gate(hidden_states)) * self.shared_expert(hidden_states)
+
+        top_idx_cpu = top_idx.to("cpu")
+        out = torch.zeros_like(hidden_states)
+        for e in range(len(self.experts)):
+            for slot in range(top_idx.shape[1]):
+                sel_cpu = top_idx_cpu[:, slot] == e
+                if not bool(sel_cpu.any()):
+                    continue
+                idx = sel_cpu.nonzero(as_tuple=True)[0].to(hidden_states.device)
+                w = top_w.index_select(0, idx)[:, slot, None]
+                y = self.experts[e](hidden_states.index_select(0, idx))
+                out.index_add_(0, idx, w * y)
+        return out + shared
+
+
+class _IndexKVStore:
+    """Raw (pre-norm, pre-rope) QSA indexer key history, one entry per token per
+    QSA layer -- a second, narrower store alongside the engine's own ``ctx.kv_cache``
+    (which only has room for one fixed ``[num_kv_heads, head_dim]`` shape per layer,
+    already used here for the real post-norm+rope K/V). Addressed through the SAME
+    page table the main pool uses, so per-request isolation matches it exactly.
+    Not incremental block-compression (that's a real engine optimization upstream's
+    Triton backend does): every forward recompresses the whole visible history from
+    this raw store, matching this port's established "reference correctness first"
+    discipline for GDN/MLA/DSA/QSA alike."""
+
+    def __init__(self, num_qsa_layers: int, num_slots: int, dim: int, device, dtype) -> None:
+        self.buf = torch.zeros(num_qsa_layers, num_slots, dim, device=device, dtype=dtype)
+
+    def write(self, qsa_slot: int, k_idx_raw: torch.Tensor, out_loc: torch.Tensor) -> None:
+        self.buf[qsa_slot][out_loc.long()] = k_idx_raw
+
+    def read(self, qsa_slot: int, table_idx: int, pos: torch.Tensor, page_table: torch.Tensor) -> torch.Tensor:
+        slots = page_table[table_idx, pos.long()]
+        return self.buf[qsa_slot][slots]
+
+
+class _Qwen4ExpQSAAttention(nn.Module):
+    """Gated GQA with the QSA block-sparse indexer (#208's primitives), full
+    checkpoint weights + real KV-cache-backed history. ``q_proj`` doubles for
+    an output gate (upstream real shape); q/k get a zero-centered per-vector
+    RMSNorm (``grouped_plus_one_rms_norm`` with ``num_groups=1``) then partial
+    rope. The indexer's raw (pre-norm/rope) k travels through its own
+    :class:`_IndexKVStore` (see its own docstring for why a second store)."""
+
+    def __init__(self, config, dtype, layer_id: int, qsa_slot: int) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.qsa_slot = qsa_slot
+        self.num_q = config.num_attention_heads
+        self.num_kv = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.rotary_dim = config.attrs["rotary_dim"]
+        self.theta = config.rope_theta or 10000.0
+        self.eps = config.attrs["rms_norm_eps"]
+        hidden = config.hidden_size
+
+        self._qkv_split = [self.num_q * self.head_dim * 2, self.num_kv * self.head_dim, self.num_kv * self.head_dim]
+        self.qkv_proj = nn.Linear(hidden, sum(self._qkv_split), bias=False, dtype=dtype)
+        self.o_proj = nn.Linear(self.num_q * self.head_dim, hidden, bias=False, dtype=dtype)
+        self.q_norm = nn.Parameter(torch.zeros(self.head_dim, dtype=dtype))
+        self.k_norm = nn.Parameter(torch.zeros(self.head_dim, dtype=dtype))
+
+        self.index_n_heads = config.attrs["index_n_heads"]
+        self.index_head_dim = config.attrs["index_head_dim"]
+        self.index_ratio = config.attrs["index_ratio"]
+        self.index_budget_blocks = config.attrs["index_budget"] // self.index_ratio
+        # The indexer's own rope runs over its own (narrower) head dim, not the
+        # main attention's rotary_dim -- upstream's real rope64 uses head_size =
+        # index_head_dim (see module note above).
+        self.index_rotary_dim = min(self.rotary_dim, self.index_head_dim)
+        self._index_split = [self.index_n_heads * self.index_head_dim, self.index_head_dim]
+        self.index_qk_proj = nn.Linear(hidden, sum(self._index_split), bias=False, dtype=dtype)
+        self.index_q_norm = nn.Parameter(torch.zeros(self.index_head_dim, dtype=dtype))
+        self.index_k_norm = nn.Parameter(torch.zeros(self.index_head_dim, dtype=dtype))
+
+    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor, table_idx: int, ctx, batch) -> torch.Tensor:
+        T = hidden_states.shape[0]
+        qg, k, v = self.qkv_proj(hidden_states).split(self._qkv_split, dim=-1)
+        qg = qg.view(T, self.num_q, self.head_dim * 2)
+        q = qg[..., : self.head_dim].contiguous()
+        gate = qg[..., self.head_dim :].reshape(T, self.num_q * self.head_dim)
+        k = k.view(T, self.num_kv, self.head_dim).contiguous()
+        v = v.view(T, self.num_kv, self.head_dim).contiguous()
+
+        q = grouped_plus_one_rms_norm(q, self.q_norm, self.eps, 1)
+        k = grouped_plus_one_rms_norm(k, self.k_norm, self.eps, 1)
+        cos, sin = qsa_rope_cos_sin(positions, self.rotary_dim, self.theta)
+        q = apply_partial_rope(q, cos[:, None, :], sin[:, None, :], self.rotary_dim)
+        k = apply_partial_rope(k, cos[:, None, :], sin[:, None, :], self.rotary_dim)
+
+        q_idx_raw, k_idx_raw = self.index_qk_proj(hidden_states).split(self._index_split, dim=-1)
+        q_idx_raw = q_idx_raw.view(T, self.index_n_heads, self.index_head_dim)
+
+        ctx.kv_cache.write_kv(k.transpose(0, 1), v.transpose(0, 1), positions, self.layer_id)
+        if ctx.qsa_index_kv is None:
+            ctx.qsa_index_kv = _IndexKVStore(
+                ctx.num_qsa_layers, ctx.kv_cache.num_slots, self.index_head_dim, hidden_states.device, hidden_states.dtype
+            )
+        ctx.qsa_index_kv.write(self.qsa_slot, k_idx_raw, positions)
+
+        written = positions[-1].item() + 1
+        read_pos = torch.arange(written, device=hidden_states.device)
+        hist_k, hist_v = ctx.kv_cache.read_kv(table_idx, read_pos, self.layer_id)
+        hist_k_idx_raw = ctx.qsa_index_kv.read(self.qsa_slot, table_idx, read_pos, ctx.page_table)
+
+        pooled, block_starts = qsa_compress_keys(hist_k_idx_raw.unsqueeze(1), self.index_ratio)
+        num_blocks = pooled.shape[0]
+        block_last = block_starts + self.index_ratio - 1
+        if num_blocks > 0:
+            scores = qsa_score(
+                q_idx_raw, pooled, self.index_q_norm, self.index_k_norm, self.eps,
+                positions, block_starts, self.index_rotary_dim, self.theta,
+            )
+            topk = qsa_topk_blocks(scores, block_last, positions, self.index_budget_blocks)
+        else:
+            topk = torch.full((T, self.index_budget_blocks), -1, dtype=torch.long, device=hidden_states.device)
+        mask = qsa_attend_mask(topk, self.index_ratio, positions, written)
+
+        sm_scale = self.head_dim**-0.5
+        out = qsa_sparse_attend(q, hist_k, hist_v, mask, sm_scale)
+        gated = out.reshape(T, self.num_q * self.head_dim) * torch.sigmoid(gate.float()).to(out.dtype)
+        return self.o_proj(gated)
+
+
+class _Qwen4ExpDecoderLayer(nn.Module):
+    """One hyper-connection decoder layer (see module docstring's own
+    ``mix``/block/``combine`` flow, duplicated per attention AND MoE)."""
+
+    def __init__(self, config, dtype, layer_id: int, qsa_slot: int | None) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.is_linear = config.attrs["layer_types"][layer_id] == "linear_attention"
+        hc_count = config.attrs["hc_count"]
+        hc_lowrank = config.attrs["hc_lowrank"]
+        eps = config.attrs["rms_norm_eps"]
+        if self.is_linear:
+            self.self_attn = None
+            self.linear_attn = _GatedDeltaNet(
+                config, None, dtype, layer_id,
+                linear_num_key_heads=config.attrs["linear_num_key_heads"],
+                linear_num_value_heads=config.attrs["linear_num_value_heads"],
+                linear_key_head_dim=config.attrs["linear_key_head_dim"],
+                linear_value_head_dim=config.attrs["linear_value_head_dim"],
+                linear_conv_kernel_dim=config.attrs["linear_conv_kernel_dim"],
+                eps=eps,
+            )
+        else:
+            self.linear_attn = None
+            self.self_attn = _Qwen4ExpQSAAttention(config, dtype, layer_id, qsa_slot)
+        self.mlp = _Qwen4ExpMoE(config, dtype, layer_id)
+        self.attn_hyper_connection = GatedResidual(config.hidden_size, hc_count, hc_lowrank, eps, dtype=dtype)
+        self.mlp_hyper_connection = GatedResidual(config.hidden_size, hc_count, hc_lowrank, eps, dtype=dtype)
+        self.ple = None
+        if layer_id in config.attrs["ple_layer_ids"]:
+            self.ple = PLELayer(
+                config.hidden_size, hc_count, config.attrs["ple_embed_dim"],
+                config.attrs["ple_conv_kernel_size"], config.attrs["ngram_size"], eps, dtype=dtype,
+            )
+
+    def forward(
+        self, R: torch.Tensor, positions: torch.Tensor, table_idx: int, ctx, batch,
+        ple_embeddings: torch.Tensor | None = None, ple_conv_state: torch.Tensor | None = None,
+        linear_slot_idx=None,
+    ):
+        new_ple_conv_state = None
+        if self.ple is not None:
+            D, new_ple_conv_state = self.ple(R, ple_embeddings, ple_conv_state)
+            R = R + D
+
+        block_input, inject = self.attn_hyper_connection.mix(R)
+        if self.is_linear:
+            block_output = self.linear_attn(block_input, positions, table_idx, ctx, batch, linear_slot_idx=linear_slot_idx)
+        else:
+            block_output = self.self_attn(block_input, positions, table_idx, ctx, batch)
+        R = self.attn_hyper_connection.combine(R, block_output, inject)
+
+        block_input, inject = self.mlp_hyper_connection.mix(R)
+        block_output = self.mlp(block_input)
+        R = self.mlp_hyper_connection.combine(R, block_output, inject)
+        return R, new_ple_conv_state
+
+
+class Qwen4ExpForCausalLM(nn.Module):
+    """Qwen3.8-Flash-Next: real forward pass for the Intel engine loop.
+
+    The residual state is ``R [T, hc_count*hidden]`` end to end (see module
+    docstring): the embedding is repeated over ``hc_count`` streams, every
+    layer mixes it down to one block input and injects the block's output
+    back, and the top-level mixer collapses the streams once before
+    ``lm_head``. There is no input/post layernorm and no final ``norm`` --
+    the hyper-connection norms are the only ones (upstream's own real
+    ``model.py`` module docstring, confirmed)."""
+
+    def __init__(self, config, device=None) -> None:
+        super().__init__()
+        self.config = config
+        if device is None:
+            device = torch.device("xpu") if _xpu_available() else torch.device("cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
+        dtype = getattr(config, "dtype", None) or torch.float32
+        self.dtype = dtype
+        self.hc_count = config.attrs["hc_count"]
+        vocab_size = config.vocab_size
+        hidden_size = config.hidden_size
+
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size, device=device, dtype=dtype)
+        layer_types = config.attrs["layer_types"]
+        qsa_layer_ids = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+        qsa_slot_of = {lid: i for i, lid in enumerate(qsa_layer_ids)}
+        self.num_qsa_layers = len(qsa_layer_ids)
+        self.layers = nn.ModuleList(
+            _Qwen4ExpDecoderLayer(config, dtype, layer_id=i, qsa_slot=qsa_slot_of.get(i))
+            for i in range(config.num_layers)
+        )
+        eps = config.attrs["rms_norm_eps"]
+        self.hyper_connection_mixer = GatedResidual(
+            hidden_size, self.hc_count, config.attrs["hc_lowrank"], eps, use_combine=False, dtype=dtype
+        )
+        from freetoken.layers import LinearReplicated
+
+        self.lm_head = LinearReplicated(hidden_size, vocab_size, has_bias=False, dtype=dtype)
+
+        max_slots = int(config.attrs.get("max_running_req") or 8)
+        self.linear_state_pool = _LinearStatePool()
+        for layer in self.layers:
+            if layer.linear_attn is not None:
+                ln = layer.linear_attn
+                self.linear_state_pool.register(
+                    ln.layer_id, max_slots, (ln.num_v_heads, ln.head_k_dim, ln.head_v_dim),
+                    (ln.conv_dim, ln.conv_kernel - 1), device, dtype,
+                )
+
+        self._ple_layer_id = config.attrs["ple_layer_ids"][0] if config.attrs["ple_layer_ids"] else None
+        if self._ple_layer_id is not None:
+            num_ngram_heads = (config.attrs["ngram_size"] - 1) * config.attrs["heads_per_ngram"]
+            # one table row-width per (ngram order, head): ple_embed_dim is the
+            # TOTAL width after concatenating every head's own lookup row.
+            row_width = config.attrs["ple_embed_dim"] // num_ngram_heads
+            mult, sizes, offsets = derive_ngram_hash_constants(
+                vocab_size=vocab_size,
+                ngram_size=config.attrs["ngram_size"],
+                num_ngram_heads=num_ngram_heads,
+                ngram_vocab_size_base=config.attrs["ngram_vocab_size_base"],
+                ple_layer_index=0,
+            )
+            self._ple_multipliers = torch.tensor(mult, dtype=torch.int64, device=device)
+            self._ple_sizes = torch.tensor(sizes, dtype=torch.int64, device=device)
+            self._ple_offsets = torch.tensor(offsets, dtype=torch.int64, device=device)
+            table_rows = offsets[-1] + sizes[-1]
+            self._ple_table = PleInMemoryTable(
+                torch.zeros(table_rows, row_width, device=device, dtype=dtype)
+            )
+            self._ple_conv_state: dict = {}
+            self._ple_ngram_ctx: dict = {}
+
+        if self.device.type != "cpu":
+            self.to(self.device)
+
+    def _ple_precompute(self, table_idx: int, token_ids: torch.Tensor):
+        args = self.config.attrs
+        boundary = args["ngram_boundary_token_id"]
+        ngram_size = args["ngram_size"]
+        ctx_len = ngram_size - 1
+        prior = self._ple_ngram_ctx.get(table_idx)
+        if prior is None:
+            prior = torch.full((ctx_len,), boundary, dtype=token_ids.dtype, device=token_ids.device)
+        full_ids = torch.cat([prior, token_ids]) if ctx_len else token_ids
+        row_ids = ple_ngram_row_ids(
+            full_ids, boundary, ngram_size, args["heads_per_ngram"],
+            self._ple_multipliers, self._ple_sizes, self._ple_offsets,
+        )
+        row_ids = row_ids[ctx_len:] if ctx_len else row_ids
+        embeddings = self._ple_table.lookup(row_ids).reshape(token_ids.shape[0], -1)
+        self._ple_ngram_ctx[table_idx] = full_ids[-ctx_len:] if ctx_len else full_ids
+
+        conv_state = self._ple_conv_state.get(table_idx)
+        if conv_state is None:
+            width = self.hc_count * self.config.hidden_size
+            state_len = (args["ple_conv_kernel_size"] - 1) * ngram_size
+            conv_state = torch.zeros(width, state_len, device=token_ids.device, dtype=self.dtype)
+        return embeddings, conv_state
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, out_loc: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        reqs = batch.reqs
+        num_tokens = input_ids.shape[0]
+        ctx.qsa_index_kv = getattr(ctx, "qsa_index_kv", None)
+        ctx.num_qsa_layers = self.num_qsa_layers
+        if ctx.linear_state_pool is None:
+            ctx.linear_state_pool = self.linear_state_pool
+        for req in reqs:
+            if req.linear_slot_idx is None:
+                req.linear_slot_idx = req.table_idx
+
+        hidden_all = self.embed_tokens(input_ids).repeat(1, self.hc_count)
+        out = torch.empty((batch.size, self.config.hidden_size), device=hidden_all.device, dtype=hidden_all.dtype)
+
+        offset = 0
+        extend_lens = batch.extend_lens
+        if extend_lens is None:
+            prefill = batch.is_prefill or (num_tokens > batch.size)
+            extend_lens = [req.extend_len if prefill else 1 for req in reqs]
+        is_decode_batch = batch.phase == "decode"
+        for i, req in enumerate(reqs):
+            ext = 1 if is_decode_batch else int(extend_lens[i])
+            token_slice = slice(offset, offset + ext)
+            R = hidden_all[token_slice]
+            pos = positions[token_slice]
+            tok_ids = input_ids[token_slice]
+            for layer in self.layers:
+                ple_embeddings = ple_conv_state = None
+                if layer.ple is not None:
+                    ple_embeddings, ple_conv_state = self._ple_precompute(req.table_idx, tok_ids)
+                R, new_conv_state = layer(
+                    R, pos, req.table_idx, ctx, batch,
+                    ple_embeddings=ple_embeddings, ple_conv_state=ple_conv_state,
+                    linear_slot_idx=req.linear_slot_idx,
+                )
+                if new_conv_state is not None:
+                    self._ple_conv_state[req.table_idx] = new_conv_state
+            collapsed = self.hyper_connection_mixer.mix(R)[0]
+            out[i] = collapsed[-1]
+            offset += ext
+
+        return self.lm_head(out)
 
 
 __all__ = [
