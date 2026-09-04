@@ -28,7 +28,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "GptOssForCausalLM": ModelSpec("freetoken.models.gpt_oss", "GptOssForCausalLM"),
     "Glm4MoeForCausalLM": ModelSpec("freetoken.models.glm4_moe", "Glm4MoeForCausalLM"),
     "GlmMoeDsaForCausalLM": ModelSpec("freetoken.models.glm_moe_dsa", "GlmMoeDsaForCausalLM"),
-    "Qwen4ExpForConditionalGeneration": ModelSpec(
+    "Qwen4ExpForConditionalGeneration": ModelSpec(  # gitleaks:allow -- architecture name, not a secret
         "freetoken.models.qwen4_exp", "Qwen4ExpForCausalLM"
     ),
     "Gemma4ForCausalLM": ModelSpec("freetoken.models.gemma4", "Gemma4ForCausalLM"),
