@@ -333,7 +333,263 @@ def qsa_attend_mask(
 
 
 # --------------------------------------------------------------------------- #
-# Not yet implemented: PLE (#207), full model wiring (#209).
+# PLE: hashed n-gram Per-Layer Embedding (#207, active on `ple_layer_ids`)
+# --------------------------------------------------------------------------- #
+#
+# Per token, grounded against upstream's real `models/qwen4_exp/ple.py`
+# module docstring (HF `Qwen4ExpTextNGramEmbedding`/`Qwen4ExpTextPLELayer`):
+#
+#     E = table[hash(ngram)]                        # heads_per_ngram * (ngram_size-1) heads -> ple_embed_dim
+#     K = norm_key(key_proj(E)).view(hc, hidden)     # V = value_proj(E) [hidden]
+#     Q = norm_query(R).view(hc, hidden)
+#     u = <K_i, Q_i> / sqrt(hidden)                  # per stream
+#     U = sigmoid(sign(u) * sqrt(max(|u|, 1e-6))) * V
+#     D = U + silu(conv1d(norm_conv(U)))             # depthwise, kernel size, dilation ngram_size
+#     R += D                                         # before the attention hyper-connection mix
+#
+# N-gram hashing (`ple_ngram_row_ids`): for each ngram order 2..ngram_size, XOR
+# together `layer_multipliers[i] * token[t-i]` for i in 0..order-1 (splitmix64-derived
+# per-layer multipliers), mod each head's own prime vocab size, offset into that head's
+# global table range. The hash window resets at `ngram_boundary_token_id` (eos): a shifted
+# token more than `in_segment` positions from the last boundary falls back to the boundary
+# id itself, matching upstream's `_shift_ignore_eos` -- confirmed NOT a silent no-op by the
+# regression test below (a boundary token mid-sequence measurably changes later rows' hashes
+# versus the same token stream with no boundary).
+#
+# Table backend: upstream's real table is a 47.7 GiB FP8 store (`PinnedUVATable`, kept
+# resident in pinned HOST RAM, gathered over UVA). This box has 29 GiB total RAM -- full
+# residency is categorically impossible here, so `PleDiskTable` below is a REAL requirement
+# of this port, not an optional upstream optimization: it reads exactly the requested rows
+# out of a safetensors shard file via `safe_open`'s lazy slicing (mmap'd, never materializes
+# the whole tensor), mirroring upstream's own `ple_disk.py` role (`--ple-backend disk`) minus
+# its C++ io_uring/pinned-staging machinery -- reference correctness first, same discipline
+# as HC/QSA above. `PleInMemoryTable` is the small-table oracle `PleDiskTable` is diffed
+# against, matching upstream's own `GpuResidentTable` role.
+#
+# This port ships the pure-torch/plain-Python reference path only; the vendored Triton
+# gather/conv kernels are not ported. Full engine wiring (checkpoint loading, the
+# `linear_state_pool` conv/n-gram-context slot states, ragged multi-request batching,
+# decode-step incremental hashing) is #209's job -- the functions/classes here operate on
+# one full, already-materialized token sequence (prefill-shaped), proven against
+# hand-computed references.
+
+
+def derive_ngram_hash_constants(
+    *,
+    vocab_size: int,
+    ngram_size: int,
+    num_ngram_heads: int,
+    ngram_vocab_size_base: int,
+    ple_layer_index: int,
+    seed: int = 1234,
+) -> Tuple[list, list, list]:
+    """Recompute (multipliers, per-head vocab sizes, per-head offsets) the way HF derives
+    them at init (checkpoint ships them as int64 tensors; this is the dummy-weight path and
+    the oracle a loader test can check real checkpoint values against). Verbatim port of
+    upstream's own derivation (splitmix64 mix + nth-prime-after search)."""
+    mask64 = (1 << 64) - 1
+    gamma = 0x9E3779B97F4A7C15
+    m1 = 0xBF58476D1CE4E5B9
+    m2 = 0x94D049BB133111EB
+    layer_prime = 10007
+
+    def splitmix64(value: int) -> int:
+        value = (value + gamma) & mask64
+        value = ((value ^ (value >> 30)) * m1) & mask64
+        value = ((value ^ (value >> 27)) * m2) & mask64
+        return (value ^ (value >> 31)) & mask64
+
+    def is_prime(value: int) -> bool:
+        if value < 2:
+            return False
+        if value % 2 == 0:
+            return value == 2
+        for divisor in range(3, int(value**0.5) + 1, 2):
+            if value % divisor == 0:
+                return False
+        return True
+
+    def nth_prime_after(start: int, count: int) -> int:
+        prime = start
+        for _ in range(count):
+            prime += 1
+            while not is_prime(prime):
+                prime += 1
+        return prime
+
+    half_bound = max(1, ((1 << 63) - 1) // max(vocab_size, 1) // 2)
+    base_seed = seed + layer_prime * ple_layer_index
+    multipliers = [
+        2 * (splitmix64((base_seed + gamma * (i + 1)) & mask64) % half_bound) + 1 for i in range(ngram_size)
+    ]
+    sizes: list = []
+    offsets: list = []
+    total = 0
+    for head in range(num_ngram_heads):
+        global_head = ple_layer_index * num_ngram_heads + head
+        size = nth_prime_after(ngram_vocab_size_base - 1, global_head + 1)
+        sizes.append(size)
+        offsets.append(total)
+        total += size
+    return multipliers, sizes, offsets
+
+
+def ple_ngram_row_ids(
+    token_ids: torch.Tensor,
+    boundary_token_id: int,
+    ngram_size: int,
+    heads_per_ngram: int,
+    multipliers: torch.Tensor,
+    head_vocab_sizes: torch.Tensor,
+    head_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Global table row per (token, hash head): ``token_ids [T] -> [T, num_ngram_heads]`` int64.
+
+    ``token_ids`` is the flat sequence to hash over (a caller wanting left-context from a
+    prior forward prepends it and slices the result). The hash window at position ``t`` never
+    crosses a ``boundary_token_id`` occurrence at or before ``t``: a shifted tap that would
+    reach past the most recent boundary reads the boundary id itself instead (matches
+    upstream ``_shift_ignore_eos``, verified by the regression test below)."""
+    device = token_ids.device
+    T = token_ids.shape[0]
+    pos = torch.arange(T, device=device)
+    eos_pos = torch.where(token_ids == boundary_token_id, pos, torch.full_like(pos, -1))
+    prev_eos = torch.cummax(eos_pos, dim=0).values
+    prev_eos = torch.cat([eos_pos.new_full((1,), -1), prev_eos[:-1]])
+    in_segment = pos - prev_eos - 1
+
+    shifted = [token_ids]
+    for shift in range(1, ngram_size):
+        src = (pos - shift).clamp(min=0)
+        gathered = token_ids[src]
+        valid = (pos - shift >= 0) & (in_segment >= shift)
+        shifted.append(torch.where(valid, gathered, torch.full_like(token_ids, boundary_token_id)))
+
+    blocks = []
+    for ngram in range(2, ngram_size + 1):
+        start = (ngram - 2) * heads_per_ngram
+        end = start + heads_per_ngram
+        mixed = shifted[0].to(torch.int64) * multipliers[0]
+        for position in range(1, ngram):
+            mixed = torch.bitwise_xor(mixed, shifted[position].to(torch.int64) * multipliers[position])
+        head_ids = torch.remainder(mixed.unsqueeze(-1), head_vocab_sizes[start:end])
+        blocks.append(head_ids + head_offsets[start:end])
+    return torch.cat(blocks, dim=-1)
+
+
+class PleInMemoryTable:
+    """Row store held whole in device/host memory; the oracle ``PleDiskTable`` is diffed
+    against (matches upstream ``GpuResidentTable``'s role). ``weight [num_rows, head_dim]``."""
+
+    def __init__(self, weight: torch.Tensor, scale: float = 1.0) -> None:
+        self.weight = weight
+        self.scale = float(scale)
+        self.num_rows, self.head_dim = weight.shape
+
+    def lookup(self, row_ids: torch.Tensor) -> torch.Tensor:
+        rows = self.weight.index_select(0, row_ids.reshape(-1)).float()
+        if self.scale != 1.0:
+            rows = rows * self.scale
+        return rows.view(*row_ids.shape[:-1], -1).to(self.weight.dtype)
+
+
+class PleDiskTable:
+    """Row store kept ENTIRELY on disk: a safetensors shard file, opened once via
+    ``safe_open`` (mmap'd) and read through ``get_slice(...)``'s lazy row indexing, which
+    reads only the bytes of the requested rows -- the table itself is never materialized in
+    RAM. This is the RAM-safe path the real 47.7 GiB n-gram store requires on a box that
+    cannot hold it whole (this port's own established constraint, not upstream's -- see
+    module note above)."""
+
+    def __init__(self, path: str, tensor_name: str, scale: float = 1.0, dtype: torch.dtype = torch.float32) -> None:
+        import safetensors
+
+        self._file = safetensors.safe_open(path, framework="pt")
+        self._slice = self._file.get_slice(tensor_name)
+        self.scale = float(scale)
+        self.dtype = dtype
+        shape = self._slice.get_shape()
+        self.num_rows, self.head_dim = shape[0], shape[1]
+
+    def lookup(self, row_ids: torch.Tensor) -> torch.Tensor:
+        flat = row_ids.reshape(-1)
+        rows = torch.stack([self._slice[int(i) : int(i) + 1][0] for i in flat]).float()
+        if self.scale != 1.0:
+            rows = rows * self.scale
+        return rows.view(*row_ids.shape[:-1], -1).to(self.dtype)
+
+
+def ple_short_conv(x: torch.Tensor, state: torch.Tensor, weight: torch.Tensor, dilation: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``silu(depthwise_conv1d([state | x]))`` over one sequence, advancing ``state``.
+
+    ``x [T, width]``, ``state [width, state_len]`` (oldest first), ``weight [width, 1, kernel]``.
+    Returns ``(out [T, width], new_state [width, state_len])``."""
+    state_len = state.shape[-1]
+    history = torch.cat([state.to(x.dtype), x.transpose(0, 1)], dim=-1).unsqueeze(0)
+    out = F.conv1d(history, weight, groups=weight.shape[0], dilation=dilation).squeeze(0)
+    new_state = history[0, :, -state_len:] if state_len > 0 else state
+    return F.silu(out.transpose(0, 1)), new_state
+
+
+class PLELayer(nn.Module):
+    """One PLE block: hashed n-gram value gated by the residual streams, then a dilated
+    depthwise conv. ``forward(R, token_ids, table, conv_state) -> (D, new_conv_state)``; the
+    caller adds ``D`` to ``R`` before the attention hyper-connection mix (matches upstream
+    ``PLELayer.forward``'s contract, minus the ragged multi-request batching and slot-state
+    pool wiring #209 owns).
+
+    Weight keys (checkpoint names, prefix stripped): ``key_proj.weight``
+    ``[hc*hidden, ple_embed_dim]``, ``value_proj.weight`` ``[hidden, ple_embed_dim]``,
+    ``norm_key/norm_query/norm_conv.weight`` ``[hc*hidden]`` (zero-centered, loaded RAW),
+    ``conv1d.weight`` ``[hc*hidden, 1, kernel]``, plus the ``ple_embedding`` hash buffers
+    (``layer_multipliers``, ``ngram_heads_vocab_sizes``, ``ngram_heads_offsets``).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        hc_count: int,
+        ple_embed_dim: int,
+        conv_kernel_size: int,
+        dilation: int,
+        eps: float,
+        *,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.hc_count = hc_count
+        self.hidden_size = hidden_size
+        self.dilation = dilation
+        width = hc_count * hidden_size
+        self.key_proj = nn.Linear(ple_embed_dim, width, bias=False, dtype=dtype)
+        self.value_proj = nn.Linear(ple_embed_dim, hidden_size, bias=False, dtype=dtype)
+        self.norm_key = GroupedPlusOneRMSNorm(width, eps, hc_count, dtype=dtype)
+        self.norm_query = GroupedPlusOneRMSNorm(width, eps, hc_count, dtype=dtype)
+        self.norm_conv = GroupedPlusOneRMSNorm(width, eps, hc_count, dtype=dtype)
+        self.conv1d = nn.Parameter(torch.zeros(width, 1, conv_kernel_size, dtype=dtype))
+
+    def forward(
+        self,
+        R: torch.Tensor,
+        embeddings: torch.Tensor,
+        conv_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``R [T, hc*hidden]``, ``embeddings [T, ple_embed_dim]`` (already gathered table
+        rows), ``conv_state [hc*hidden, state_len]``. Returns ``(D [T, hc*hidden], new_conv_state)``."""
+        key = self.norm_key(self.key_proj(embeddings))
+        value = self.value_proj(embeddings)
+        query = self.norm_query(R)
+        shape = (-1, self.hc_count, self.hidden_size)
+        gate = (key.view(shape).float() * query.view(shape).float()).sum(-1, keepdim=True) / (self.hidden_size**0.5)
+        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+        gated = (gate * value.unsqueeze(-2).float()).flatten(-2).to(R.dtype)
+        x = self.norm_conv(gated)
+        conv_out, new_state = ple_short_conv(x, conv_state, self.conv1d, self.dilation)
+        return gated + conv_out, new_state
+
+
+# --------------------------------------------------------------------------- #
+# Not yet implemented: full model wiring (#209).
 # --------------------------------------------------------------------------- #
 
 from freetoken._stub import unimplemented
@@ -367,6 +623,12 @@ __all__ = [
     "qsa_expand_block_mask",
     "qsa_sparse_attend",
     "qsa_attend_mask",
+    "derive_ngram_hash_constants",
+    "ple_ngram_row_ids",
+    "PleInMemoryTable",
+    "PleDiskTable",
+    "ple_short_conv",
+    "PLELayer",
     "parse_config",
     "iter_weights",
     "Qwen4ExpForCausalLM",
