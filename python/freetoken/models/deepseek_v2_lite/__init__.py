@@ -1,13 +1,12 @@
 """DeepSeek-Coder-V2-Lite -- Intel Arc Pro B70 port.
 
-**Current scope: Multi-head Latent Attention (MLA) + config parsing only**
-(issue `models-dsv2lite-mla`, #217, first child of the DeepSeek-Coder-V2-Lite
-epic #216). The real MoE router (`models-dsv2lite-moe`, #218) and full
-engine wiring against a real downloaded checkpoint (`models-dsv2lite-e2e`,
-#219) are deliberate, separate follow-up issues -- every layer here runs a
-plain dense MLP (same scope-cut shape as `deepseek_v4`'s own #190), so this
-module's own accept bar (a real MLA forward, end to end, numerically sound)
-is provable in isolation.
+**Current scope: Multi-head Latent Attention (MLA) + the real greedy MoE
+router (issues `models-dsv2lite-mla` #217 and `models-dsv2lite-moe` #218,
+first two children of the DeepSeek-Coder-V2-Lite epic #216).** Full engine
+wiring against a real downloaded checkpoint (`models-dsv2lite-e2e`, #219)
+is a deliberate, separate follow-up issue. The MoE block is fused
+(in-VRAM) only -- same scope cut as `deepseek_v4`'s own MoE (#192), see
+`_DeepseekV2LiteMoE`'s own fail-loud guard.
 
 Real DeepSeek-Coder-V2-Lite checkpoint config (pulled directly from HF,
 ``deepseek-ai/DeepSeek-Coder-V2-Lite-Base``, not guessed):
@@ -409,7 +408,17 @@ class _DeepseekV2LiteMLA(nn.Module):
         cache_row = torch.cat([kv_latent, k_rot], dim=-1)  # [T, kv_lora_rank + rope]
         k_for_pool = cache_row.unsqueeze(0)  # [1, T, D] -- head-major, 1 head
         v_for_pool = torch.zeros_like(k_for_pool)  # V half unused for plain MLA -- see deepseek_v4's own docstring
-        ctx.kv_cache.write_kv(k_for_pool, v_for_pool, positions, self.layer_id)
+        # write_kv's third argument is out_loc -- PHYSICAL pool slots, not
+        # logical token positions. These only coincide under an identity
+        # page table (this module's own tests use BaseKVCachePool, which is
+        # identity); the real per-request allocator (MHAKVCache) reserves
+        # slot 0 as a dummy/padding slot, so a real request's first token
+        # never lands on slot 0 -- positions and slots are never the same
+        # number on real hardware. Same real bug class fixed in qwen3/
+        # qwen3_moe (#234, commit dbb1b6b) -- read_kv already does this
+        # translation internally, write_kv does not, so callers must.
+        out_loc = ctx.page_table[table_idx, positions.long()]
+        ctx.kv_cache.write_kv(k_for_pool, v_for_pool, out_loc, self.layer_id)
 
         written = req_written_len(ctx, batch, table_idx)
         read_pos = torch.arange(written, device=hidden_states.device)
@@ -453,6 +462,125 @@ class _DeepseekV2LiteMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class _DeepseekV2LiteTopkRouter(nn.Module):
+    """DeepSeek-Coder-V2-Lite's real ``topk_method="greedy"`` router
+    (``DeepseekV2TopkRouter``, confirmed byte-for-byte against the real,
+    installed ``transformers.models.deepseek_v2.modeling_deepseek_v2``,
+    v5.15.1 -- ported verbatim, not guessed). Genuinely different math from
+    every other MoE router in this port (`deepseek_v4`/`glm_moe_dsa`/
+    `qwen3_5_moe`/`qwen3_moe` all use a sigmoid + bias-corrected,
+    optionally-grouped router): plain softmax scores, flat (or
+    group-limited) top-k, NO renormalization step and NO bias-correction
+    term at all -- the real reference code has no such branch for the
+    ``greedy``/``group_limited_greedy`` methods, and the real checkpoint's
+    own ``norm_topk_prob: false`` is consistent with that (do not add a
+    renorm branch the real reference doesn't have, even though other
+    routers in this port do renormalize -- that would be guessing, not
+    porting). ``weight`` is named to match the real checkpoint's
+    ``mlp.gate.weight`` key.
+
+    The real checkpoint sets ``n_group: 1``/``topk_group: 1`` (confirmed via
+    its own downloaded ``config.json``, not assumed from the HF class
+    default) -- i.e. genuinely flat top-k over all 64 routed experts, no
+    grouping. ``group_limited_greedy`` (``n_group > 1``) is still
+    implemented for completeness/correctness against the real reference,
+    but is not the path this specific checkpoint exercises.
+    """
+
+    def __init__(self, config: ModelConfig, dtype) -> None:
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.n_group = config.attrs.get("n_group", 1)
+        self.topk_group = config.attrs.get("topk_group", 1)
+        self.routed_scaling_factor = config.attrs.get("routed_scaling_factor", 1.0)
+        topk_method = config.attrs.get("topk_method", "greedy")
+        if topk_method not in ("greedy", "group_limited_greedy"):
+            raise NotImplementedError(
+                f"DeepSeek-Coder-V2-Lite: unsupported topk_method {topk_method!r} -- "
+                "only 'greedy'/'group_limited_greedy' are implemented (the real "
+                "checkpoint this port targets uses 'greedy')."
+            )
+        self.weight = nn.Parameter(torch.empty(self.num_experts, config.hidden_size, dtype=dtype))
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``hidden_states`` is ``[T, H]``. Returns ``(topk_indices [T, k],
+        topk_weights [T, k])`` -- weights already scaled (never
+        renormalized, see class docstring)."""
+        router_logits = F.linear(hidden_states.float(), self.weight.float())  # [T, E]
+        scores = router_logits.softmax(dim=-1, dtype=torch.float32)
+        if self.n_group > 1:
+            T = scores.shape[0]
+            group_scores = scores.view(T, self.n_group, self.num_experts // self.n_group).max(dim=-1).values
+            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1.0)
+            expert_mask = (
+                group_mask.unsqueeze(-1)
+                .expand(T, self.n_group, self.num_experts // self.n_group)
+                .reshape(T, self.num_experts)
+            )
+            scores = scores.masked_fill(expert_mask == 0, 0.0)
+        topk_weights, topk_indices = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+        topk_weights = topk_weights * self.routed_scaling_factor
+        return topk_indices, topk_weights
+
+
+class _DeepseekV2LiteMoE(nn.Module):
+    """A DeepSeek-Coder-V2-Lite MoE block: the real greedy router
+    (:class:`_DeepseekV2LiteTopkRouter`) + N routed experts + an always-on
+    shared expert combined by plain unweighted sum -- identical combination
+    shape to `deepseek_v4`'s own ``_DeepseekV4MoE`` (only the router math
+    differs). In-VRAM only, same deliberate fused-only scope cut as V4/
+    glm4_moe/gpt_oss -- see the fail-loud guard below."""
+
+    def __init__(self, config: ModelConfig, device, dtype, layer_id: int) -> None:
+        super().__init__()
+        # Fail loud, not silently wrong -- same real bug class documented in
+        # deepseek_v4's own _DeepseekV4MoE: this block always builds real,
+        # device-resident expert modules and never reads the offload cache.
+        if bool(getattr(config, "use_offload_moe", False)) or bool(getattr(config, "use_cpu_moe", False)) or bool(getattr(config, "use_hybrid", False)):
+            raise NotImplementedError(
+                "DeepseekV2ForCausalLM only supports the in-VRAM (fused) MoE backend "
+                "-- offload/cpu/hybrid are not wired yet. Pass moe_backend=\"fused\" "
+                "explicitly (EngineConfig's \"auto\" default does not know this "
+                "architecture can't offload)."
+            )
+        self.layer_id = layer_id
+        self.gate = _DeepseekV2LiteTopkRouter(config, dtype)
+        self.experts = nn.ModuleList(
+            _DeepseekV2LiteMLP(config.hidden_size, config.moe_intermediate_size, dtype) for _ in range(config.num_experts)
+        )
+        n_shared = config.attrs.get("n_shared_experts", 0)
+        self.shared_experts = (
+            _DeepseekV2LiteMLP(config.hidden_size, config.moe_intermediate_size * n_shared, dtype) if n_shared > 0 else None
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        in_shape = hidden_states.shape
+        flat = hidden_states.reshape(-1, in_shape[-1])  # [n_tok, H]
+        topk_indices, topk_weights = self.gate(flat)
+        topk_weights = topk_weights.to(flat.dtype)
+
+        # Host-built integer indices (never nonzero()/boolean masking on the
+        # device -- see qwen3_moe's own _forward_inram for the real bug
+        # this avoids: an XPU bool-tensor nonzero() silently returns empty).
+        top_idx_cpu = topk_indices.to("cpu")
+        out = torch.zeros_like(flat)
+        for e in range(len(self.experts)):
+            for slot in range(topk_indices.shape[1]):
+                sel_cpu = top_idx_cpu[:, slot] == e
+                if not bool(sel_cpu.any()):
+                    continue
+                idx = sel_cpu.nonzero(as_tuple=True)[0].to(flat.device)
+                w = topk_weights.index_select(0, idx)[:, slot, None]
+                y = self.experts[e](flat.index_select(0, idx))
+                out.index_add_(0, idx, w * y)
+
+        if self.shared_experts is not None:
+            out = out + self.shared_experts(flat)
+        return out.view(in_shape)
+
+
 class _DeepseekV2LiteDecoderLayer(nn.Module):
     def __init__(self, config: ModelConfig, device, dtype, layer_id: int) -> None:
         super().__init__()
@@ -462,20 +590,11 @@ class _DeepseekV2LiteDecoderLayer(nn.Module):
         self.self_attn = _DeepseekV2LiteMLA(config, device, dtype, layer_id)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=eps, dtype=dtype)
         is_dense = (not config.is_moe) or layer_id < int(config.first_k_dense_replace or 0)
-        if is_dense:
-            self.mlp = _DeepseekV2LiteMLP(config.hidden_size, config.intermediate_size, dtype)
-        else:
-            # The real MoE router is issue #218, not yet implemented -- fail
-            # loud rather than silently building a numerically-wrong dense
-            # MLP for a layer the real checkpoint routes through experts
-            # (same "fail loud, not silently wrong" discipline as
-            # `deepseek_v4`'s own offload-backend guard).
-            raise NotImplementedError(
-                f"DeepSeek-Coder-V2-Lite layer {layer_id} is a routed-MoE layer "
-                f"(first_k_dense_replace={config.first_k_dense_replace}) -- the real "
-                "MoE router is issue #218 (models-dsv2lite-moe), not yet implemented. "
-                "This issue (#217) only covers dense layers / MLA attention."
-            )
+        self.mlp = (
+            _DeepseekV2LiteMLP(config.hidden_size, config.intermediate_size, dtype)
+            if is_dense
+            else _DeepseekV2LiteMoE(config, device, dtype, layer_id)
+        )
 
     def forward(self, hidden_states, positions, table_idx, ctx, batch):
         residual = hidden_states
@@ -551,6 +670,8 @@ __all__ = [
     "iter_weights",
     "DeepseekV2LiteForCausalLM",
     "_DeepseekV2LiteMLA",
+    "_DeepseekV2LiteTopkRouter",
+    "_DeepseekV2LiteMoE",
     "apply_interleaved_rope",
     "yarn_rope_params",
     "yarn_softmax_scale",
