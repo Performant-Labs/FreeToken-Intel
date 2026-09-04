@@ -28,6 +28,11 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "GptOssForCausalLM": ModelSpec("freetoken.models.gpt_oss", "GptOssForCausalLM"),
     "Glm4MoeForCausalLM": ModelSpec("freetoken.models.glm4_moe", "Glm4MoeForCausalLM"),
     "GlmMoeDsaForCausalLM": ModelSpec("freetoken.models.glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+    # Qwen4ExpForCausalLM is the real registered class upstream builds
+    # (model.py); ...ForConditionalGeneration is only config.py's own
+    # fallback default string when a checkpoint's config.json lacks an
+    # `architectures` field -- kept as an alias so either resolves.
+    "Qwen4ExpForCausalLM": ModelSpec("freetoken.models.qwen4_exp", "Qwen4ExpForCausalLM"),  # gitleaks:allow -- architecture name, not a secret
     "Qwen4ExpForConditionalGeneration": ModelSpec("freetoken.models.qwen4_exp", "Qwen4ExpForCausalLM"),  # gitleaks:allow -- architecture name, not a secret
     "Gemma4ForCausalLM": ModelSpec("freetoken.models.gemma4", "Gemma4ForCausalLM"),
     "Gemma4ForConditionalGeneration": ModelSpec("freetoken.models.gemma4", "Gemma4ForCausalLM"),
