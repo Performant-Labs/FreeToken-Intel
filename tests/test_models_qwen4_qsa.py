@@ -151,12 +151,32 @@ def test_qsa_attend_mask_includes_trailing_incomplete_block_unconditionally():
     T, ratio = 10, 4  # 2 complete blocks (0-3, 4-7), trailing tokens 8-9 incomplete
     topk_idx = torch.tensor([[-1, -1]])  # no block selected at all for this query
     query_positions = torch.tensor([9])
-    mask = qsa_attend_mask(topk_idx, ratio, query_positions, num_complete_blocks=2, seq_len=T)
+    mask = qsa_attend_mask(topk_idx, ratio, query_positions, seq_len=T)
     assert mask.shape == (1, T)
     # tokens 8, 9 (trailing incomplete block) must be visible even with no block selected
     assert bool(mask[0, 8]) and bool(mask[0, 9])
     # no earlier (compressed-block) token is visible since nothing was selected
     assert not bool(mask[0, :8].any())
+
+
+def test_qsa_attend_mask_open_group_is_per_query_not_a_global_tail():
+    """Real bug this pins (found running the port on real B70 hardware): for a long,
+    EXACTLY block-aligned sequence, an early query (whose own block hasn't closed yet, so
+    it has no causally-visible compressed blocks at all) must still see its own open
+    group's raw prefix -- not zero tokens. A global "trailing incomplete block" concept
+    (the old, wrong implementation) only covers rows near the END of the sequence; upstream
+    ``qsa_sparse.py``'s own module docstring (step 5) says the always-visible region is
+    "the causal tail of the open group", which is PER QUERY."""
+    T, ratio = 40, 4  # exactly 10 complete blocks, no global trailing incomplete region at all
+    topk_idx = torch.full((T, 1), -1, dtype=torch.long)  # nothing selected for any query
+    query_positions = torch.arange(T)
+    mask = qsa_attend_mask(topk_idx, ratio, query_positions, seq_len=T)
+    # every query must see at least itself -- an all-false row means softmax(-inf) -> NaN
+    assert mask.any(dim=-1).all()
+    # query 0's open group is just position 0 (block 0 spans 0..3, not yet closed)
+    assert mask[0].tolist() == [i == 0 for i in range(T)]
+    # query 2's open group is positions 0..2 (still inside block 0, not yet closed)
+    assert mask[2, :3].all() and not mask[2, 3:].any()
 
 
 def test_qsa_sparse_attend_matches_dense_reference_when_nothing_is_pruned():

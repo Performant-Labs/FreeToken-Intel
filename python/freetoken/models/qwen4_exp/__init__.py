@@ -313,17 +313,23 @@ def qsa_sparse_attend(
 
 
 def qsa_attend_mask(
-    topk_idx: torch.Tensor, index_ratio: int, query_positions: torch.Tensor, num_complete_blocks: int, seq_len: int
+    topk_idx: torch.Tensor, index_ratio: int, query_positions: torch.Tensor, seq_len: int
 ) -> torch.Tensor:
-    """The full attend mask for one QSA layer: selected-block tokens UNION the trailing
-    incomplete-block tokens (always attended raw, see module note above), AND'd with causality."""
+    """The full attend mask for one QSA layer: selected-block tokens UNION each query's own
+    OPEN GROUP (upstream ``qsa_sparse.py`` module docstring, step 5: "expand them to token
+    indices plus the causal tail of the open group") -- the raw tokens of the still-forming
+    block a query's own position falls in are always attended, since that block has no
+    compressed representative yet to be top-k-selected. This is PER-QUERY (each row's open
+    group is ``[(pos // index_ratio) * index_ratio, pos]``), not a single global trailing
+    region for the whole sequence -- a query early in a long, block-aligned sequence has an
+    open group near its own position, not near the sequence's end."""
     device = topk_idx.device
     block_mask = qsa_expand_block_mask(topk_idx, index_ratio, seq_len)
-    tail_start = num_complete_blocks * index_ratio
     positions = torch.arange(seq_len, device=device)
-    tail_mask = positions >= tail_start
+    group_start = (query_positions // index_ratio) * index_ratio
+    open_mask = (positions[None, :] >= group_start[:, None]) & (positions[None, :] <= query_positions[:, None])
     causal = positions[None, :] <= query_positions[:, None]
-    return (block_mask | tail_mask[None, :]) & causal
+    return (block_mask | open_mask) & causal
 
 
 # --------------------------------------------------------------------------- #
