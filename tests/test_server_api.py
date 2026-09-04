@@ -139,6 +139,55 @@ def test_chat_completions_streaming_sse():
     assert "chat.completion.chunk" in text
 
 
+def test_responses_non_streaming_returns_real_generated_text():
+    """Issue #200's own repo-audit finding: `/v1/responses` was a
+    hardcoded stub that always returned an empty `output` array without
+    ever calling generation. This pins the real fix -- actual generated
+    text, not an empty list."""
+    app = _make_app(["Hello", " world"])
+    response = _client(app).post(
+        "/v1/responses",
+        json={"model": "Qwen3-30B-A3B", "input": "Hi"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "response"
+    assert body["status"] == "completed"
+    assert body["output_text"] == "Hello world"
+    assert body["output"][0]["content"][0]["text"] == "Hello world"
+
+
+def test_responses_accepts_list_input_with_text_parts():
+    """The real Responses API's ``input`` also accepts a list of
+    message-item dicts whose ``content`` is a list of typed parts
+    (``{"type": "input_text", "text": ...}``), not just a bare string."""
+    app = _make_app(["Hello", " world"])
+    response = _client(app).post(
+        "/v1/responses",
+        json={
+            "model": "Qwen3-30B-A3B",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["output_text"] == "Hello world"
+
+
+def test_responses_streaming_sse_emits_real_events():
+    app = _make_app(["Hello", " world"])
+    with _client(app).stream(
+        "POST",
+        "/v1/responses",
+        json={"model": "Qwen3-30B-A3B", "input": "Hi", "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        text = "".join(response.iter_text())
+    assert "event: response.created" in text
+    assert "event: response.output_text.delta" in text
+    assert "event: response.completed" in text
+    assert '"delta": "Hello"' in text or '"delta":"Hello"' in text
+
+
 def test_not_ready_engine_returns_503_not_traceback():
     def engine_holder():
         from freetoken._stub import NotYetImplemented
