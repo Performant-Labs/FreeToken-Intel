@@ -18,11 +18,13 @@ Two real differences from this port's Qwen3-family models:
   unconditional shared-expert add; confirmed against the real HF
   `Qwen2MoeSparseMoeBlock.forward`.
 
-This issue (#221) covers config parsing, attention, and the router/shared-
-expert combination as standalone, independently-testable primitives (same
-shape as `qwen4_exp`'s own `#206`/`#208` primitives) -- NOT yet wired into a
-decoder layer, the engine's KV cache, or a `ForCausalLM` class; that is
-issue #222's job.
+Issue #221 built config parsing, attention, and the router/shared-expert
+combination as standalone primitives. Issue #222 (this file's decoder layer
+and `Qwen2MoeForCausalLM`) wires them into the real engine loop: dense vs.
+MoE layers split by `mlp_only_layers`/`decoder_sparse_step`, fused
+(in-VRAM) MoE only -- offload/cpu/hybrid raise loudly rather than silently
+leaving experts uninitialized (the real bug class `loader.py`'s
+`_CPU_MOE_CAPABLE_ARCHS` gate exists to prevent).
 """
 from __future__ import annotations
 
@@ -120,11 +122,27 @@ def parse_config(hf_config, model_path: str | None = None, **_kwargs) -> ModelCo
     cfg.attrs["shared_expert_intermediate_size"] = int(src.get("shared_expert_intermediate_size") or 0)
     cfg.attrs["decoder_sparse_step"] = int(src.get("decoder_sparse_step") or 1)
     cfg.attrs["mlp_only_layers"] = list(src.get("mlp_only_layers") or [])
+    cfg.attrs["rms_norm_eps"] = float(src.get("rms_norm_eps") or 1e-6)
     return cfg
 
 
-def iter_weights(model_path: str, device: torch.device, **_kwargs) -> "iter[tuple[str, torch.Tensor]]":
-    """Yield the checkpoint's tensors, each placed on ``device``.
+def iter_weights(
+    model_path: str,
+    device: torch.device,
+    *,
+    include_moe_experts: bool = True,
+    include_non_moe: bool = True,
+    **_kwargs,
+) -> "iter[tuple[str, torch.Tensor]]":
+    """Yield the checkpoint's tensors, each on its destination device.
+
+    MoE expert tensors (``...mlp.experts...``) stay on **host** memory (the
+    loader's fused-path expert placement reads them from there); every other
+    (dense) tensor is yielded on ``device``. ``include_moe_experts``/
+    ``include_non_moe`` let the loader stream just one half (mirrors
+    ``qwen3_moe``'s own ``iter_weights`` exactly -- same real failure mode:
+    without this split, ``load_moe_expert_sources`` chokes on dense tensors
+    like ``lm_head.weight`` mixed into the expert stream).
 
     Synthesizes ``lm_head.weight`` from ``embed_tokens.weight`` for a
     ``tie_word_embeddings: true`` checkpoint that ships no separate
@@ -136,14 +154,20 @@ def iter_weights(model_path: str, device: torch.device, **_kwargs) -> "iter[tupl
     embed_tokens_weight = None
     saw_lm_head = False
     for name, tensor in iter_safetensors(model_path, device):
-        placed = tensor.to(device)
+        is_expert = ".experts." in name
+        if is_expert and not include_moe_experts:
+            continue
+        if not is_expert and not include_non_moe:
+            continue
+        dest = torch.device("cpu") if is_expert else device
+        placed = tensor.to(dest)
         if name == "model.embed_tokens.weight":
             embed_tokens_weight = placed
         elif name == "lm_head.weight":
             saw_lm_head = True
         yield name, placed
 
-    if not saw_lm_head and embed_tokens_weight is not None:
+    if include_non_moe and not saw_lm_head and embed_tokens_weight is not None:
         hf_config = cached_load_hf_config(model_path)
         if bool(getattr(hf_config, "tie_word_embeddings", False)):
             yield "lm_head.weight", embed_tokens_weight
@@ -254,10 +278,190 @@ def qwen2moe_shared_expert_output(
     return gate * shared
 
 
+# --------------------------------------------------------------------------- #
+# Full model wiring (#222): decoder layer + causal-LM wrapper.
+# --------------------------------------------------------------------------- #
+
+
+def _xpu_available() -> bool:
+    try:
+        return bool(torch.xpu.is_available())
+    except Exception:
+        return False
+
+
+class _Qwen2MoeMLP(nn.Module):
+    """Plain dense SwiGLU MLP -- used for any layer ``mlp_only_layers``
+    marks dense (or every layer, if the checkpoint's ``decoder_sparse_step``
+    somehow yields none as MoE, though the real checkpoint has every layer
+    MoE)."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int, dtype) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False, dtype=dtype)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False, dtype=dtype)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _Qwen2MoeMoE(nn.Module):
+    """Router (flat softmax top-k) + per-expert dense loop + the real
+    sigmoid-gated shared expert. In-VRAM (fused) only -- offload/cpu/hybrid
+    are not wired for this architecture yet, same scope cut as
+    ``glm4_moe``/``deepseek_v4``/``glm_moe_dsa`` before their own follow-up
+    issues; guard loudly rather than silently leaving experts uninitialized
+    (the real bug class `loader.py`'s ``_CPU_MOE_CAPABLE_ARCHS`` gate exists
+    to prevent)."""
+
+    def __init__(self, config: ModelConfig, device, dtype, layer_id: int) -> None:
+        super().__init__()
+        if bool(getattr(config, "use_offload_moe", False)) or bool(getattr(config, "use_cpu_moe", False)) or bool(getattr(config, "use_hybrid", False)):
+            raise NotImplementedError(
+                "Qwen2MoeForCausalLM only supports the in-VRAM (fused) MoE backend "
+                "-- offload/cpu/hybrid are not wired yet. Pass moe_backend=\"fused\" "
+                "explicitly (EngineConfig's \"auto\" default does not know this "
+                "architecture can't offload)."
+            )
+        self.layer_id = layer_id
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = bool(config.attrs.get("norm_topk_prob", False))
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False, dtype=dtype)
+        self.experts = nn.ModuleList(
+            _Qwen2MoeMLP(config.hidden_size, config.moe_intermediate_size, dtype) for _ in range(config.num_experts)
+        )
+        shared_inter = int(config.attrs.get("shared_expert_intermediate_size", 0))
+        self.shared_expert = _Qwen2MoeMLP(config.hidden_size, shared_inter, dtype) if shared_inter > 0 else None
+        self.shared_expert_gate = (
+            nn.Linear(config.hidden_size, 1, bias=False, dtype=dtype) if shared_inter > 0 else None
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        in_shape = hidden_states.shape
+        flat = hidden_states.reshape(-1, in_shape[-1])
+        routing_weights, selected_experts = qwen2moe_router(
+            flat, self.gate.weight, self.top_k, self.norm_topk_prob
+        )
+
+        sel_cpu = selected_experts.to("cpu")
+        out = torch.zeros_like(flat)
+        for e in range(len(self.experts)):
+            for slot in range(selected_experts.shape[1]):
+                mask = sel_cpu[:, slot] == e
+                if not bool(mask.any()):
+                    continue
+                idx = mask.nonzero(as_tuple=True)[0].to(flat.device)
+                w = routing_weights.index_select(0, idx)[:, slot, None]
+                y = self.experts[e](flat.index_select(0, idx))
+                out.index_add_(0, idx, w * y)
+
+        if self.shared_expert is not None:
+            out = out + qwen2moe_shared_expert_output(
+                flat,
+                self.shared_expert.gate_proj.weight,
+                self.shared_expert.up_proj.weight,
+                self.shared_expert.down_proj.weight,
+                self.shared_expert_gate.weight,
+            )
+        return out.view(in_shape)
+
+
+class _Qwen2MoeDecoderLayer(nn.Module):
+    def __init__(self, config: ModelConfig, device, dtype, layer_id: int) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        eps = config.attrs.get("rms_norm_eps", 1e-6)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=eps, dtype=dtype)
+        self.self_attn = Qwen2MoeAttention(config, device, dtype, layer_id)
+        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=eps, dtype=dtype)
+
+        mlp_only_layers = config.attrs.get("mlp_only_layers", [])
+        sparse_step = int(config.attrs.get("decoder_sparse_step", 1)) or 1
+        # Real checkpoint's own dense-vs-MoE rule (HF Qwen2MoeDecoderLayer):
+        # a layer is dense iff it's in mlp_only_layers OR sparse_step does
+        # not divide (layer_id + 1). Confirmed: real checkpoint has
+        # mlp_only_layers=[] and decoder_sparse_step=1, so every layer is
+        # MoE there -- but don't assume that for any other checkpoint.
+        is_dense = layer_id in mlp_only_layers or (layer_id + 1) % sparse_step != 0
+        self.mlp = (
+            _Qwen2MoeMLP(config.hidden_size, config.intermediate_size, dtype)
+            if is_dense
+            else _Qwen2MoeMoE(config, device, dtype, layer_id)
+        )
+
+    def forward(self, hidden_states, positions, table_idx, ctx, batch):
+        residual = hidden_states
+        hidden_states = self.self_attn(self.input_layernorm(hidden_states), positions, table_idx, ctx, batch)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states
+
+
+class Qwen2MoeForCausalLM(nn.Module):
+    """Qwen1.5-MoE-A2.7B: real forward pass for the Intel engine loop (``#14``)."""
+
+    def __init__(self, config, device=None) -> None:
+        super().__init__()
+        self.config = config
+        if device is None:
+            device = torch.device("xpu") if _xpu_available() else torch.device("cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
+        dtype = getattr(config, "dtype", None) or torch.bfloat16
+        vocab_size = getattr(config, "vocab_size", 256)
+        hidden_size = getattr(config, "hidden_size", 256)
+        num_layers = getattr(config, "num_layers", 0)
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size, device=device, dtype=dtype)
+        self.layers = nn.ModuleList(
+            _Qwen2MoeDecoderLayer(config, device, dtype, layer_id=i) for i in range(num_layers)
+        )
+        eps = getattr(config, "attrs", {}).get("rms_norm_eps", 1e-6)
+        self.norm = nn.RMSNorm(hidden_size, eps=eps, dtype=dtype)
+        from freetoken.layers import LinearReplicated
+
+        self.lm_head = LinearReplicated(hidden_size, vocab_size, has_bias=False, dtype=dtype)
+        self.moe_offload = False
+        self.moe_cache = None
+        if self.device.type != "cpu":
+            self.to(self.device)
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, out_loc: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        reqs = batch.reqs
+        num_tokens = input_ids.shape[0]
+
+        hidden = self.embed_tokens(input_ids)
+        out = torch.empty((batch.size, self.config.hidden_size), device=hidden.device, dtype=hidden.dtype)
+
+        offset = 0
+        extend_lens = batch.extend_lens
+        if extend_lens is None:
+            prefill = batch.is_prefill or (num_tokens > batch.size)
+            extend_lens = [req.extend_len if prefill else 1 for req in reqs]
+        is_decode_batch = batch.phase == "decode"
+        for i, req in enumerate(reqs):
+            ext = 1 if is_decode_batch else int(extend_lens[i])
+            token_slice = slice(offset, offset + ext)
+            h = hidden[token_slice]
+            for layer in self.layers:
+                h = layer(h, positions[token_slice], req.table_idx, ctx, batch)
+            out[i] = self.norm(h)[-1]
+            offset += ext
+
+        return self.lm_head(out)
+
+
 __all__ = [
     "parse_config",
     "iter_weights",
     "Qwen2MoeAttention",
     "qwen2moe_router",
     "qwen2moe_shared_expert_output",
+    "Qwen2MoeForCausalLM",
 ]

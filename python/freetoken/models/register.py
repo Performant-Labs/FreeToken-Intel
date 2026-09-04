@@ -18,6 +18,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "Qwen2ForCausalLM": ModelSpec("freetoken.models.qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": ModelSpec("freetoken.models.qwen3", "Qwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ModelSpec("freetoken.models.qwen3_moe", "Qwen3MoeForCausalLM"),
+    "Qwen2MoeForCausalLM": ModelSpec("freetoken.models.qwen2_moe", "Qwen2MoeForCausalLM"),  # gitleaks:allow -- architecture name, not a secret
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe", "Qwen3_5MoEForCausalLM"
     ),
