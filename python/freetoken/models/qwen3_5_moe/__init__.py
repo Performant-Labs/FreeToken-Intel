@@ -1087,9 +1087,14 @@ class _Qwen35Attention:
         q = q.transpose(1, 2)[0]
         k = k.transpose(1, 2)[0]
         v = v.transpose(1, 2)[0]
-        # Append this request's K/V to the pool at its positions (identity table:
-        # out_loc == position under the identity page table, as in qwen3_moe).
-        ctx.kv_cache.write_kv(k, v, positions, self.layer_id)
+        # write_kv's third argument is out_loc -- PHYSICAL pool slots, not
+        # logical token positions. These only coincide under an identity page
+        # table; MHAKVCache's real per-request free-list allocator is NOT
+        # identity (slot 0 is reserved as dummy/padding, so a real request's
+        # first token never lands on slot 0). See qwen3/qwen3_moe's identical
+        # fix (#234) -- this call had the same wrong "identity table" assumption.
+        out_loc = ctx.page_table[table_idx, positions.long()]
+        ctx.kv_cache.write_kv(k, v, out_loc, self.layer_id)
         out = ctx.attn_backend.forward(q, k, v, self.layer_id, batch, table_idx=table_idx)
         # Gated output: sigmoid(gate) elementwise over the attention output.
         # out is head-major [heads, T, head_dim]; make the gate head-major to match.

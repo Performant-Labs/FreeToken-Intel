@@ -288,3 +288,64 @@ def test_qwen35_auto_resolves_to_offload_on_xpu(qwen35_xpu_ckpt):
     _add_prompt(engine, output_len=6)
     tokens = engine.generate()
     assert len(tokens[0]) == 6 and all(0 <= t < _V for t in tokens[0])
+
+
+def test_write_kv_uses_physical_pool_slots_not_logical_positions(qwen35_xpu_ckpt):
+    """Real bug (#234) found running qwen3/qwen3_moe against a real trained
+    checkpoint's generation through the actual Engine: ``write_kv``'s third
+    argument is ``out_loc`` -- PHYSICAL pool slots -- not logical token
+    positions. These only coincide under an identity page table. The real
+    ``MHAKVCache`` per-request free-list allocator (every live ``Engine``
+    uses this, not the identity-mapped ``BaseKVCachePool`` this file's own
+    sibling module ``test_models_qwen35_loader.py`` uses via
+    ``_drive_prefill``) reserves slot 0 as dummy/padding, so a real request's
+    first token never lands on slot 0. The full-attention layer here had the
+    identical wrong pattern (passed raw ``positions`` straight through,
+    documented with a now-known-false "identity table" comment) -- fixed to
+    translate positions -> physical slots via ``ctx.page_table`` first,
+    exactly as ``qwen3``/``qwen3_moe``'s fix did.
+
+    This closes a real coverage gap: every existing qwen3_5_moe test either
+    used the identity-mapped ``BaseKVCachePool`` directly (masks the bug by
+    construction) or compared the offload path against the fused path
+    (both share this exact buggy call, so they'd corrupt identically and
+    still agree -- a self-referential check that can't catch this class of
+    bug). This is the first qwen3_5_moe test to run a real ``Engine`` +
+    real ``MHAKVCache`` and check the actual physical slot ``write_kv``
+    received against an independent oracle (the page table itself).
+    """
+    dev = torch.device("cpu")
+    engine = Engine(_engine_config(qwen35_xpu_ckpt, dev, moe_backend="fused"))
+
+    captured = {}
+    pool = engine.ctx.kv_cache
+    orig_write_kv = pool.write_kv
+
+    def spy_write_kv(k, v, out_loc, layer_id=0):
+        if layer_id not in captured:
+            captured[layer_id] = out_loc.clone()
+        return orig_write_kv(k, v, out_loc, layer_id)
+
+    pool.write_kv = spy_write_kv
+    try:
+        _add_prompt(engine, output_len=1)
+        engine.generate()
+    finally:
+        pool.write_kv = orig_write_kv
+
+    full_layer_ids = [l.layer_id for l in engine.model.layers if getattr(l, "self_attn", None) is not None]
+    assert full_layer_ids, "the fabricated tower must have a full-attention layer"
+    lid = full_layer_ids[0]
+    assert lid in captured, "the full-attention layer's write_kv must have been called"
+
+    table_idx = 0
+    positions = torch.arange(5)  # len(input_ids) in _add_prompt: [1, 2, 3, 5, 8]
+    expected_slots = engine.ctx.page_table[table_idx, positions.long()]
+
+    # A real request's first token never lands on the reserved slot 0 --
+    # confirms the allocator genuinely isn't identity for this run.
+    assert 0 not in expected_slots.tolist()
+    # The actual out_loc write_kv received must be the PHYSICAL pool slots
+    # from the page table, not the raw logical positions [0, 1, 2, 3, 4].
+    assert captured[lid].equal(expected_slots)
+    assert not captured[lid].equal(positions)

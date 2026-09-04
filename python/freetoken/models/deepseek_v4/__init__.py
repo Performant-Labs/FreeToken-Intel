@@ -402,7 +402,14 @@ class _DeepseekV4MLA(nn.Module):
             v_for_pool = F.pad(k_idx, (0, pool_row_width - self.index_head_dim)).unsqueeze(0)
         else:
             v_for_pool = torch.zeros_like(k_for_pool)  # V half is unused for plain MLA -- see docstring
-        ctx.kv_cache.write_kv(k_for_pool, v_for_pool, positions, self.layer_id)
+        # write_kv's third argument is out_loc -- PHYSICAL pool slots, not
+        # logical token positions. These only coincide under an identity page
+        # table; MHAKVCache's real per-request free-list allocator is NOT
+        # identity (slot 0 is reserved as dummy/padding, so a real request's
+        # first token never lands on slot 0). See qwen3/qwen3_moe's identical
+        # fix (#234) -- this call had the same wrong "identity table" assumption.
+        out_loc = ctx.page_table[table_idx, positions.long()]
+        ctx.kv_cache.write_kv(k_for_pool, v_for_pool, out_loc, self.layer_id)
 
         written = req_written_len(ctx, batch, table_idx)
         read_pos = torch.arange(written, device=hidden_states.device)
