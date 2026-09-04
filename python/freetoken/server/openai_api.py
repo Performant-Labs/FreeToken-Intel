@@ -30,6 +30,31 @@ class ChatMessage(BaseModel):
     content: str | list | None = None
 
 
+class ResponsesRequest(BaseModel):
+    """The subset of the real OpenAI Responses API request this port
+    honors (issue #200's audit found `/v1/responses` was a hardcoded
+    empty-output stub -- looked wired up, never called generation at
+    all). Scope: plain text in, plain text out, matching this port's own
+    existing `/v1/chat/completions` capability -- tool-call-argument
+    streaming and reasoning-item events are real upstream features
+    (`responses_api.py`, ~750 lines using the ``openai`` SDK's typed
+    response models) deliberately deferred as follow-up, not attempted
+    here. ``input`` accepts either a bare string (a single user turn,
+    the common case) or the real API's list-of-message-item shape."""
+
+    model: str
+    input: str | list[dict]
+    instructions: str | None = None
+    stream: bool = False
+    max_output_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    tools: list[dict] | None = None
+    reasoning_effort: str | None = None
+
+    model_config = {"extra": "allow"}
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
@@ -92,14 +117,11 @@ def register_openai_routes(app: FastAPI, engine_holder) -> None:
         return _merge_to_completion(chunks)
 
     @app.post("/v1/responses")
-    def responses() -> dict:
-        _engine()  # 503 if the engine/loader is still a stub
-        return {
-            "id": "resp-" + uuid.uuid4().hex[:24],
-            "object": "response",
-            "status": "completed",
-            "output": [],
-        }
+    def responses(request: ResponsesRequest) -> object:
+        if request.stream:
+            return StreamingResponse(_responses_stream(request), media_type="text/event-stream")
+        text = "".join(content for _, content in _responses_generate(request))
+        return _responses_object(text, status="completed")
 
     def _chat_stream(request: ChatCompletionRequest):
         yield from _sse(_chat_completions(request))
@@ -145,6 +167,146 @@ def register_openai_routes(app: FastAPI, engine_holder) -> None:
             "model": model_name,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
+
+    def _responses_messages(request: ResponsesRequest) -> list[dict]:
+        """Normalize the real Responses API's ``input`` (a bare string, or
+        a list of message-item dicts whose ``content`` may itself be a
+        string or a list of ``{"type": "input_text", "text": ...}``-shaped
+        parts) into this port's own plain chat-message shape
+        (``generation.stream_chat`` already consumes this -- the same
+        conversion `/v1/chat/completions` relies on)."""
+        messages: list[dict] = []
+        if request.instructions:
+            messages.append({"role": "system", "content": request.instructions})
+        if isinstance(request.input, str):
+            messages.append({"role": "user", "content": request.input})
+            return messages
+        for item in request.input:
+            role = item.get("role", "user")
+            content = item.get("content", "")
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "") for part in content if isinstance(part, dict) and "text" in part
+                )
+            messages.append({"role": role, "content": content})
+        return messages
+
+    def _responses_generate(request: ResponsesRequest) -> Iterator[tuple[str, str]]:
+        """Yield ``(reasoning_delta, content_delta)`` per decoded token --
+        the same primitive `/v1/chat/completions` streams from, reused
+        as-is (see this endpoint's own scope note on ``ResponsesRequest``:
+        plain text only, no tool-call/reasoning-item streaming yet)."""
+        engine = _engine()
+        server_args = app.state.server_args
+        chat_template_kwargs: dict = {}
+        if request.reasoning_effort is not None:
+            chat_template_kwargs["reasoning_effort"] = request.reasoning_effort
+        yield from generation.stream_chat(
+            engine,
+            _responses_messages(request),
+            model=server_args.resolved_model_name,
+            max_tokens=request.max_output_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            tools=request.tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+
+    def _responses_object(text: str, *, status: str, response_id: str | None = None) -> dict:
+        """The real Responses API's top-level object shape (a plain dict,
+        matching this file's own established style -- see
+        `_merge_to_completion` -- rather than depending on the ``openai``
+        SDK's typed models, which aren't a declared dependency here)."""
+        return {
+            "id": response_id or ("resp_" + uuid.uuid4().hex),
+            "object": "response",
+            "created_at": generation.now_timestamp(),
+            "status": status,
+            "model": app.state.server_args.resolved_model_name,
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_" + uuid.uuid4().hex,
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                }
+            ],
+            "output_text": text,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+
+    def _responses_stream(request: ResponsesRequest) -> Iterator[str]:
+        """Real Responses API SSE events -- ``event: <type>\\ndata:
+        <json>\\n\\n`` per event (a different wire shape from
+        `/v1/chat/completions`' own plain ``data:``-only frames). Emits
+        the subset codex needs for plain-text streaming: ``created`` ->
+        one ``output_text.delta`` per token -> ``completed``. Tool-call
+        argument deltas and reasoning-item events are the real upstream
+        feature this scope note already flags as deferred."""
+        response_id = "resp_" + uuid.uuid4().hex
+        seq = 0
+
+        def frame(event_type: str, data: dict) -> str:
+            nonlocal seq
+            data = {"type": event_type, "sequence_number": seq, **data}
+            seq += 1
+            return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        in_progress = _responses_object("", status="in_progress", response_id=response_id)
+        yield frame("response.created", {"response": in_progress})
+        yield frame("response.in_progress", {"response": in_progress})
+
+        parts: list[str] = []
+        item_id = "msg_" + uuid.uuid4().hex
+        yield frame(
+            "response.output_item.added",
+            {
+                "output_index": 0,
+                "item": {"type": "message", "id": item_id, "status": "in_progress", "role": "assistant", "content": []},
+            },
+        )
+        yield frame(
+            "response.content_part.added",
+            {
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            },
+        )
+        for _reasoning_delta, content_delta in _responses_generate(request):
+            if not content_delta:
+                continue
+            parts.append(content_delta)
+            yield frame(
+                "response.output_text.delta",
+                {"item_id": item_id, "output_index": 0, "content_index": 0, "delta": content_delta},
+            )
+        text = "".join(parts)
+        yield frame(
+            "response.output_text.done",
+            {"item_id": item_id, "output_index": 0, "content_index": 0, "text": text},
+        )
+        yield frame(
+            "response.content_part.done",
+            {
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": text, "annotations": []},
+            },
+        )
+        final = _responses_object(text, status="completed", response_id=response_id)
+        yield frame(
+            "response.output_item.done",
+            {"output_index": 0, "item": final["output"][0]},
+        )
+        yield frame("response.completed", {"response": final})
 
     def _served_name(app: FastAPI) -> str:
         return app.state.server_args.resolved_model_name
