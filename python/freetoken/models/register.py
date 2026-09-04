@@ -35,6 +35,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "OlmoeForCausalLM": ModelSpec("freetoken.models.olmoe", "OlmoeForCausalLM"),
     "Glm4MoeForCausalLM": ModelSpec("freetoken.models.glm4_moe", "Glm4MoeForCausalLM"),
     "GlmMoeDsaForCausalLM": ModelSpec("freetoken.models.glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+    "MellumForCausalLM": ModelSpec("freetoken.models.mellum", "MellumForCausalLM"),
     # Qwen4ExpForCausalLM is the real registered class upstream builds
     # (model.py); ...ForConditionalGeneration is only config.py's own
     # fallback default string when a checkpoint's config.json lacks an
