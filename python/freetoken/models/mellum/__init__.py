@@ -232,15 +232,222 @@ def mellum_moe_router(hidden_states: torch.Tensor, gate_weight: torch.Tensor, to
     return top_w, top_idx
 
 
-__all__ = ["MellumAttention", "mellum_moe_router", "parse_config"]
+def _xpu_available() -> bool:
+    try:
+        return bool(torch.xpu.is_available())
+    except Exception:
+        return False
 
 
-# --------------------------------------------------------------------------- #
-# Not yet implemented: full model wiring (#228).
-# --------------------------------------------------------------------------- #
+def iter_weights(
+    model_path: str,
+    device: torch.device,
+    *,
+    include_moe_experts: bool = True,
+    include_non_moe: bool = True,
+) -> "iter[tuple[str, torch.Tensor]]":
+    """Yield the checkpoint's tensors, each on its destination device.
 
-from freetoken._stub import unimplemented
+    Fused (in-VRAM) experts only for now (issue #226's own scope note: no
+    offload/CPU/hybrid MoE backend for Mellum yet, mirroring how
+    ``glm4_moe``/``gpt_oss`` shipped fused-only first) -- every tensor,
+    including experts, is placed on ``device``. Real bug found wiring this:
+    ``include_moe_experts``/``include_non_moe`` are NOT no-ops even on the
+    fused path -- the loader's own ``load_moe_expert_sources`` streams this
+    generator with ``include_non_moe=False`` to gather ONLY expert tensors
+    into banks (fused and offload both build the banks first; fused then
+    copies them into resident expert modules), and ``_place_dense`` streams
+    it separately with ``include_moe_experts=False`` for the dense pass.
+    Ignoring these kwargs mixes dense tensors (e.g. ``lm_head.weight``) into
+    the expert-bank stream, which raises inside
+    ``weight.py:stream_moe_expert_sources`` ("Unexpected expert weight
+    key") -- confirmed by hitting exactly that error before this filter was
+    added. Mirrors ``qwen3_moe``'s own ``iter_weights`` filtering.
+
+    Synthesizes ``lm_head.weight`` from ``embed_tokens.weight`` for a
+    ``tie_word_embeddings: true`` checkpoint that ships no separate
+    ``lm_head.weight`` key -- same real failure mode ``qwen3``/``qwen3_moe``
+    already guard against (an unfilled ``lm_head`` silently zeros every
+    logit).
+    """
+    from freetoken.models.weight import iter_safetensors
+
+    embed_tokens_weight = None
+    saw_lm_head = False
+    for name, tensor in iter_safetensors(model_path, device):
+        is_expert = ".experts." in name
+        if is_expert and not include_moe_experts:
+            continue
+        if not is_expert and not include_non_moe:
+            continue
+        placed = tensor.to(device)
+        if name == "model.embed_tokens.weight":
+            embed_tokens_weight = placed
+        elif name == "lm_head.weight":
+            saw_lm_head = True
+        yield name, placed
+
+    if include_non_moe and not saw_lm_head and embed_tokens_weight is not None:
+        from freetoken.utils import cached_load_hf_config
+
+        hf_config = cached_load_hf_config(model_path)
+        if bool(getattr(hf_config, "tie_word_embeddings", False)):
+            yield "lm_head.weight", embed_tokens_weight
 
 
-def iter_weights(*args, **kwargs):
-    unimplemented("iter_weights", "models-mellum-e2e")
+class _MellumExpert(nn.Module):
+    """A single MoE expert: gate/up/down projections (SwiGLU), fused/in-VRAM only."""
+
+    def __init__(self, config, dtype) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False, dtype=dtype)
+        self.up_proj = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False, dtype=dtype)
+        self.down_proj = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _MellumMoE(nn.Module):
+    """Router + N fused (XPU-resident) experts, no shared expert.
+
+    Reuses ``mellum_moe_router`` (#227's own standalone primitive) for the
+    routing math, then a per-expert gather over the resident ``_MellumExpert``
+    modules -- the same "route on host, gather with index_select" pattern
+    ``qwen3_moe``'s fused path uses (XPU `nonzero()`/boolean-mask indexing on
+    this torch/XPU build silently returns empty for a bool tensor regardless
+    of content -- a real, confirmed bug this port routes around everywhere).
+    """
+
+    def __init__(self, config, device, dtype) -> None:
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        from freetoken.layers import LinearReplicated
+
+        self.gate = LinearReplicated(config.hidden_size, self.num_experts, has_bias=False, dtype=dtype)
+        self.experts = nn.ModuleList(_MellumExpert(config, dtype).to(device, dtype) for _ in range(self.num_experts))
+
+    def forward(self, hidden_states: torch.Tensor, model=None, batch=None) -> torch.Tensor:
+        in_shape = hidden_states.shape
+        flat = hidden_states.reshape(-1, in_shape[-1])  # [T, hidden]
+        top_w, top_idx = mellum_moe_router(flat, self.gate.weight, self.top_k)
+
+        out = torch.zeros_like(flat)
+        top_idx_host = top_idx.to("cpu")
+        for e in range(self.num_experts):
+            token_rows, k_slots = (top_idx_host == e).nonzero(as_tuple=True)
+            if token_rows.numel() == 0:
+                continue
+            token_rows = token_rows.to(flat.device)
+            k_slots = k_slots.to(flat.device)
+            sel = flat.index_select(0, token_rows)
+            expert_out = self.experts[e](sel)
+            w = top_w[token_rows, k_slots].unsqueeze(-1)
+            out.index_add_(0, token_rows, expert_out * w)
+        return out.view(in_shape)
+
+
+class _MellumDecoderLayer(nn.Module):
+    def __init__(self, config, device, dtype, layer_id: int) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        layer_types = config.attrs.get("layer_types") or []
+        layer_type = layer_types[layer_id] if layer_id < len(layer_types) else "full_attention"
+        eps = config.attrs.get("rms_norm_eps", 1e-6)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=eps, dtype=dtype)
+        self.self_attn = MellumAttention(config, device, dtype, layer_id, layer_type)
+        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=eps, dtype=dtype)
+        self.mlp = _MellumMoE(config, device, dtype)
+        self.mlp.layer_id = layer_id
+
+    def forward(self, hidden_states, positions, table_idx, ctx, batch):
+        residual = hidden_states
+        hidden_states = self.self_attn(self.input_layernorm(hidden_states), positions, table_idx, ctx, batch)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = residual + self.mlp(
+            self.post_attention_layernorm(hidden_states), model=ctx.model, batch=batch
+        )
+        return hidden_states
+
+
+class MellumForCausalLM(nn.Module):
+    """The Mellum2 model: real forward pass for the Intel engine loop.
+
+    Subclasses ``nn.Module`` (not the torch-free ``BaseLLMModel`` stub) so its
+    parameters are real registered ``nn.Parameter``s -- the loader resolves
+    ``named_parameters()``/``named_buffers()`` to fill weights, which only
+    works for proper ``nn.Module`` children. Structurally identical to
+    ``qwen3_moe``'s own ``Qwen3MoeForCausalLM`` (same reuse this whole
+    package already leans on), fused-MoE-only (no offload path yet, see
+    ``iter_weights``'s own note).
+    """
+
+    def __init__(self, config, device=None) -> None:
+        super().__init__()
+        self.config = config
+        if device is None:
+            device = torch.device("xpu") if _xpu_available() else torch.device("cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
+        dtype = getattr(config, "dtype", None) or torch.bfloat16
+        vocab_size = getattr(config, "vocab_size", 256)
+        hidden_size = getattr(config, "hidden_size", 256)
+        num_layers = getattr(config, "num_layers", 0)
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size, device=device, dtype=dtype)
+        self.layers = nn.ModuleList(
+            _MellumDecoderLayer(config, device, dtype, layer_id=i) for i in range(num_layers)
+        )
+        eps = config.attrs.get("rms_norm_eps", 1e-6) if getattr(config, "attrs", None) else 1e-6
+        self.norm = nn.RMSNorm(hidden_size, eps=eps, dtype=dtype)
+        from freetoken.layers import LinearReplicated
+
+        self.lm_head = LinearReplicated(hidden_size, vocab_size, has_bias=False, dtype=dtype)
+        # No offload/CPU/hybrid MoE backend yet (see iter_weights); always
+        # fused/in-VRAM, so the engine's offload plumbing must see this model
+        # as never eligible for it.
+        self.moe_offload = False
+        self.moe_cache = None
+        self.moe_layer_id = None
+        if self.device.type != "cpu":
+            self.to(self.device)
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, out_loc: torch.Tensor) -> torch.Tensor:
+        """Run one engine step; return the **last-position** logits ``[bs, V]``."""
+        from freetoken.core import get_global_ctx
+
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        reqs = batch.reqs
+        num_tokens = input_ids.shape[0]
+
+        hidden = self.embed_tokens(input_ids)  # [num_tokens, hidden]
+        out = torch.empty((batch.size, self.config.hidden_size), device=hidden.device, dtype=hidden.dtype)
+
+        offset = 0
+        extend_lens = batch.extend_lens
+        if extend_lens is None:
+            prefill = batch.is_prefill or (num_tokens > batch.size)
+            extend_lens = [req.extend_len if prefill else 1 for req in reqs]
+        is_decode_batch = batch.phase == "decode"
+        for i, req in enumerate(reqs):
+            ext = 1 if is_decode_batch else int(extend_lens[i])
+            token_slice = slice(offset, offset + ext)
+            h = hidden[token_slice]
+            for layer in self.layers:
+                h = layer(h, positions[token_slice], req.table_idx, ctx, batch)
+            out[i] = self.norm(h)[-1]
+            offset += ext
+
+        return self.lm_head(out)
+
+
+__all__ = [
+    "MellumAttention",
+    "mellum_moe_router",
+    "parse_config",
+    "iter_weights",
+    "MellumForCausalLM",
+]
