@@ -329,3 +329,48 @@ def test_engine_generate_with_yarn_rope_scaling(tmp_path):
     vocab = engine.config.model_config.vocab_size
     assert len(generated[0]) == 3
     assert all(0 <= t < vocab for t in generated[0])
+
+
+def test_write_kv_uses_physical_pool_slots_not_logical_positions(tmp_path):
+    """Same real bug class fixed in qwen3/qwen3_moe (#234, commit dbb1b6b):
+    ``write_kv``'s third argument is ``out_loc`` -- PHYSICAL pool slots --
+    not logical token positions. These only coincide under an identity page
+    table (this file's other tests all use the default engine-built pool);
+    the real per-request allocator (``MHAKVCache``) reserves slot 0 as a
+    dummy/padding slot, so a real request's first token never lands on slot
+    0 -- positions and slots are never the same number on real hardware.
+    ``_DeepseekV2LiteMLA.forward`` passed raw ``positions`` directly here,
+    identical to the bug #234 found and fixed in ``qwen3``/``qwen3_moe``.
+
+    Pins the fix directly: after a real Engine's real per-request slot
+    allocation, the ``out_loc`` argument ``write_kv`` actually receives must
+    be the physical page-table slots, not the raw logical positions.
+    """
+    model_path = _write_tiny_checkpoint(tmp_path)
+    engine = Engine(_engine_config(model_path, device=DEVICE))
+
+    captured = {}
+    pool = engine.ctx.kv_cache
+    orig_pool_write_kv = pool.write_kv
+
+    def spy_write_kv(k, v, out_loc, layer_id=0):
+        if layer_id == 0 and "out_loc" not in captured:
+            captured["out_loc"] = out_loc.clone()
+        return orig_pool_write_kv(k, v, out_loc, layer_id)
+
+    pool.write_kv = spy_write_kv
+    try:
+        _add_prompt(engine, output_len=1)
+        engine.generate()
+    finally:
+        pool.write_kv = orig_pool_write_kv
+
+    table_idx = 0
+    positions = torch.arange(3)  # the prompt is 3 tokens, see _add_prompt
+    expected_slots = engine.ctx.page_table[table_idx, positions.long()]
+
+    # A real request's first token never lands on the reserved slot 0 --
+    # confirms the allocator genuinely isn't identity for this run.
+    assert 0 not in expected_slots.tolist()
+    assert captured["out_loc"].equal(expected_slots)
+    assert not captured["out_loc"].equal(positions)
