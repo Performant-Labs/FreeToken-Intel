@@ -261,14 +261,22 @@ class _Qwen3Attention(nn.Module):
     def _rope(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         # x: [H, N, D] (head-major); pos: [N] absolute positions (rotate_half RoPE).
         # The token dim is the *middle* one here, so the per-token cos/sin must index dim 1.
+        #
+        # Half-split (rotate_half), NOT interleaved -- matches the ``cos``/``sin``
+        # ``cat(freqs, freqs)`` layout below and the real HF Qwen3 convention
+        # (confirmed against a real downloaded checkpoint's generated text on
+        # this port's own qwen3 dense sibling, which had this exact bug: the
+        # previous ``x[..., ::2]``/``x[..., 1::2]`` interleaved split did not
+        # match this cos/sin layout and produced degenerate/wrong output. See
+        # qwen3_5_moe's own ``_rotate_half``, which already documents this is
+        # NOT the interleaved variant.
         freqs = torch.outer(pos.to(torch.float32), self.inv_freq)  # [N, D/2]
-        # Expand to the full head dim [N, D] (interleaved (x, y) pairs) and
-        # place it on the token (middle) dim so it broadcasts over [H, N, D].
         emb = torch.cat((freqs, freqs), dim=-1)  # [N, D]
         cos = emb.cos()[None, :, :]  # [1, N, D]
         sin = emb.sin()[None, :, :]  # [1, N, D]
         x_f = x.to(torch.float32)
-        x1, x2 = x_f[..., ::2], x_f[..., 1::2]
+        half = x_f.shape[-1] // 2
+        x1, x2 = x_f[..., :half], x_f[..., half:]
         rotated = torch.cat((-x2, x1), dim=-1)
         return (x_f * cos + rotated * sin).to(x.dtype)
 
@@ -302,12 +310,23 @@ class _Qwen3Attention(nn.Module):
         v = self.v_proj(hidden_states).view(bsz, self.num_kv_heads, self.head_dim).transpose(0, 1)
         q = self._rope(self.q_norm(q), positions)
         k = self._rope(self.k_norm(k), positions)
-        # Append this request's K/V to the pool. ``positions`` here is this
-        # request's token positions (the decoder layer passed
-        # positions[token_slice]); the new token's out_loc slot equals its
-        # absolute position under the identity page table, so index out_loc by
-        # this request's positions rather than the whole-batch out_loc.
-        ctx.kv_cache.write_kv(k, v, positions, self.layer_id)
+        # Append this request's K/V to the pool. write_kv's third argument is
+        # out_loc -- PHYSICAL pool slots, not logical token positions. These
+        # only coincide under an identity page table; MHAKVCache's real
+        # per-request free-list allocator is NOT identity (slot 0 is a
+        # reserved dummy/padding slot, so the first real token of any
+        # request lands on slot >= 1, never slot 0 -- see
+        # kvcache/mha_pool.py). The previous "identity page table" comment
+        # here documented a real, incorrect assumption: passing raw
+        # `positions` silently wrote every token to the wrong slot on real
+        # hardware (confirmed via a `read_kv` == pre-write `v` round-trip
+        # check on qwen3's identical pattern, which failed only under
+        # MHAKVCache, not the identity-mapped BaseKVCachePool used in
+        # isolated/synthetic tests -- which is why this was never caught
+        # against a synthetic fixture). Translate positions -> slots via the
+        # page table, exactly as read_kv already does internally.
+        out_loc = ctx.page_table[table_idx, positions.long()]
+        ctx.kv_cache.write_kv(k, v, out_loc, self.layer_id)
         # ``table_idx`` identifies *this* request (the decoder layer runs each
         # request's layers on its own hidden slice, so q/k/v hold only this
         # request's new tokens, not the whole batch's). The backend uses it to
