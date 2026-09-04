@@ -32,6 +32,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     # disambiguate from any future DeepSeek-V2-Chat/-236B port).
     "DeepseekV2ForCausalLM": ModelSpec("freetoken.models.deepseek_v2_lite", "DeepseekV2LiteForCausalLM"),
     "GptOssForCausalLM": ModelSpec("freetoken.models.gpt_oss", "GptOssForCausalLM"),
+    "OlmoeForCausalLM": ModelSpec("freetoken.models.olmoe", "OlmoeForCausalLM"),
     "Glm4MoeForCausalLM": ModelSpec("freetoken.models.glm4_moe", "Glm4MoeForCausalLM"),
     "GlmMoeDsaForCausalLM": ModelSpec("freetoken.models.glm_moe_dsa", "GlmMoeDsaForCausalLM"),
     # Qwen4ExpForCausalLM is the real registered class upstream builds
