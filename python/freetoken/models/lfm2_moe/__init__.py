@@ -11,11 +11,15 @@ Fill in: GitHub issues `models-lfm2moe-conv` (#230), `models-lfm2moe-attn-moe`
 (#231), `models-lfm2moe-e2e` (#232) -- one package, built up incrementally
 (this port's established one-``__init__.py``-per-model convention).
 
-This file currently ships #230 only: ``parse_config`` (real) and the short
-gated-conv layer primitive (``ShortConv`` / ``short_conv_forward``) below.
-``iter_weights``/``Lfm2MoeForCausalLM`` stay stubs (``unimplemented``) until
-#232 wires the full model -- the conv primitive is unit-tested standalone
-in the meantime (see ``tests/test_models_lfm2moe_conv.py``).
+Issues #230 (conv) and #231 (attention + router) shipped the standalone
+primitives; #232 (this file's current state) wires them into the full
+model: the hybrid decoder layer (conv OR attention per ``layer_types``,
+dense-vs-MoE split per ``num_dense_layers``), the stateful conv-forward
+path (per-request left-context rings), the causal-LM wrapper, and the
+real ``iter_weights`` (checkpoint-key normalization + tied-``lm_head``
+synthesis). Real-checkpoint validation against
+``LiquidAI/LFM2.5-8B-A1B-Base`` is sequenced separately by the parent
+session (deliberately out of scope here, per the issue's own body).
 
 ## Hybrid backbone
 
@@ -61,7 +65,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from freetoken._stub import unimplemented
 from freetoken.models.config import ModelConfig
 
 
@@ -129,8 +132,83 @@ def parse_config(hf_config: Any, model_path: str | None = None, **_kwargs) -> Mo
     return cfg
 
 
-def iter_weights(*args, **kwargs):
-    unimplemented("iter_weights", "models-lfm2moe-e2e")
+def iter_weights(
+    model_path: str,
+    device: torch.device,
+    *,
+    include_moe_experts: bool = True,
+    include_non_moe: bool = True,
+):
+    """Yield the checkpoint's tensors (names normalized to this port's module
+    tree), each on its destination device.
+
+    Three real normalizations against the raw HF ``Lfm2MoeForCausalLM``
+    layout, all confirmed from the real checkpoint family (the
+    ``LiquidAI/LFM2.5-8B-A1B`` HF ``modeling_lfm2_moe.py`` + its
+    ``base_model_ep_plan``), not assumed:
+
+    * the FFN block is spelled ``feed_forward`` in the checkpoint but
+      ``mlp`` in this port's module tree (and in the loader's expert-bank
+      streamer, whose key parser ``_expert_source_info`` anchors on the
+      ``mlp`` token -- renaming here is what routes the fused
+      ``experts.gate_up_proj``/``down_proj`` tensors into the packed banks);
+    * the depthwise conv filter is a real ``nn.Conv1d`` weight
+      ``conv.conv.weight`` ``[hidden, 1, kernel]`` in the checkpoint but a
+      flat ``conv.conv_weight`` ``[hidden, kernel]`` parameter on this
+      port's :class:`ShortConv` (same for the optional bias);
+    * ``tie_word_embeddings: true`` checkpoints (the real
+      ``LFM2.5-8B-A1B-Base`` is one) ship no ``lm_head.weight`` key at all
+      -- synthesize it from ``embed_tokens.weight`` (the same real failure
+      mode ``qwen3``/``qwen3_moe``/``mellum`` guard against: an unfilled
+      ``lm_head`` silently zeros every logit).
+
+    ``include_moe_experts``/``include_non_moe`` are NOT no-ops (see
+    ``mellum.iter_weights``'s own comment on the identical trap): the
+    loader's expert-bank builder streams this generator with
+    ``include_non_moe=False`` (expert tensors only) and the dense pass
+    with ``include_moe_experts=False``. The expert filter keys on
+    ``.experts.`` AFTER the ``feed_forward`` -> ``mlp`` rename.
+
+    One deliberate no-op: the real checkpoint family may persist the
+    zero-initialized ``expert_bias`` buffer (``use_expert_bias: true``) as
+    a ``feed_forward.expert_bias`` tensor. This port's router holds that
+    buffer at ``mlp.gate.expert_bias``, so a checkpoint key never matches
+    and ``_place`` silently skips it -- correct here because the HF buffer
+    is zero-initialized and never trained (no gradient path through a
+    buffer), so its saved value is always exactly the zeros this port's
+    own buffer already holds.
+    """
+    from freetoken.models.weight import iter_safetensors
+
+    embed_tokens_weight = None
+    saw_lm_head = False
+    for name, tensor in iter_safetensors(model_path, device):
+        if ".feed_forward." in name:
+            name = name.replace(".feed_forward.", ".mlp.")
+        if name.endswith(".conv.conv.weight"):
+            # [hidden, 1, kernel] (nn.Conv1d) -> [hidden, kernel] (ShortConv).
+            tensor = tensor.reshape(tensor.shape[0], tensor.shape[-1])
+            name = name[: -len(".conv.conv.weight")] + ".conv.conv_weight"
+        elif name.endswith(".conv.conv.bias"):
+            name = name[: -len(".conv.conv.bias")] + ".conv.conv_bias"
+        is_expert = ".experts." in name
+        if is_expert and not include_moe_experts:
+            continue
+        if not is_expert and not include_non_moe:
+            continue
+        placed = tensor.to(device)
+        if name == "model.embed_tokens.weight":
+            embed_tokens_weight = placed
+        elif name == "lm_head.weight":
+            saw_lm_head = True
+        yield name, placed
+
+    if include_non_moe and not saw_lm_head and embed_tokens_weight is not None:
+        from freetoken.utils import cached_load_hf_config
+
+        hf_config = cached_load_hf_config(model_path)
+        if bool(getattr(hf_config, "tie_word_embeddings", False)):
+            yield "lm_head.weight", embed_tokens_weight
 
 
 # --------------------------------------------------------------------------- #
@@ -172,12 +250,46 @@ class ShortConv(nn.Module):
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=has_bias, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """``x [T, hidden] -> [T, hidden]``."""
+        """``x [T, hidden] -> [T, hidden]`` (stateless: left zero-padding)."""
         bcx = self.in_proj(x).transpose(0, 1)  # [3*hidden, T]
         b, c, gx = bcx.chunk(3, dim=0)  # each [hidden, T]
         h = b * gx
         h = causal_depthwise_conv1d(h.unsqueeze(0), self.conv_weight, self.conv_bias, self.kernel_size).squeeze(0)
         y = c * h
+        return self.out_proj(y.transpose(0, 1))
+
+    def forward_stateful(self, x: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        """Chunked/stateful variant for the engine loop (#232).
+
+        ``x`` is this request's NEW tokens ``[T, hidden]`` (one engine step's
+        slice, not the whole sequence); ``state`` is this request's conv
+        left-context ring ``[hidden, kernel-1]`` -- the last ``kernel-1``
+        pre-conv gated activations -- updated IN PLACE (``copy_``). A fresh
+        sequence is expressed by the caller zeroing ``state`` first, which
+        reduces exactly to :meth:`forward`'s left zero-padding.
+
+        Same math as the real HF decode path (``causal_conv1d_update``):
+        concatenate the ring under the new activations, run the depthwise
+        conv with NO padding -- the output is exactly ``T`` positions, each
+        reading the ``kernel`` inputs ending at that position -- then keep
+        the last ``kernel-1`` columns as the new ring. Chunked prefill works
+        the same way (a continuation chunk's ring carries over from the
+        previous chunk).
+        """
+        bcx = self.in_proj(x).transpose(0, 1)  # [3*hidden, T]
+        b, c, gx = bcx.chunk(3, dim=0)  # each [hidden, T]
+        h = b * gx
+        km1 = self.kernel_size - 1
+        if km1:
+            full = torch.cat([state, h], dim=-1)  # [hidden, kernel-1+T]
+        else:
+            full = h
+        out = F.conv1d(
+            full.unsqueeze(0), self.conv_weight.unsqueeze(1), bias=self.conv_bias, groups=self.hidden_size
+        ).squeeze(0)  # [hidden, T]
+        if km1:
+            state.copy_(full[:, -km1:])
+        y = c * out
         return self.out_proj(y.transpose(0, 1))
 
 
@@ -367,16 +479,329 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Not yet implemented: full model wiring (#232).
+# Full model wiring (#232).
+#
+# Ground truth: ``Lfm2MoeDecoderLayer``/``Lfm2MoeModel``/``Lfm2MoeForCausalLM``
+# in the real ``modeling_lfm2_moe.py``, read directly. Real structural facts
+# (not the issue text's guesses):
+#
+# * the per-layer norms are ``operator_norm`` (pre-operator) and ``ffn_norm``
+#   (pre-FFN) -- NOT ``input_layernorm``/``post_attention_layernorm``;
+# * the FINAL norm (applied after the layer stack, before ``lm_head``) is
+#   named ``embedding_norm`` (``model.embedding_norm.weight`` in the
+#   checkpoint) -- despite the name it normalizes the stack OUTPUT, not the
+#   embedding input;
+# * the dense MLP (first ``num_dense_layers`` layers) is a plain SwiGLU with
+#   ``w1``/``w3``/``w2`` and ``intermediate_size`` (7168 on the real
+#   LFM2.5-8B-A1B), NOT the MoE intermediate size;
+# * a conv layer and an attention layer share the SAME residual shape
+#   (``h + op(operator_norm(h))`` then ``h + ffn(ffn_norm(h))``) -- only the
+#   operator module differs.
+#
+# The module tree deliberately names the FFN attribute ``mlp`` (the
+# checkpoint says ``feed_forward``; ``iter_weights`` renames) so the loader's
+# fused-expert placement (``_place_expert_weights``, which hard-codes
+# ``layers.{i}.mlp.experts.{e}.{gate,up,down}_proj`` per-expert modules)
+# works unchanged -- the same module-shape contract every other fused-only
+# model here (mellum, glm4_moe, gpt_oss) already satisfies. The routed
+# experts are therefore per-expert ``nn.Linear`` modules (fed from the packed
+# banks), while the #231-tested fused-3D ``Lfm2MoeExperts`` stays as the
+# byte-for-byte HF-reference primitive. The router IS reused directly
+# (#231's own ``Lfm2MoeTopKRouter``, ``weight`` param path
+# ``mlp.gate.weight`` matching the checkpoint after the rename).
 # --------------------------------------------------------------------------- #
 
 
-class Lfm2MoeForCausalLM:
-    def __init__(self, *args, **kwargs) -> None:
-        pass
+class _ConvStatePool:
+    """Per-request conv left-context rings: one ``[hidden, kernel-1]`` tensor
+    per (conv layer, request slot), lazily grown.
 
-    def forward(self, *args, **kwargs):
-        unimplemented("Lfm2MoeForCausalLM.forward", "models-lfm2moe-e2e")
+    The model owns this (it knows the layer count and per-request shapes);
+    slots are indexed by the request's ``linear_slot_idx`` (falling back to
+    ``table_idx``, mirroring ``qwen3_5_moe``'s own default 1:1 GDN-state
+    pool). A slot's ring is zeroed by the decoder layer whenever a slice
+    starts at position 0 (a fresh sequence), so a recycled table row never
+    leaks the previous request's context into the new one.
+    """
+
+    def __init__(self) -> None:
+        self._layers: dict[int, list[torch.Tensor]] = {}
+
+    def register(self, layer_id: int, num_slots: int, hidden: int, km1: int, device, dtype) -> None:
+        self._layers[layer_id] = [
+            torch.zeros(hidden, km1, device=device, dtype=dtype) for _ in range(num_slots)
+        ]
+
+    def get(self, layer_id: int, slot: int) -> torch.Tensor:
+        entries = self._layers.get(layer_id)
+        if entries is None:
+            raise KeyError(f"conv-state pool: conv layer {layer_id} not registered")
+        while slot >= len(entries):
+            # Lazily grow for a request admitted after the pool was sized.
+            entries.append(torch.zeros_like(entries[-1]))
+        return entries[slot]
+
+
+class _Lfm2MoeDenseMLP(nn.Module):
+    """Real HF ``Lfm2MoeMLP``: SwiGLU with ``w1``/``w3``/``w2`` (checkpoint
+    key spelling preserved) and the DENSE ``intermediate_size``."""
+
+    def __init__(self, config: ModelConfig, dtype) -> None:
+        super().__init__()
+        self.w1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, dtype=dtype)
+        self.w3 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, dtype=dtype)
+        self.w2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class _Lfm2MoeExpert(nn.Module):
+    """One routed expert: SwiGLU gate/up/down (fused/in-VRAM only, fed from
+    the loader's packed banks via ``_place_expert_weights``)."""
+
+    def __init__(self, config: ModelConfig, dtype) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False, dtype=dtype)
+        self.up_proj = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False, dtype=dtype)
+        self.down_proj = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _Lfm2MoeMoE(nn.Module):
+    """Router + resident experts for one MoE layer (#232 wiring).
+
+    Routing math is #231's own ``Lfm2MoeTopKRouter`` reused directly
+    (sigmoid top-k, optional selection-only bias, renorm, scaling factor --
+    see its own docstring); the experts dispatch with the host-side
+    per-expert loop this port uses everywhere (a bool-tensor ``nonzero()``
+    on this torch/XPU build silently returns empty -- see ``mellum``'s own
+    comment on the same confirmed bug)."""
+
+    def __init__(self, config: ModelConfig, device, dtype) -> None:
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.gate = Lfm2MoeTopKRouter(config, dtype)
+        self.experts = nn.ModuleList(
+            _Lfm2MoeExpert(config, dtype).to(device, dtype) for _ in range(self.num_experts)
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        in_shape = hidden_states.shape
+        flat = hidden_states.reshape(-1, in_shape[-1])  # [T, hidden]
+        selected_experts, topk_weights = self.gate(flat)
+
+        out = torch.zeros_like(flat)
+        selected_host = selected_experts.to("cpu")
+        for e in range(self.num_experts):
+            token_rows, k_slots = (selected_host == e).nonzero(as_tuple=True)
+            if token_rows.numel() == 0:
+                continue
+            token_rows = token_rows.to(flat.device)
+            k_slots = k_slots.to(flat.device)
+            sel = flat.index_select(0, token_rows)
+            expert_out = self.experts[e](sel)
+            w = topk_weights[token_rows, k_slots].unsqueeze(-1)
+            out.index_add_(0, token_rows, expert_out * w)
+        return out.view(in_shape)
+
+
+class _Lfm2MoeDecoderLayer(nn.Module):
+    """One hybrid LFM2-MoE decoder layer.
+
+    ``layer_types[i]`` picks the operator: ``"full_attention"`` builds the
+    GQA module (#231), anything else (``"conv"``) the short conv (#230,
+    run through its stateful path with this request's ring). The FFN is a
+    dense MLP for the first ``num_dense_layers`` layers, the routed MoE for
+    the rest. Residual structure per the real HF forward::
+
+        h = h + op(operator_norm(h))
+        h = h + ffn(ffn_norm(h))
+    """
+
+    def __init__(self, config: ModelConfig, device, dtype, layer_id: int) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        layer_types = config.attrs.get("layer_types") or []
+        self.layer_type = layer_types[layer_id] if layer_id < len(layer_types) else "full_attention"
+        self.is_attention_layer = self.layer_type == "full_attention"
+        eps = config.attrs.get("norm_eps", 1e-5)
+        self.operator_norm = nn.RMSNorm(config.hidden_size, eps=eps, dtype=dtype)
+        self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=eps, dtype=dtype)
+        if self.is_attention_layer:
+            self.self_attn = Lfm2MoeAttention(config, device, dtype, layer_id)
+            self.conv = None
+        else:
+            self.self_attn = None
+            self.conv = ShortConv(
+                config.hidden_size,
+                int(config.attrs.get("conv_L_cache", 3)),
+                bool(config.attrs.get("conv_bias", False)),
+                dtype=dtype,
+            )
+        num_dense = int(config.attrs.get("num_dense_layers") or 0)
+        if layer_id < num_dense:
+            self.mlp = _Lfm2MoeDenseMLP(config, dtype)
+        else:
+            self.mlp = _Lfm2MoeMoE(config, device, dtype)
+        self.mlp.layer_id = layer_id
+
+    def forward(
+        self,
+        hidden_states,
+        positions,
+        table_idx,
+        ctx,
+        batch,
+        conv_slot_idx=None,
+        fresh_sequence: bool = False,
+    ):
+        residual = hidden_states
+        x = self.operator_norm(hidden_states)
+        if self.is_attention_layer:
+            hidden_states = self.self_attn(x, positions, table_idx, ctx, batch)
+        else:
+            pool = ctx.model.conv_state_pool
+            state = pool.get(self.layer_id, conv_slot_idx if conv_slot_idx is not None else table_idx)
+            if fresh_sequence:
+                # A recycled slot must not leak the previous request's ring
+                # into this one's first chunk -- zero it, which reduces
+                # exactly to the stateless left-zero-padding semantics.
+                state.zero_()
+            hidden_states = self.conv.forward_stateful(x, state)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        return residual + self.mlp(self.ffn_norm(hidden_states))
+
+
+def _xpu_available() -> bool:
+    try:
+        return bool(torch.xpu.is_available())
+    except Exception:
+        return False
+
+
+class Lfm2MoeForCausalLM(nn.Module):
+    """The LFM2(.5)-MoE model: embeddings + hybrid conv/attention layers +
+    ``embedding_norm`` final norm + ``lm_head``, with per-request conv-state
+    rings for the short-conv layers.
+
+    Subclasses ``nn.Module`` so its parameters are real registered
+    ``nn.Parameter``s the loader resolves via ``named_parameters()``
+    (structurally mirroring ``mellum.MellumForCausalLM``; fused/in-VRAM
+    experts only -- no offload/CPU/hybrid MoE backend yet, see
+    ``iter_weights`` and the loader's ``_CPU_MOE_CAPABLE_ARCHS`` fallback).
+    """
+
+    def __init__(self, config: ModelConfig, device=None) -> None:
+        super().__init__()
+        self.config = config
+        if device is None:
+            device = torch.device("xpu") if _xpu_available() else torch.device("cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
+        dtype = getattr(config, "dtype", None) or torch.bfloat16
+        self.dtype = dtype
+        vocab_size = getattr(config, "vocab_size", 256)
+        hidden_size = getattr(config, "hidden_size", 256)
+        num_layers = getattr(config, "num_layers", 0)
+        eps = config.attrs.get("norm_eps", 1e-5) if getattr(config, "attrs", None) else 1e-5
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size, device=device, dtype=dtype)
+        self.layers = nn.ModuleList(
+            _Lfm2MoeDecoderLayer(config, device, dtype, layer_id=i) for i in range(num_layers)
+        )
+        # The FINAL norm (the real HF name -- ``model.embedding_norm.weight``;
+        # it normalizes the stack output despite the name).
+        self.embedding_norm = nn.RMSNorm(hidden_size, eps=eps, dtype=dtype)
+        from freetoken.layers import LinearReplicated
+
+        self.lm_head = LinearReplicated(hidden_size, vocab_size, has_bias=False, dtype=dtype)
+        # No offload/CPU/hybrid MoE backend yet: the engine's offload
+        # plumbing must see this model as never eligible for it (the
+        # loader's _CPU_MOE_CAPABLE_ARCHS gate then falls back to fused
+        # expert placement -- the same deliberate scope cut as mellum).
+        self.moe_offload = False
+        self.moe_cache = None
+        self.moe_layer_id = None
+        # Per-request conv left-context rings (see _ConvStatePool). Sized
+        # from the engine's max_running_req when stashed in attrs; lazily
+        # grown either way, so any admission pattern is handled.
+        max_slots = int(config.attrs.get("max_running_req") or 8)
+        self.conv_state_pool = _ConvStatePool()
+        self._register_conv_pool(max_slots)
+        if self.device.type != "cpu":
+            self.to(self.device)
+
+    def _register_conv_pool(self, num_slots: int) -> None:
+        """(Re)size the conv-state pool for ``num_slots`` requests."""
+        self.conv_state_pool = _ConvStatePool()
+        for layer in self.layers:
+            if layer.conv is not None:
+                self.conv_state_pool.register(
+                    layer.layer_id,
+                    num_slots,
+                    layer.conv.hidden_size,
+                    layer.conv.kernel_size - 1,
+                    self.device,
+                    self.dtype,
+                )
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, out_loc: torch.Tensor) -> torch.Tensor:
+        """Run one engine step; return the **last-position** logits ``[bs, V]``.
+
+        Mirrors the established per-model engine contract (``mellum`` /
+        ``qwen3_5_moe``): each request's new-token slice runs through every
+        layer (conv layers via their stateful path with this request's ring,
+        attention layers through the paged-KV pool), and only the last
+        position's post-``embedding_norm`` hidden state feeds ``lm_head``.
+        """
+        from freetoken.core import get_global_ctx
+
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        reqs = batch.reqs
+        num_tokens = input_ids.shape[0]
+
+        # The conv layers read their per-request ring from the model's own
+        # pool, indexed by the request's linear_slot_idx (the same field
+        # qwen3_5_moe's GDN layers use; the hybrid engine path may assign
+        # one, the default is 1:1 with table_idx).
+        for req in reqs:
+            if req.linear_slot_idx is None:
+                req.linear_slot_idx = req.table_idx
+
+        hidden = self.embed_tokens(input_ids)  # [num_tokens, hidden]
+        out = torch.empty((batch.size, self.config.hidden_size), device=hidden.device, dtype=hidden.dtype)
+
+        offset = 0
+        extend_lens = batch.extend_lens
+        if extend_lens is None:
+            prefill = batch.is_prefill or (num_tokens > batch.size)
+            extend_lens = [req.extend_len if prefill else 1 for req in reqs]
+        is_decode_batch = batch.phase == "decode"
+        for i, req in enumerate(reqs):
+            ext = 1 if is_decode_batch else int(extend_lens[i])
+            token_slice = slice(offset, offset + ext)
+            h = hidden[token_slice]
+            pos = positions[token_slice]
+            # A slice starting at position 0 is a fresh sequence: zero the
+            # conv rings for this slot so a recycled table row never leaks
+            # the previous request's context. (Prefill continuations and
+            # decode steps start past 0 and carry the ring forward.) A
+            # prefix-cache hit that skips earlier positions would need its
+            # ring restored, not zeroed -- same known gap as qwen3_5_moe's
+            # default pool; out of scope here (no prefix caching wired for
+            # this model yet).
+            fresh = bool(pos.numel() and int(pos[0].item()) == 0)
+            for layer in self.layers:
+                h = layer(h, pos, req.table_idx, ctx, batch, conv_slot_idx=req.linear_slot_idx, fresh_sequence=fresh)
+            out[i] = self.embedding_norm(h)[-1]
+            offset += ext
+
+        return self.lm_head(out)
 
 
 __all__ = [
