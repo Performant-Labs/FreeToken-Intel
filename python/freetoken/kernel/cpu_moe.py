@@ -323,6 +323,8 @@ def _as_c_bf16_bits_ptr(t: torch.Tensor):
     #257: this is how the raw bf16 bytes cross the ctypes boundary with no
     float32 materialization anywhere on the way.
     """
+    import torch  # lazy: torch is an optional extra, see the top-of-file note
+
     t = t.contiguous()
     if t.dtype != torch.bfloat16:
         raise TypeError(f"expected a bfloat16 tensor, got {t.dtype}")
