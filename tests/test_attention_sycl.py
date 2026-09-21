@@ -5,6 +5,9 @@ Two halves:
 * CPU-safe (the per-PR ``ci`` job, torch-free): the backend imports and registers
   cleanly, and ``sycl`` is wired as a spec-consuming backend (the kernel needs
   ``attn_spec.sliding_window`` for SWA). These touch no torch and run on any box.
+  This half also covers ``_kv_is_bf16`` (issue #259, attn-sycl-bf16-abi): plain
+  torch-dtype logic with no XPU/kernel dependency, so it is unit-testable here
+  too (torch-required, like the rest of this "CPU-safe" half, but no XPU).
 
 * ``xpu``-marked (the B70 nightly, ``.venv-xpu``): the backend actually compiles
   ``attention.cpp`` and drives the kernel. The correctness bar is that a dummy-
@@ -18,6 +21,12 @@ Two halves:
   which desyncs torch's XPU stream, so a torch reference computed on the XPU
   *after* the kernel read stale USM and would falsely "diverge". A CPU reference
   is on a different, unaffected device, so the comparison is sound.
+
+  ``test_sycl_backend_matches_reference_random_weights_on_xpu`` is parametrized
+  over ``dtype_name`` (``float32`` / ``bfloat16``, issue #259): every fixture in
+  this file used to be float32-only, which is exactly what let the kernel's old
+  ``const float*``-only ABI silently misread a real (bf16-default) KV pool
+  without any test noticing. The bf16 case is the regression test for that.
 """
 from __future__ import annotations
 
@@ -53,6 +62,48 @@ def test_sycl_backend_registered_with_spec_consumption():
     assert info.consumes_attn_spec  # the kernel needs attn_spec.sliding_window for SWA
     assert AttnType.SWA in info.supported_types
     assert AttnType.FULL in info.supported_types
+
+
+# --- Issue #259 (attn-sycl-bf16-abi): pure dtype-handling logic -------------
+#
+# `_kv_is_bf16` is the one place forward() decides which kernel template
+# instantiation (KVT=float vs. KVT=uint16_t, see attention.cpp) a call will
+# hit. It is plain torch-dtype logic with no XPU/kernel dependency, so it is
+# unit-testable without the oneAPI toolchain or an XPU device -- exactly the
+# class of dtype/ABI mismatch this issue exists to stop hiding behind a
+# synthetic, float32-only test fixture (the module docstring's "CPU-safe"
+# half already establishes the pattern: torch-required, XPU-not-required).
+
+
+def test_kv_is_bf16_selects_float32_path():
+    pytest.importorskip("torch")
+    import torch as _torch
+
+    from freetoken.attention.sycl import _kv_is_bf16
+
+    assert _kv_is_bf16(_torch.float32) == 0
+
+
+def test_kv_is_bf16_selects_bf16_path():
+    pytest.importorskip("torch")
+    import torch as _torch
+
+    from freetoken.attention.sycl import _kv_is_bf16
+
+    assert _kv_is_bf16(_torch.bfloat16) == 1
+
+
+def test_kv_is_bf16_rejects_unsupported_dtype():
+    """A KV pool dtype the kernel has no widen path for (e.g. float16) must be
+    a loud, explicit rejection -- not a silent pointer-arithmetic misread the
+    pre-fix const-float*-only ABI was for bf16 (this issue's whole point)."""
+    pytest.importorskip("torch")
+    import torch as _torch
+
+    from freetoken.attention.sycl import _kv_is_bf16
+
+    with pytest.raises(AssertionError):
+        _kv_is_bf16(_torch.float16)
 
 
 def test_sycl_backend_raises_without_xpu_on_first_use(monkeypatch):
@@ -161,7 +212,7 @@ def _write_tiny_checkpoint(tmp_path, *, random: bool = False) -> str:
     return str(model_path)
 
 
-def _engine_config(model_path, *, device, attention_backend, dummy_weight: bool = True):
+def _engine_config(model_path, *, device, attention_backend, dummy_weight: bool = True, dtype=None):
     import torch
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
@@ -169,7 +220,7 @@ def _engine_config(model_path, *, device, attention_backend, dummy_weight: bool 
     return EngineConfig(
         model_path=model_path,
         tp_info=DistributedInfo(0, 1),
-        dtype=torch.float32,
+        dtype=dtype if dtype is not None else torch.float32,
         device=device,
         attention_backend=attention_backend,
         max_running_req=2,
@@ -275,7 +326,8 @@ def test_sycl_backend_multi_request_decode_on_xpu(tmp_path):
 
 
 @pytest.mark.xpu
-def test_sycl_backend_matches_reference_random_weights_on_xpu(tmp_path):
+@pytest.mark.parametrize("dtype_name", ["float32", "bfloat16"])
+def test_sycl_backend_matches_reference_random_weights_on_xpu(tmp_path, dtype_name):
     """Non-zero weights: a K/V-slot off-by-one changes the logits and the tokens.
 
     The two tests above use zeroed weights, under which *every* KV slot reads
@@ -286,6 +338,16 @@ def test_sycl_backend_matches_reference_random_weights_on_xpu(tmp_path):
     fires. Multi-step decode (output_len=5) is required: the slot layout only
     differs from a correct one once a request attends over a multi-token history
     (kv_len > 1).
+
+    Parametrized over ``dtype_name`` (issue #259, attn-sycl-bf16-abi): the
+    ``bfloat16`` case is this issue's whole point -- ``engine.py`` defaults a
+    real model's KV pool to bf16, and the pre-fix kernel's ``const float*``-
+    only ABI silently reinterpreted that 2-byte storage as 4-byte float32
+    (wrong element size, wrong strides, corrupted output), a bug this suite
+    could never catch while every fixture here was float32-only. With the
+    dtype-templated kernel (KVT=uint16_t widened in-register, see
+    attention.cpp), the bf16 run must match the reference exactly as the
+    float32 run always did.
 
     The reference runs on the XPU (not the CPU) on purpose: with random weights
     the model's *non-attention* ops (RMSNorm / MoE / RoPE) round differently on
@@ -299,6 +361,7 @@ def test_sycl_backend_matches_reference_random_weights_on_xpu(tmp_path):
     import torch
 
     assert torch.xpu.is_available()
+    dtype = getattr(torch, dtype_name)
     model_path = _write_tiny_checkpoint(tmp_path, random=True)
 
     from freetoken.core import reset_global_ctx
@@ -307,17 +370,22 @@ def test_sycl_backend_matches_reference_random_weights_on_xpu(tmp_path):
     # Reference (correctness bar) on the XPU -- see the docstring for why a CPU
     # reference is the wrong bar for non-zero weights.
     reset_global_ctx()
-    ref_engine = Engine(_engine_config(model_path, device="xpu", attention_backend="auto", dummy_weight=False))
+    ref_engine = Engine(
+        _engine_config(model_path, device="xpu", attention_backend="auto", dummy_weight=False, dtype=dtype)
+    )
     _add_prompt(ref_engine, output_len=5, prompt_ids=[1, 2, 3])
     ref_tokens = ref_engine.generate()
     reset_global_ctx()
 
-    sycl_engine = Engine(_engine_config(model_path, device="xpu", attention_backend="sycl", dummy_weight=False))
+    sycl_engine = Engine(
+        _engine_config(model_path, device="xpu", attention_backend="sycl", dummy_weight=False, dtype=dtype)
+    )
     _add_prompt(sycl_engine, output_len=5, prompt_ids=[1, 2, 3])
     sycl_tokens = sycl_engine.generate()
     reset_global_ctx()
 
     assert len(sycl_tokens) == 1
     assert sycl_tokens == ref_tokens, (
-        f"SYCL attention diverged from the reference under random weights: {sycl_tokens} != {ref_tokens}"
+        f"SYCL attention ({dtype_name}) diverged from the reference under random weights: "
+        f"{sycl_tokens} != {ref_tokens}"
     )
