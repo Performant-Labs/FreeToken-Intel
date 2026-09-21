@@ -127,6 +127,29 @@ def iter_safetensors(model_path: str, device: torch.device | str = "cpu"):
                 yield name, f.get_tensor(name)
 
 
+def _iter_weights_fn(model_path: str, spec):
+    """Resolve the ``iter_weights`` function to actually stream ``model_path``'s
+    tensors with.
+
+    ``spec`` (from :func:`_spec_for_model_path`) names the *model class*'s own
+    module (e.g. ``freetoken.models.qwen3_moe``) -- correct for
+    ``spec.model_cls``, but NOT for tensor iteration when the checkpoint is
+    GGUF (issue #273): the registry maps *architecture* to model class, never
+    checkpoint *format* to reader, so a GGUF checkpoint of a
+    ``Qwen3MoeForCausalLM``-architecture model still resolves ``spec.module``
+    to ``qwen3_moe`` (which only knows how to read safetensors). Route to
+    ``freetoken.models.gguf.iter_weights`` directly for a GGUF path instead of
+    trusting ``spec.iter_weights``.
+    """
+    from freetoken.models.gguf import is_gguf_path
+
+    if is_gguf_path(model_path):
+        from freetoken.models.gguf import iter_weights as gguf_iter_weights
+
+        return gguf_iter_weights
+    return _load_attr(spec.module, spec.iter_weights)
+
+
 def load_weight(
     model_path: str,
     device: torch.device,
@@ -136,12 +159,15 @@ def load_weight(
     """Yield the checkpoint's tensors, each on its destination device.
 
     Dense tensors are yielded on ``device`` (the XPU); MoE expert tensors are
-    yielded on host memory (offloaded). Dispatches to the model's
-    ``iter_weights`` with the destination device. The FTW / GGUF branches of the
-    upstream loader are not part of this port and are out of scope.
+    yielded on host memory (offloaded). Dispatches to the checkpoint's real
+    tensor reader (:func:`_iter_weights_fn` -- ``freetoken.models.gguf
+    .iter_weights`` for a GGUF checkpoint, issue #273; the target
+    architecture's own ``iter_weights`` otherwise) with the destination
+    device. The FTW branch of the upstream loader is not part of this port
+    and remains out of scope.
     """
     _config, spec = _spec_for_model_path(model_path)
-    iter_weights = _load_attr(spec.module, spec.iter_weights)
+    iter_weights = _iter_weights_fn(model_path, spec)
     yield from iter_weights(
         model_path,
         device,
@@ -183,7 +209,7 @@ def load_moe_expert_sources(
         raise ValueError(f"{config.architectures[0]} does not provide MoE expert source loading")
     if dummy:
         return dummy_moe_expert_sources(config, dtype=dtype)
-    iter_weights = _load_attr(spec.module, spec.iter_weights)
+    iter_weights = _iter_weights_fn(model_path, spec)
     src = iter_weights(
         model_path,
         torch.device("cpu"),
@@ -228,7 +254,19 @@ def checkpoint_quant_method(model_path: str) -> Optional[str]:
     """``quantization_config.quant_method`` from the checkpoint's own
     ``config.json`` (e.g. ``"gptq"``), or ``None`` for an unquantized
     checkpoint. Read directly from the raw HF config -- independent of
-    ``ModelConfig``/``parse_config``, which does not stash this today."""
+    ``ModelConfig``/``parse_config``, which does not stash this today.
+
+    A GGUF checkpoint (issue #273) has no ``config.json``/``quantization_
+    config`` at all -- its own per-tensor GGML quant type is resolved and
+    fully dequantized by ``freetoken.models.gguf.iter_weights`` before any
+    tensor is yielded, so from here on a GGUF-sourced bank is always plain
+    bf16, same as an unquantized checkpoint. ``None`` (not detected/
+    unsupported) is the correct answer, not an error.
+    """
+    from freetoken.models.gguf import is_gguf_path
+
+    if is_gguf_path(model_path):
+        return None
     hf_config = cached_load_hf_config(model_path)
     raw = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
     qc = raw.get("quantization_config")
@@ -312,6 +350,21 @@ def checkpoint_gptq_group_size(model_path: str) -> int:
 
 
 def _spec_for_model_path(model_path: str, use_offload_moe: bool = False):
+    # issue #273: GGUF checkpoints have no config.json -- cached_load_hf_config
+    # would fail outright. Route around the whole HF-config path when the
+    # checkpoint is GGUF, resolving the registry key from the file's own
+    # ``general.architecture`` metadata via GGUF_ARCH_TO_REGISTRY_KEY.
+    from freetoken.models.gguf import is_gguf_path
+
+    if is_gguf_path(model_path):
+        from freetoken.models.gguf import GGUF_ARCH_TO_REGISTRY_KEY, load_gguf_metadata
+        from freetoken.models.gguf import parse_config as gguf_parse_config
+
+        metadata = load_gguf_metadata(model_path)
+        arch = metadata.get("general.architecture")
+        spec = get_model_spec(GGUF_ARCH_TO_REGISTRY_KEY.get(arch, arch))
+        return gguf_parse_config(metadata, use_offload_moe=use_offload_moe), spec
+
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     parse_config = _load_attr(spec.module, spec.parse_config)

@@ -39,6 +39,41 @@ _CPU_MOE_CAPABLE_ARCHS = {
 }
 
 
+class _GgufConfigShim:
+    """Stands in for a real HF ``PretrainedConfig`` when ``model_path`` is a
+    GGUF checkpoint (issue #273), so the rest of ``load_model`` -- which
+    calls ``hf_config.architectures[0]`` and
+    ``parse_config(hf_config, use_offload_moe=..., ...)`` uniformly for
+    every architecture -- needs no further changes.
+
+    ``.architectures`` is resolved to this port's registry key (not the raw
+    GGUF architecture string) via ``GGUF_ARCH_TO_REGISTRY_KEY``, matching
+    what a real HF ``config.json``'s own ``architectures`` field would hold.
+    ``.to_dict()`` hands back the raw GGUF KV-metadata store; GGUF's own
+    ``parse_config`` (#272) accepts that directly (extended for this issue
+    to recognize any object exposing ``.to_dict()``, not just a plain dict
+    or a path string), so the loader's repeated ``parse_config(hf_config,
+    ...)`` re-parse calls work unchanged.
+    """
+
+    def __init__(self, metadata: dict, registry_key: str) -> None:
+        self._metadata = metadata
+        self.architectures = [registry_key]
+
+    def to_dict(self) -> dict:
+        return self._metadata
+
+
+def _load_hf_or_gguf_config(model_path: str):
+    from freetoken.models.gguf import GGUF_ARCH_TO_REGISTRY_KEY, is_gguf_path, load_gguf_metadata
+
+    if is_gguf_path(model_path):
+        metadata = load_gguf_metadata(model_path)
+        arch = metadata.get("general.architecture")
+        return _GgufConfigShim(metadata, GGUF_ARCH_TO_REGISTRY_KEY.get(arch, arch))
+    return cached_load_hf_config(model_path)
+
+
 def load_model(
     model_path: str,
     device: torch.device | str | None = None,
@@ -74,14 +109,27 @@ def load_model(
     if dtype is None:
         dtype = torch.bfloat16
 
-    hf_config = cached_load_hf_config(model_path)
+    from freetoken.models.gguf import is_gguf_path
+
+    _is_gguf = is_gguf_path(model_path)
+    hf_config = _load_hf_or_gguf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     # The offload flag is baked into the model config at parse time, but
     # resolving ``moe_backend="auto"`` (the default) needs to know whether the
     # model is a MoE -- which the config only exposes *after* parsing. So parse
     # once without offload, inspect the result, resolve the backend, and re-parse
     # only if the resolution flips the flag (the common ``auto``-on-XPU path).
-    parse_config = _load_attr(spec.module, spec.parse_config)
+    # issue #273: spec.module here is the *model class*'s own module (e.g.
+    # freetoken.models.qwen3_moe), resolved from the registry key -- correct
+    # for spec.model_cls / spec.iter_weights, but its OWN parse_config
+    # expects a real HF config (hf_config.to_dict()'s HF key spellings, e.g.
+    # "num_local_experts"), not the raw GGUF metadata this issue's
+    # _GgufConfigShim.to_dict() hands back. Use GGUF's own parse_config
+    # directly for a GGUF checkpoint instead of resolving it through spec.
+    if _is_gguf:
+        from freetoken.models.gguf import parse_config
+    else:
+        parse_config = _load_attr(spec.module, spec.parse_config)
     model_config = parse_config(hf_config, use_offload_moe=False, model_path=model_path)
     from freetoken.moe import parse_moe_cpu_layers, resolve_moe_backend
     from freetoken.moe.bench_profile import quant_format_for_dtype
