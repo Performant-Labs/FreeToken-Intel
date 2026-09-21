@@ -26,7 +26,7 @@ job, which builds directly on all of the above.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from freetoken._stub import unimplemented
 from freetoken.models.config import ModelConfig
@@ -63,6 +63,7 @@ __all__ = [
     "parse_config",
     "iter_weights",
     "GgufModel",
+    "GGUF_ARCH_TO_REGISTRY_KEY",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -216,7 +217,21 @@ def parse_config(
     shape probe the way ``qwen3_moe``'s ``head_dim`` recovery does).
     """
     del model_path  # accepted for call-signature parity with the other architectures' parse_config; unused.
-    metadata = path_or_metadata if isinstance(path_or_metadata, dict) else load_gguf_metadata(path_or_metadata)
+    if isinstance(path_or_metadata, dict):
+        metadata = path_or_metadata
+    elif hasattr(path_or_metadata, "to_dict"):
+        # issue #273: loader.py calls every architecture's parse_config
+        # uniformly as parse_config(hf_config, ...), where hf_config is
+        # normally a real HF PretrainedConfig. For a GGUF checkpoint the
+        # loader instead hands this function a lightweight shim
+        # (_GgufConfigShim, weight.py) carrying the same .to_dict() ->
+        # metadata contract, so this one extra branch is all that's needed
+        # to make every downstream hf_config.architectures[0] /
+        # re-parse-on-backend-change code path in loader.py work
+        # unchanged for GGUF too.
+        metadata = path_or_metadata.to_dict()
+    else:
+        metadata = load_gguf_metadata(path_or_metadata)
 
     arch = metadata.get("general.architecture")
     if not arch:
@@ -273,8 +288,185 @@ def parse_config(
     return cfg
 
 
-def iter_weights(*args, **kwargs):
-    unimplemented("iter_weights", "models-gguf-iter-and-loader-wiring")
+# --------------------------------------------------------------------------- #
+# GGUF tensor name -> this port's HF-style parameter name (issue #273)
+# --------------------------------------------------------------------------- #
+
+import re as _re
+
+_LAYER_RE = _re.compile(r"^blk\.(\d+)\.(.+)$")
+
+# The standard (non-GDN) transformer block's GGUF tensor-name suffixes ->
+# this port's HF-style trailing parameter name. Verified against
+# gguf-py's own MODEL_TENSORS[MODEL_ARCH.QWEN3MOE] table (matches upstream
+# llama.cpp's real tensor names 1:1 with Qwen3MoeForCausalLM's own HF
+# key spelling -- q/k/v are separate projections with their own q_norm/
+# k_norm, unlike qwen35moe's fused attn_qkv + Gated-Delta-Net layers,
+# which are NOT covered here: qwen35moe is excluded from the hybrid
+# split already (see qwen3_5_moe._forward_hybrid's "gguf" exclusion)
+# and its GDN tensor wiring (ssm_*, attn_gate, shared-expert ffn_*_shexp)
+# is real, separable follow-up work, not in this issue's scope).
+_DENSE_SUFFIX_MAP = {
+    "attn_norm.weight": "input_layernorm.weight",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_output.weight": "self_attn.o_proj.weight",
+    "ffn_norm.weight": "post_attention_layernorm.weight",
+    "ffn_gate_inp.weight": "mlp.gate.weight",
+    # Dense (non-MoE) MLP -- a dense-transformer architecture's own layers,
+    # or a MoE architecture's leading dense layers (first_k_dense_replace).
+    "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_down.weight": "mlp.down_proj.weight",
+}
+
+_TOP_LEVEL_MAP = {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "output_norm.weight": "model.norm.weight",
+    "output.weight": "lm_head.weight",
+}
+
+# GGUF's per-architecture ``general.architecture`` string -> this port's
+# model-registry key (``register.py``'s ``_MODEL_REGISTRY`` dict), needed
+# because ``get_model_spec`` dispatches on the registry key, not the raw
+# GGUF architecture string (which is lowercase/no-suffix, e.g. "qwen3moe"
+# vs. the registry's "Qwen3MoeForCausalLM"). Verified against gguf-py's
+# own ``MODEL_ARCH_NAMES`` table for each architecture this port's
+# registry actually knows -- only architectures both sides support are
+# listed; anything else falls back to the raw GGUF string (which
+# ``get_model_spec`` then rejects with a clear "not supported" error,
+# same as an unregistered HF ``architectures[0]`` value would).
+GGUF_ARCH_TO_REGISTRY_KEY: Dict[str, str] = {
+    "qwen3moe": "Qwen3MoeForCausalLM",
+    "qwen35moe": "Qwen3_5MoeForConditionalGeneration",
+    "llama": "LlamaForCausalLM",
+    "qwen2": "Qwen2ForCausalLM",
+    "qwen3": "Qwen3ForCausalLM",
+}
+
+
+def _gguf_to_pytorch_shape(shape) -> tuple:
+    """GGUF's on-disk tensor-info shape is ggml's own ``ne[]`` order (the
+    *fastest-varying* dimension listed first); every consumer of a
+    dequantized tensor here needs standard PyTorch/numpy row-major shape,
+    which is that same tuple **reversed**.
+
+    Empirically verified while building this issue (#273): the reference
+    ``gguf`` pip package's own ``ReaderTensor.shape`` property reports the
+    identical raw, un-reversed ``ne[]`` order this port's own
+    :class:`~freetoken.models.gguf.reader.GGUFTensorInfo` does (confirmed
+    byte-for-byte identical in #270/#271's own tests) -- but
+    ``gguf.GGUFReader._build_tensors`` builds that tensor's *actual data
+    array* with ``np_dims = tuple(reversed(dims))``, i.e. gguf-py's own
+    tensor **values** are only in the semantically-correct PyTorch/numpy
+    orientation after this same reversal. #270/#271's tests never needed
+    to apply it themselves: they only cross-checked raw dequantized *byte
+    values* against the reference package using its own (matching,
+    un-reversed) ``.shape`` attribute for the reshape target on *both*
+    sides, never against its separately-and-correctly-oriented ``.data``
+    array -- so their passing tests validated bit-exact dequantization,
+    not tensor *orientation*, which is why this reversal wasn't caught
+    (or needed) until a real weight matrix had to be used in a real
+    matmul here. Directly re-verified for this issue against
+    ``gguf.GGUFReader(...).tensors[i].data`` on a real checkpoint's real
+    ``token_embd.weight`` (see this PR's own test/description).
+    """
+    return tuple(reversed(shape))
+
+
+def _gguf_block_size_and_type_size(ggml_type: int) -> Tuple[int, int]:
+    """(block_size, type_size) for a GGML quant type -- how many raw bytes
+    one block of the on-disk tensor occupies, needed to read exactly a
+    tensor's own byte span (not into the next tensor). Delegates to the
+    reference ``gguf`` pip package's own ``GGML_QUANT_SIZES`` table (a
+    real runtime dependency of this port already, see ``dequant.py``'s own
+    docstring and ``pyproject.toml``) rather than duplicating a second
+    copy of this table here.
+    """
+    import gguf as _gguf_ref
+
+    qtype = _gguf_ref.GGMLQuantizationType(ggml_type)
+    return _gguf_ref.GGML_QUANT_SIZES[qtype]
+
+
+def iter_weights(
+    model_path: str,
+    device,
+    *,
+    include_moe_experts: bool = True,
+    include_non_moe: bool = True,
+):
+    """Yield ``(name, tensor)`` for every tensor of a GGUF checkpoint,
+    dequantized (:func:`dequantize`, issue #271) and renamed to this
+    port's HF-style parameter names -- the same contract every other
+    architecture's own ``iter_weights`` fulfills (e.g.
+    ``freetoken.models.qwen3_moe.iter_weights``'s docstring): dense
+    tensors on ``device``, MoE expert tensors on host memory (the offload
+    banks the engine streams from).
+
+    GGUF stores a MoE layer's experts as one already-packed
+    ``[num_experts, ...]`` tensor per projection (``ffn_gate_exps`` /
+    ``ffn_up_exps`` / ``ffn_down_exps``), not per-expert tensors --
+    verified against the real target checkpoint's own header (Zot:
+    ``general/qwen3.6-35b-a3b:q4_k_m-gguf``, read via an HTTP range
+    request rather than the full 22.7GB pull). ``gate`` and ``up`` are
+    concatenated on dim 1 into a single ``gate_up_proj`` tensor before
+    yielding, matching :func:`freetoken.models.weight
+    .stream_moe_expert_sources`'s own packed-form contract exactly
+    (``[E, 2I, H]``, gate then up -- see that function's docstring), so
+    this reaches the loader's *existing*, already-tested packed-bank path
+    unchanged, with no new bank-building logic needed.
+    """
+    import torch as _torch
+
+    from .dequant import dequantize as _dequantize
+
+    gguf_file = load_gguf(model_path)
+
+    by_layer: Dict[int, Dict[str, GGUFTensorInfo]] = {}
+    top_level: Dict[str, GGUFTensorInfo] = {}
+    for name, info in gguf_file.tensors.items():
+        m = _LAYER_RE.match(name)
+        if m:
+            by_layer.setdefault(int(m.group(1)), {})[m.group(2)] = info
+        else:
+            top_level[name] = info
+
+    with open(gguf_file.path, "rb") as fh:
+
+        def _read_and_dequant(info: GGUFTensorInfo) -> "_torch.Tensor":
+            block_size, type_size = _gguf_block_size_and_type_size(info.ggml_type)
+            n_bytes = (info.n_elements // block_size) * type_size
+            fh.seek(info.offset)
+            raw = fh.read(n_bytes)
+            return _dequantize(info.ggml_type, raw, _gguf_to_pytorch_shape(info.shape))
+
+        if include_non_moe:
+            for gguf_name, hf_name in _TOP_LEVEL_MAP.items():
+                info = top_level.get(gguf_name)
+                if info is not None:
+                    yield hf_name, _read_and_dequant(info).to(device)
+
+        for layer in sorted(by_layer):
+            suffixes = by_layer[layer]
+            prefix = f"model.layers.{layer}"
+            if include_non_moe:
+                for gguf_suffix, hf_suffix in _DENSE_SUFFIX_MAP.items():
+                    info = suffixes.get(gguf_suffix)
+                    if info is not None:
+                        yield f"{prefix}.{hf_suffix}", _read_and_dequant(info).to(device)
+            if include_moe_experts:
+                gate = suffixes.get("ffn_gate_exps.weight")
+                up = suffixes.get("ffn_up_exps.weight")
+                down = suffixes.get("ffn_down_exps.weight")
+                if gate is not None and up is not None:
+                    gate_up = _torch.cat([_read_and_dequant(gate), _read_and_dequant(up)], dim=1)
+                    yield f"{prefix}.mlp.experts.gate_up_proj", gate_up.to("cpu")
+                if down is not None:
+                    yield f"{prefix}.mlp.experts.down_proj", _read_and_dequant(down).to("cpu")
 
 
 class GgufModel:

@@ -65,16 +65,27 @@ class EngineConfig:
 
     @cached_property
     def hf_config(self):
-        from freetoken.utils import cached_load_hf_config
+        # issue #273: a GGUF checkpoint has no config.json -- route through
+        # the same GGUF-aware shim freetoken.models.loader.load_model uses,
+        # rather than duplicating GGUF-detection logic a third time.
+        from freetoken.models.loader import _load_hf_or_gguf_config
 
-        return cached_load_hf_config(self.model_path)
+        return _load_hf_or_gguf_config(self.model_path)
 
     @cached_property
     def model_config(self) -> ModelConfig:
+        from freetoken.models.gguf import is_gguf_path
         from freetoken.models.register import _load_attr, get_model_spec
 
         spec = get_model_spec(self.hf_config.architectures[0])
-        parse_config = _load_attr(spec.module, spec.parse_config)
+        # spec.module is the *model class*'s own module (e.g. qwen3_moe),
+        # whose own parse_config expects a real HF config -- not this
+        # GGUF-checkpoint shim's raw GGUF metadata. Same fix as
+        # freetoken.models.loader.load_model's own parse_config resolution.
+        if is_gguf_path(self.model_path):
+            from freetoken.models.gguf import parse_config
+        else:
+            parse_config = _load_attr(spec.module, spec.parse_config)
         return parse_config(self.hf_config)
 
     @property
