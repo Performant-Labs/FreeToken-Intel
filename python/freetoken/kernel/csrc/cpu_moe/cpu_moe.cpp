@@ -80,6 +80,7 @@ void moe_forward_core(
     // token.
     std::vector<float> gate(I);
     std::vector<float> up(I);
+    std::vector<float> act(I);  // silu(gate) * up, hoisted out of the H-wide output loop
 
     for (int e = 0; e < num_experts; ++e) {
         if (expert_mask != nullptr && expert_mask[e] == 0) {
@@ -115,14 +116,24 @@ void moe_forward_core(
                     up[i] = acc;
                 }
 
+                // silu(gate[i]) * up[i] does not depend on the output index o,
+                // so it must be computed once per i, not recomputed inside the
+                // H-wide output loop below (that recomputation -- including a
+                // std::exp() per iteration -- was PR #254's own review finding:
+                // O(I*H) exp() calls instead of O(I), dominating this already
+                // scalar/unvectorized GEMM's cost).
+                for (size_t i = 0; i < I; ++i) {
+                    act[i] = silu(gate[i]) * up[i];
+                }
+
                 const float w = expert_weights[static_cast<size_t>(t) * topk + j];
                 float* out_row = out + static_cast<size_t>(t) * H;
-                // y = (silu(gate) * up) @ down_e.T ; out_row += w * y
+                // y = act @ down_e.T ; out_row += w * y
                 for (size_t o = 0; o < H; ++o) {
                     const float* down_row = down_e + o * I;
                     float acc = 0.0f;
                     for (size_t i = 0; i < I; ++i) {
-                        acc += silu(gate[i]) * up[i] * down_row[i];
+                        acc += act[i] * down_row[i];
                     }
                     out_row[o] += w * acc;
                 }
