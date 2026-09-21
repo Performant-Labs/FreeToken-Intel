@@ -510,7 +510,17 @@ private:
         }
     }
 
-    std::thread thread_;
+    // Declaration order matters here, not just initializer-list order: C++
+    // constructs members in declaration order regardless of how the
+    // constructor's initializer list writes them, and thread_'s constructor
+    // (below) starts run() executing concurrently the instant it runs. If
+    // thread_ were declared first, run() could observe mu_ (and the
+    // condition variables, and job_'s own fields) before their constructors
+    // have completed -- undefined behavior, a real data race, and a
+    // (rare, scheduler-dependent, so easy to miss in testing) hang/crash.
+    // Every piece of state run() touches must be declared -- and therefore
+    // constructed -- before thread_ so it is already valid when the new
+    // thread starts.
     std::mutex mu_;
     std::condition_variable cv_job_;
     std::condition_variable cv_done_;
@@ -521,6 +531,7 @@ private:
     bool shutdown_ = false;
     int64_t next_handle_ = 0;
     int64_t handle_ = 0;
+    std::thread thread_;
 };
 
 // Function-local static: constructed on the first submit() (lazily, so a
