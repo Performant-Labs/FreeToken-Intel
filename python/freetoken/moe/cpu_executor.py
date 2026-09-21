@@ -14,6 +14,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from freetoken.kernel._toolchain import ToolchainError
+from freetoken.kernel.cpu_moe import cpu_moe, cpu_moe_forward_fast
+
 
 class CpuMoeExecutor:
     """Host-side expert GEMM over the pinned host banks.
@@ -30,23 +33,20 @@ class CpuMoeExecutor:
     def __init__(self, num_experts: int, intermediate: int, *, threads: int = 0) -> None:
         self.num_experts = int(num_experts)
         self.intermediate = int(intermediate)
-        # ``threads == 0`` means "auto" (physical cores) once the thread-pool
-        # GEMM lands; the pure-PyTorch impl below is single-threaded per GEMM and
-        # relies on torch's own BLAS threading, so the knob is accepted but a no-op
-        # until the AVX-512/AMX kernel (issue ``moe-cpu`` accept: "Thread-pool
-        # expert GEMM using AVX-512 (AMX when present)") replaces it.
-        #
-        # Issue #252 built that native, runtime-dispatched AVX-512 +
-        # thread-pooled kernel (``freetoken.kernel.cpu_moe.cpu_moe_forward_fast``,
-        # measured ~5-8x faster than the naive scalar port on this project's
-        # dev hardware) but does *not* wire it into this executor's
-        # ``forward`` below -- that GIL-free dispatch (submitting into the
-        # native worker instead of calling back into Python per layer) is
-        # issue #248's job, per the parent epic #249's explicit split
-        # ("independent of the dispatch-mechanism children, can proceed in
-        # parallel with #248/#253/#251"). This ``forward`` stays pure-PyTorch
-        # and ``threads`` remains a no-op here until #248 lands.
+        # Issue #291: threads reaches the native pool's own width knob.
+        # ``0`` means the pool's own "auto" (hardware_concurrency, clamped to
+        # num_experts) -- see cpu_moe_forward_fast's docstring -- not "keep
+        # the pure-PyTorch loop", the way it silently did before this issue.
         self.threads = int(threads)
+        # Issue #291: the native GEMM epic #249 built (#250's naive port,
+        # #252's AVX-512 + thread-pool fast path) is compiled/loaded once per
+        # executor and used for every ``forward`` call from here on. A missing
+        # C++ toolchain is the *only* reason to fall back to the pure-PyTorch
+        # loop below -- it stays only as that fallback, never the default.
+        try:
+            self._native_module = cpu_moe()
+        except ToolchainError:
+            self._native_module = None
 
     def forward(
         self,
@@ -76,6 +76,33 @@ class CpuMoeExecutor:
             accumulation order matches the in-VRAM reference (see
             ``_Qwen3MoE._forward_inram`` / ``_forward_offload``).
         """
+        if self._native_module is not None:
+            out = cpu_moe_forward_fast(
+                self._native_module,
+                flat,
+                top_idx,
+                top_w,
+                gate_up,
+                down,
+                self.num_experts,
+                self.intermediate,
+                expert_mask=None,
+                threads=self.threads,
+            )
+            return out.to(device=flat.device, dtype=flat.dtype)
+        return self._python_forward(flat, top_idx, top_w, gate_up, down)
+
+    def _python_forward(
+        self,
+        flat: torch.Tensor,
+        top_idx: torch.Tensor,
+        top_w: torch.Tensor,
+        gate_up: torch.Tensor,
+        down: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pure-PyTorch fallback, used only when the native module (#250/#252)
+        could not be compiled -- see ``__init__``. Same expert-major,
+        top-k-column accumulation order as the native path."""
         dev = flat.device
         # Mirror the block's router: host-side routing (no device "which rows?"
         # query). top_idx / top_w are the fresh topk/weights from the block,

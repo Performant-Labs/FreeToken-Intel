@@ -345,3 +345,166 @@ def test_engine_offload_backend_generate_produces_in_vocab_tokens(synthetic_gguf
     reset_global_ctx()
     assert len(tokens[0]) == 4
     assert all(0 <= t < VOCAB for t in tokens[0])
+
+
+# --------------------------------------------------------------------------
+# Issue #287 regression: a trailing MTP (multi-token-prediction) block uses
+# the exact same blk.N.* naming as a real decoder layer -- including a full
+# spare attn_q/k/v + ffn_*_exps/*_shexp tensor set that looks, by tensor
+# name alone, exactly like an extra "full-attention layer the formula
+# doesn't predict" (the very shape test_parse_config_detects_real_layer_
+# types_not_just_the_interval_formula above exercises and, before this fix,
+# would have wrongly accepted for a real MTP block too). The GGUF spec's
+# own `{arch}.nextn_predict_layers` key is the authoritative signal that
+# block(s) is not a real decoder layer at all -- confirmed against an
+# independent reference implementation (llama.cpp) on the real checkpoint,
+# which logs "model has unused tensor blk.N.*.weight -- ignoring" for
+# every single tensor of the trailing block and produces coherent output,
+# while this port's pre-fix code loaded and ran it as a real 41st layer,
+# corrupting the final hidden state and producing incoherent generation
+# (issue #287's own root cause).
+# --------------------------------------------------------------------------
+MTP_LAYER = LAYERS  # the extra trailing "layer" index (block 6 of a 6-real-layer model)
+
+
+def _build_synthetic_qwen35moe_gguf_with_mtp_block(tmp_path) -> str:
+    kv = [
+        _kv_string("general.architecture", "qwen35moe"),
+        _kv_string("general.name", "tiny-qwen35moe-mtp"),
+        _kv_scalar("qwen35moe.context_length", GGUFValueType.UINT32, "I", 128),
+        _kv_scalar("qwen35moe.embedding_length", GGUFValueType.UINT32, "I", HIDDEN),
+        # block_count includes the trailing MTP block; nextn_predict_layers
+        # says exactly 1 of those blocks is not a real decoder layer.
+        _kv_scalar("qwen35moe.block_count", GGUFValueType.UINT32, "I", LAYERS + 1),
+        _kv_scalar("qwen35moe.nextn_predict_layers", GGUFValueType.UINT32, "I", 1),
+        _kv_scalar("qwen35moe.feed_forward_length", GGUFValueType.UINT32, "I", INTER),
+        _kv_scalar("qwen35moe.attention.head_count", GGUFValueType.UINT32, "I", NUM_HEADS),
+        _kv_scalar("qwen35moe.attention.head_count_kv", GGUFValueType.UINT32, "I", KV_HEADS),
+        _kv_scalar("qwen35moe.attention.key_length", GGUFValueType.UINT32, "I", HEAD_DIM),
+        _kv_scalar("qwen35moe.attention.layer_norm_rms_epsilon", GGUFValueType.FLOAT32, "f", 1e-5),
+        _kv_scalar("qwen35moe.rope.freq_base", GGUFValueType.FLOAT32, "f", 1000000.0),
+        _kv_scalar("qwen35moe.rope.dimension_count", GGUFValueType.UINT32, "I", ROTARY_DIM),
+        _kv_scalar("qwen35moe.expert_count", GGUFValueType.UINT32, "I", EXPERTS),
+        _kv_scalar("qwen35moe.expert_used_count", GGUFValueType.UINT32, "I", TOPK),
+        _kv_scalar("qwen35moe.expert_feed_forward_length", GGUFValueType.UINT32, "I", INTER),
+        _kv_scalar("qwen35moe.expert_shared_feed_forward_length", GGUFValueType.UINT32, "I", SHARED_INTER),
+        _kv_scalar("qwen35moe.ssm.conv_kernel", GGUFValueType.UINT32, "I", CONV_KERNEL),
+        _kv_scalar("qwen35moe.ssm.state_size", GGUFValueType.UINT32, "I", KEY_HEAD_DIM),
+        _kv_scalar("qwen35moe.ssm.group_count", GGUFValueType.UINT32, "I", NUM_KEY_HEADS),
+        _kv_scalar("qwen35moe.ssm.time_step_rank", GGUFValueType.UINT32, "I", NUM_VALUE_HEADS),
+        _kv_scalar("qwen35moe.ssm.inner_size", GGUFValueType.UINT32, "I", INNER_SIZE),
+        _kv_scalar("qwen35moe.full_attention_interval", GGUFValueType.UINT32, "I", FULL_ATTENTION_INTERVAL),
+        _kv_scalar("qwen35moe.vocab_size", GGUFValueType.UINT32, "I", VOCAB),
+    ]
+
+    tensors: list[tuple] = []
+    data_chunks: list[bytes] = []
+    offset = 0
+
+    def add(name: str, shape: tuple):
+        nonlocal offset
+        payload = _f32_tensor_bytes(shape)
+        tensors.append((name, shape, 0, offset))
+        data_chunks.append(payload)
+        offset += len(payload)
+
+    add("token_embd.weight", (HIDDEN, VOCAB))
+    add("output_norm.weight", (HIDDEN,))
+    add("output.weight", (HIDDEN, VOCAB))
+    for layer in range(LAYERS):
+        p = f"blk.{layer}"
+        add(f"{p}.attn_norm.weight", (HIDDEN,))
+        add(f"{p}.post_attention_norm.weight", (HIDDEN,))
+        if layer in FULL_ATTENTION_LAYERS:
+            add(f"{p}.attn_q.weight", (HIDDEN, NUM_HEADS * HEAD_DIM * 2))
+            add(f"{p}.attn_q_norm.weight", (HEAD_DIM,))
+            add(f"{p}.attn_k.weight", (HIDDEN, KV_HEADS * HEAD_DIM))
+            add(f"{p}.attn_k_norm.weight", (HEAD_DIM,))
+            add(f"{p}.attn_v.weight", (HIDDEN, KV_HEADS * HEAD_DIM))
+            add(f"{p}.attn_output.weight", (NUM_HEADS * HEAD_DIM, HIDDEN))
+        else:
+            add(f"{p}.attn_qkv.weight", (HIDDEN, CONV_DIM))
+            add(f"{p}.attn_gate.weight", (HIDDEN, VALUE_DIM))
+            add(f"{p}.ssm_alpha.weight", (HIDDEN, NUM_VALUE_HEADS))
+            add(f"{p}.ssm_beta.weight", (HIDDEN, NUM_VALUE_HEADS))
+            add(f"{p}.ssm_conv1d.weight", (CONV_KERNEL, CONV_DIM))
+            add(f"{p}.ssm_dt.bias", (NUM_VALUE_HEADS,))
+            add(f"{p}.ssm_a", (NUM_VALUE_HEADS,))
+            add(f"{p}.ssm_norm.weight", (VALUE_HEAD_DIM,))
+            add(f"{p}.ssm_out.weight", (VALUE_DIM, HIDDEN))
+        add(f"{p}.ffn_gate_inp.weight", (HIDDEN, EXPERTS))
+        add(f"{p}.ffn_gate_inp_shexp.weight", (HIDDEN,))
+        add(f"{p}.ffn_gate_shexp.weight", (HIDDEN, SHARED_INTER))
+        add(f"{p}.ffn_up_shexp.weight", (HIDDEN, SHARED_INTER))
+        add(f"{p}.ffn_down_shexp.weight", (SHARED_INTER, HIDDEN))
+        add(f"{p}.ffn_gate_exps.weight", (HIDDEN, INTER, EXPERTS))
+        add(f"{p}.ffn_up_exps.weight", (HIDDEN, INTER, EXPERTS))
+        add(f"{p}.ffn_down_exps.weight", (INTER, HIDDEN, EXPERTS))
+
+    # The trailing MTP block (real checkpoint: blk.40) -- full-attention-
+    # shaped tensors (exactly what would be misread as "one more real
+    # full-attention layer the formula doesn't predict") plus its own
+    # nextn.* draft-head tensors. Must be entirely excluded, not just its
+    # nextn.* subset.
+    mp = f"blk.{MTP_LAYER}"
+    add(f"{mp}.attn_norm.weight", (HIDDEN,))
+    add(f"{mp}.post_attention_norm.weight", (HIDDEN,))
+    add(f"{mp}.attn_q.weight", (HIDDEN, NUM_HEADS * HEAD_DIM * 2))
+    add(f"{mp}.attn_k.weight", (HIDDEN, KV_HEADS * HEAD_DIM))
+    add(f"{mp}.attn_v.weight", (HIDDEN, KV_HEADS * HEAD_DIM))
+    add(f"{mp}.attn_output.weight", (NUM_HEADS * HEAD_DIM, HIDDEN))
+    add(f"{mp}.ffn_gate_inp.weight", (HIDDEN, EXPERTS))
+    add(f"{mp}.ffn_gate_exps.weight", (HIDDEN, INTER, EXPERTS))
+    add(f"{mp}.ffn_up_exps.weight", (HIDDEN, INTER, EXPERTS))
+    add(f"{mp}.ffn_down_exps.weight", (INTER, HIDDEN, EXPERTS))
+    add(f"{mp}.nextn.eh_proj.weight", (HIDDEN, HIDDEN))
+    add(f"{mp}.nextn.enorm.weight", (HIDDEN,))
+    add(f"{mp}.nextn.hnorm.weight", (HIDDEN,))
+    add(f"{mp}.nextn.shared_head_norm.weight", (HIDDEN,))
+
+    header = _build_minimal_gguf(kv=kv, tensors=tensors)
+    path = tmp_path / "tiny-qwen35moe-mtp.gguf"
+    path.write_bytes(header + b"".join(data_chunks))
+    return str(path)
+
+
+@pytest.fixture(scope="module")
+def synthetic_gguf_path_with_mtp(tmp_path_factory) -> str:
+    return _build_synthetic_qwen35moe_gguf_with_mtp_block(tmp_path_factory.mktemp("gguf-qwen35moe-mtp"))
+
+
+def test_parse_config_excludes_trailing_mtp_block_from_num_layers(synthetic_gguf_path_with_mtp):
+    cfg = parse_config(synthetic_gguf_path_with_mtp, model_path=synthetic_gguf_path_with_mtp)
+    assert cfg.num_layers == LAYERS  # NOT LAYERS + 1
+    layer_types = cfg.attrs["text_config"]["layer_types"]
+    assert len(layer_types) == LAYERS
+    assert layer_types == [
+        "full_attention" if i in FULL_ATTENTION_LAYERS else "linear_attention" for i in range(LAYERS)
+    ]
+
+
+def test_iter_weights_never_yields_the_mtp_block(synthetic_gguf_path_with_mtp):
+    seen = dict(iter_weights(synthetic_gguf_path_with_mtp, torch.device("cpu")))
+    assert not any(f".layers.{MTP_LAYER}." in name for name in seen)
+    assert f"model.layers.{LAYERS - 1}.input_layernorm.weight" in seen
+
+
+def test_engine_generate_excludes_mtp_block_end_to_end(synthetic_gguf_path_with_mtp):
+    reset_global_ctx()
+    engine = Engine(_engine_config(synthetic_gguf_path_with_mtp))
+    assert len(engine.model.layers) == LAYERS  # NOT LAYERS + 1
+    engine.add_request(
+        Req(
+            input_ids=[1, 2, 3],
+            table_idx=0,
+            cached_len=0,
+            output_len=4,
+            uid=0,
+            sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
+            cache_handle=None,
+        )
+    )
+    tokens = engine.generate()
+    reset_global_ctx()
+    assert len(tokens[0]) == 4
+    assert all(0 <= t < VOCAB for t in tokens[0])
