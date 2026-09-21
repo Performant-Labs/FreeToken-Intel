@@ -567,6 +567,7 @@ def _ensure_torch() -> None:
         "_Qwen35MxfpExpert",
         "_Qwen35Fp8Expert",
         "_Qwen35Int8Expert",
+        "_Qwen35GptqExpert",
         "_Qwen35DecoderLayer",
         "Qwen3_5MoEForCausalLM",
     )
@@ -1856,6 +1857,69 @@ class _Qwen35Int8Expert:
             intermediate=self.intermediate,
             k_gate_up=self.k_gate_up,
             k_down=self.k_down,
+            out_dtype=x.dtype,
+        )
+
+
+class _Qwen35GptqExpert:
+    """A single GPTQ-Int4-quantized MoE expert, fully XPU-resident (issue
+    `moe-fused-gptq`, #258, part of the `quant-xpu` epic, #10).
+
+    The GPTQ sibling of :class:`_Qwen35MxfpExpert` / :class:`_Qwen35Fp8Expert`
+    / :class:`_Qwen35Int8Expert`: holds the checkpoint's packed
+    ``qweight``/``qzeros``/``scales`` (the same per-expert tensors
+    :class:`freetoken.models.weight.GptqExpertBank` streams for the offload
+    backend, moved onto the device instead of staying on host) and never
+    materializes a dequantized weight --
+    :func:`freetoken.kernel.triton.gptq_fused_linear.fused_gptq_expert_forward`
+    runs the native packed GEMM directly, the same kernel
+    :func:`freetoken.moe.offload_cache.SlotWeightAccessor` (#137) dequantizes
+    lazily for the offload backend, here without any host round-trip at all.
+
+    Unlike the offload cache's ``GptqExpertBank`` (which also carries a
+    shared ``g_idx`` side tensor), :func:`fused_gptq_expert_forward` only
+    supports the ``desc_act=False`` (sequential groups, ``g_idx[k] = k //
+    group_size``) case -- the only case any real checkpoint this project has
+    loaded uses (see ``gptq_fused_linear.py``'s own docstring) -- so no
+    ``g_idx`` is stored here; ``group_size`` (an architecture/checkpoint
+    constant, shared across every expert and every layer) is enough to
+    reconstruct the group boundaries.
+    """
+
+    def __init__(
+        self,
+        qweight_gate_up: torch.Tensor,
+        qzeros_gate_up: torch.Tensor,
+        scales_gate_up: torch.Tensor,
+        qweight_down: torch.Tensor,
+        qzeros_down: torch.Tensor,
+        scales_down: torch.Tensor,
+        intermediate: int,
+        group_size: int,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("qweight_gate_up", qweight_gate_up, persistent=False)
+        self.register_buffer("qzeros_gate_up", qzeros_gate_up, persistent=False)
+        self.register_buffer("scales_gate_up", scales_gate_up, persistent=False)
+        self.register_buffer("qweight_down", qweight_down, persistent=False)
+        self.register_buffer("qzeros_down", qzeros_down, persistent=False)
+        self.register_buffer("scales_down", scales_down, persistent=False)
+        self.intermediate = intermediate
+        self.group_size = group_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.gptq_fused_linear import fused_gptq_expert_forward
+
+        return fused_gptq_expert_forward(
+            x,
+            self.qweight_gate_up,
+            self.qzeros_gate_up,
+            self.scales_gate_up,
+            self.qweight_down,
+            self.qzeros_down,
+            self.scales_down,
+            group_size=self.group_size,
+            intermediate=self.intermediate,
             out_dtype=x.dtype,
         )
 

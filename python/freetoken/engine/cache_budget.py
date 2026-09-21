@@ -37,7 +37,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-__all__ = ["CacheBudget", "MoeCachePlan", "plan_cache_budget", "resolve_served_context_len"]
+__all__ = [
+    "CacheBudget",
+    "MoeCachePlan",
+    "plan_cache_budget",
+    "resolve_served_context_len",
+    "check_pinned_kv_fit",
+]
 
 
 @dataclass(frozen=True)
@@ -288,3 +294,148 @@ def resolve_served_context_len(
         f"conventional full-context pool."
     )
     return planned_kv_pages, reason
+
+
+def check_pinned_kv_fit(
+    *,
+    total_vram_bytes: Optional[int],
+    memory_ratio: float,
+    moe_cache_size: int,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype_bytes: int,
+    requested_num_pages: int,
+    moe_intermediate_size: int = 0,
+    hidden_size: int = 0,
+    bytes_per_slot_override: Optional[int] = None,
+    reserved_pages: int = 0,
+) -> tuple[int, Optional[str]]:
+    """Cap the pinned (non-auto) KV pool to what actually fits in VRAM.
+
+    Issue #260: the pinned path (``planned_num_pages is None``, i.e. the
+    operator set ``--moe-cache-size`` or left everything default so
+    ``moe_cache_auto`` never ran) has always sized the KV pool as
+    ``max_running_req * max_seq_len`` on the claim that this is "always >=
+    the demand" -- but unlike :func:`plan_cache_budget`'s auto path, that
+    formula was never checked against actual VRAM. If the pinned MoE cache
+    plus the conventional KV formula together don't fit, the failure mode is
+    a raw allocator OOM inside ``create_kv_pool``, not a loud, graceful cap.
+
+    This is the pinned-mode equivalent of the auto path's fit assert: it reads
+    the same total-VRAM query the auto planner uses (passed in by the
+    caller -- this module stays device-agnostic and torch-free, see the
+    module docstring), subtracts the operator's own pinned MoE cache
+    footprint, and caps ``requested_num_pages`` down to whatever whole KV
+    pages the remaining budget can hold, with a loud, operator-actionable
+    reason -- mirroring :func:`resolve_served_context_len`'s cap-and-log
+    treatment for the auto path.
+
+    ``total_vram_bytes is None`` means there is no live device to measure
+    against (e.g. a CPU test/dev box, or a dense/no-XPU run): nothing to
+    check, so the request is returned unchanged and the caller keeps the
+    conventional formula exactly as before.
+
+    Args:
+        total_vram_bytes: the device's total VRAM (bytes), or ``None`` when
+            there is no live device to query.
+        memory_ratio: fraction of total VRAM treated as addressable (0, 1] --
+            the same knob :func:`plan_cache_budget` uses.
+        moe_cache_size: the MoE expert cache's actual slot count in this run
+            (the operator's pin, or the loader's own conventional default when
+            unpinned) -- 0 for a dense (non-MoE) model.
+        num_layers, num_kv_heads, head_dim, dtype_bytes: the KV pool's row
+            shape, same meaning as in :func:`plan_cache_budget`.
+        requested_num_pages: the conventional ``max_running_req * max_seq_len``
+            page count (plus any operator ``--num-page-override``) the engine
+            was about to allocate, unchecked.
+        moe_intermediate_size, hidden_size: needed to size one expert slot's
+            bytes (ignored when ``moe_cache_size`` is 0, or when
+            ``bytes_per_slot_override`` is given).
+        bytes_per_slot_override: use this exact per-slot byte count instead of
+            the bf16 ``(gate_up + down) * dtype_bytes`` formula -- same escape
+            hatch as :func:`plan_cache_budget` for a non-bf16 bank schema.
+        reserved_pages: additional whole KV pages the caller will allocate on
+            top of whatever this function returns, that must ALSO fit in the
+            same VRAM budget -- e.g. ``Engine``'s own "+1 page of slack" for
+            ``MHAKVCache``'s reserved slot 0 (issue #173), added
+            *unconditionally* after this check runs. Without this, a fit check
+            against ``requested_num_pages`` alone could return a cap that
+            itself fits exactly, only for the caller's own +1 slack page to
+            push the real allocation back over budget -- the same
+            "conventional formula asserted safe but never actually checked"
+            failure this whole function exists to close (issue #260's own
+            review comment on the pinned-fit PR). Reflected in the fit
+            arithmetic (``requested_num_pages + reserved_pages`` must fit) but
+            NOT in the returned page count or the reason string (both still
+            describe the caller's own conventional demand) -- the caller adds
+            ``reserved_pages`` back on top, exactly as it always did.
+
+    Returns:
+        ``(effective_num_pages, cap_reason)`` -- ``cap_reason`` is ``None``
+        when the conventional pool actually fits, else a loud explanation of
+        the cap.
+
+    Raises:
+        ValueError: on a non-positive ``requested_num_pages`` / ``memory_ratio``,
+            or when even a single KV page cannot fit alongside the pinned MoE
+            cache (the pinned-mode equivalent of :func:`plan_cache_budget`'s
+            fit assert -- there is nothing sane to cap to at that point).
+    """
+    if total_vram_bytes is None:
+        return requested_num_pages, None
+    if memory_ratio <= 0 or memory_ratio > 1:
+        raise ValueError(f"memory_ratio must be in (0, 1], got {memory_ratio}")
+    if requested_num_pages <= 0:
+        raise ValueError(f"requested_num_pages must be positive, got {requested_num_pages}")
+    if reserved_pages < 0:
+        raise ValueError(f"reserved_pages must be non-negative, got {reserved_pages}")
+
+    budget = int(total_vram_bytes * memory_ratio)
+
+    moe_bytes = 0
+    if moe_cache_size > 0:
+        if bytes_per_slot_override is not None:
+            if bytes_per_slot_override <= 0:
+                raise ValueError(
+                    f"bytes_per_slot_override must be positive, got {bytes_per_slot_override}"
+                )
+            bytes_per_slot = bytes_per_slot_override
+        else:
+            bytes_per_slot = _bytes_per_expert_slot(
+                moe_cache_size, moe_intermediate_size, hidden_size, dtype_bytes
+            )
+        moe_bytes = moe_cache_size * bytes_per_slot
+
+    bytes_per_kv_token = _bytes_per_kv_token(num_layers, num_kv_heads, head_dim, dtype_bytes)
+    kv_budget = budget - moe_bytes
+    # fit_pages is the TOTAL whole KV pages the remaining budget can hold --
+    # including the reserved_pages the caller will add on top of whatever we
+    # return, so the two together never exceed budget (see reserved_pages'
+    # own docstring above for why this matters).
+    fit_pages = max(0, kv_budget) // bytes_per_kv_token
+    fit_pages_for_caller = fit_pages - reserved_pages
+
+    if fit_pages_for_caller <= 0:
+        raise ValueError(
+            "VRAM budget cannot fit even one KV page alongside the pinned MoE "
+            f"cache: budget {budget} bytes, pinned MoE cache {moe_cache_size} "
+            f"slots ({moe_bytes} bytes), reserved_pages {reserved_pages}. Lower "
+            f"--moe-cache-size, lower --max-running-req / --max-model-len, or "
+            f"raise --memory-ratio."
+        )
+
+    if fit_pages_for_caller >= requested_num_pages:
+        return requested_num_pages, None
+
+    reason = (
+        f"pinned KV pool would need {requested_num_pages} pages "
+        f"(max_running_req * max_seq_len) but only {fit_pages_for_caller} pages "
+        f"fit in the addressable VRAM budget ({budget} bytes) once the pinned "
+        f"MoE cache ({moe_cache_size} slots, {moe_bytes} bytes){' and ' + str(reserved_pages) + ' reserved slack page(s)' if reserved_pages else ''} "
+        f"are set aside; capping the KV pool to {fit_pages_for_caller} pages "
+        f"instead of OOMing at first allocation. Lower --max-running-req, pass "
+        f"a smaller --max-model-len, lower --moe-cache-size, or use "
+        f"--moe-cache-auto to let the planner balance the split."
+    )
+    return fit_pages_for_caller, reason
