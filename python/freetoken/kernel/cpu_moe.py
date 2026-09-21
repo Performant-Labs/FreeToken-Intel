@@ -59,6 +59,7 @@ import pathlib
 import platform
 import shutil
 import subprocess
+import tempfile
 from typing import TYPE_CHECKING, Iterable, Optional
 
 from freetoken.kernel._toolchain import ToolchainError
@@ -198,15 +199,31 @@ def cpu_moe(name: str = "cpu_moe") -> KernelModule:
     cache_dir.mkdir(parents=True, exist_ok=True)
     key_dir = so_path.parent
     key_dir.mkdir(parents=True, exist_ok=True)
-    # Compile to a per-process temp file in the same directory, then atomically
+    # Compile to a per-call temp file in the same directory, then atomically
     # rename into place. so_path is content-addressed by _build_key (compiler +
-    # host arch + source hash), so any process racing us to the same key is
+    # host arch + source hash), so any caller racing us to the same key is
     # compiling byte-identical output -- os.replace is atomic on the same
     # filesystem, so a concurrent reader either sees the old (absent) path or
     # the fully-written file, never a partially-written one.
-    tmp_so = key_dir / f".{name}.{os.getpid()}.tmp.so"
+    #
+    # tempfile.mkstemp (not "pid-named") because os.getpid() alone collides
+    # across *threads* in the same process: _compile shells out via
+    # subprocess.run, which releases the GIL, so two threads racing a cold
+    # cache could both pick the same pid-named tmp path and stomp each
+    # other's compile output mid-write. mkstemp atomically creates a
+    # guaranteed-unique file (O_EXCL under the hood), so this holds under
+    # both multi-process and multi-thread races.
+    fd, tmp_name = tempfile.mkstemp(dir=key_dir, prefix=f".{name}.", suffix=".tmp.so")
+    os.close(fd)
+    tmp_so = pathlib.Path(tmp_name)
     try:
         _compile(str(CPU_MOE_SRC), str(tmp_so))
+        # mkstemp creates the placeholder 0600 (owner-only); the compiler
+        # overwrites the *content* but not that mode, so restore the normal
+        # 0644 a directly-compiled .so would have gotten (readable by anyone
+        # who can already read the cache dir -- the file has no secret
+        # content, it's a compiled kernel).
+        tmp_so.chmod(0o644)
         os.replace(tmp_so, so_path)
     finally:
         tmp_so.unlink(missing_ok=True)
