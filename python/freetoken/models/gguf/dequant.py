@@ -278,9 +278,13 @@ _DEQUANTIZERS = {
 
 
 def dequantize(
-    quant_type: Union[int, str], raw_bytes: bytes, shape: Sequence[int]
+    quant_type: Union[int, str],
+    raw_bytes: bytes,
+    shape: Sequence[int],
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Dequantize one tensor's raw GGUF bytes to a dense ``bf16`` tensor.
+    """Dequantize one tensor's raw GGUF bytes to a dense ``out_dtype`` tensor.
 
     ``quant_type`` is either the raw ``ggml_type`` int (as stored in a
     ``GGUFTensorInfo.ggml_type``) or its name (e.g. ``"Q4_K"``, matching
@@ -290,9 +294,17 @@ def dequantize(
     hands back), so the caller passes it through unchanged; this function
     only reshapes the flat dequantized values into it.
 
-    Dequantizes to ``bf16`` regardless of the checkpoint's own stored scale
-    dtype (always ``f16`` for the quant types here), matching this port's
-    dequant-to-activation-dtype convention (see this module's docstring).
+    Defaults to ``bf16`` (unchanged from #271/#281's own callers, e.g.
+    ``freetoken.models.gguf.iter_weights``'s eager whole-tensor dequant,
+    where the model's activation dtype is bf16 by convention) regardless of
+    the checkpoint's own stored scale dtype (always ``f16`` for the quant
+    types here). ``out_dtype`` is exposed as a real parameter (issue
+    `models-gguf-lazy-packed-dequant`, #282) so a lazy, per-slot caller
+    (``freetoken.moe.offload_cache.SlotWeightAccessor``) can dequantize
+    straight to the model's ACTUAL activation dtype -- matching this port's
+    dequant-to-activation-dtype convention and avoiding the same ``dtype``
+    bug class issue #138 found for GPTQ (dequantizing to some fixed/
+    checkpoint-stored dtype instead of the caller's real target dtype).
     """
     ggml_type = _resolve_ggml_type(quant_type)
     type_name = GGML_TYPE_NAMES.get(ggml_type, f"UNKNOWN_{ggml_type}")
@@ -316,4 +328,4 @@ def dequantize(
     flat = flat[:n_elements]
 
     tensor = torch.from_numpy(np.ascontiguousarray(flat))
-    return tensor.reshape(tuple(shape)).to(torch.bfloat16)
+    return tensor.reshape(tuple(shape)).to(out_dtype)

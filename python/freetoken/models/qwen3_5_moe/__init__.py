@@ -1407,14 +1407,18 @@ class _Qwen35MoE:
         # #153), and "int8_channel" (issue moe-quant-banks-int8, #154) hit
         # the exact same bank-name mismatch (weight_gate_up/scale_gate_up/...
         # or blocks_.../scales_... instead of gate_up/down) -- excluded for
-        # the same reason, not a separate decision.
+        # the same reason, not a separate decision. "gguf_kquant" (issue
+        # `models-gguf-lazy-packed-dequant`, #282) hits it too (its own
+        # bank names are raw_gate/raw_up/raw_down) -- same exclusion, same
+        # reason: the CPU half has no dequant-and-cache logic for any
+        # packed format yet, GGUF's packed format included.
         cache_quant_format = getattr(getattr(model, "moe_cache", None), "quant_format", "bf16")
         # The fetch fraction f (share of misses PCIe-fetched, the rest on CPU).
         # Read through ctx.model (the loader stores it there); a test-harness
         # Context that sets none falls back to the block-local 0.0 (pure offload),
         # which is the correct no-split default.
         fetch_frac = float(getattr(model, "moe_hybrid_fetch_fraction", 0.0) or 0.0)
-        if cache_quant_format in ("gptq_int4", "fp8_block", "mxfp4", "int8_channel"):
+        if cache_quant_format in ("gptq_int4", "fp8_block", "mxfp4", "int8_channel", "gguf_kquant"):
             fetch_frac = 1.0
         if fetch_frac <= 0.0:
             # No usable profile -> every miss rides PCIe (pure offload).
@@ -1622,7 +1626,7 @@ class _Qwen35MoE:
         # the whole checkpoint (the RAM-saving point of the whole epic, #134).
         from freetoken.moe.offload_cache import SlotWeightAccessor
 
-        slot_weights = SlotWeightAccessor(cache, intermediate, flat.dtype)
+        slot_weights = SlotWeightAccessor(cache, intermediate, flat.dtype, layer_id=layer_id)
         dev = flat.device
         out = torch.zeros_like(flat)
         routed_cpu = torch.empty(B, k, dtype=torch.int64)

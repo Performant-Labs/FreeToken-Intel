@@ -209,6 +209,25 @@ def load_moe_expert_sources(
         raise ValueError(f"{config.architectures[0]} does not provide MoE expert source loading")
     if dummy:
         return dummy_moe_expert_sources(config, dtype=dtype)
+    # Issue `models-gguf-lazy-packed-dequant` (#282): a GGUF checkpoint's own
+    # iter_weights (freetoken.models.gguf.iter_weights) dequantizes every
+    # tensor -- including the MoE expert banks -- eagerly to bf16 at load
+    # time. For the real target checkpoint (256 experts x 41 layers) that is
+    # ~66GB of host RAM just for the MoE banks, on a box with ~59GB total,
+    # defeating the entire reason this port supports GGUF at all (a 22.7GB
+    # on-disk quant, meant to fit where the 72GB bf16 original doesn't -- see
+    # #199's own "Why"). Route around iter_weights' eager dequant entirely
+    # for the MoE banks: read the raw packed GGML bytes straight from the
+    # file and keep them packed, exactly like the GPTQ/FP8/MXFP4/INT8
+    # streamers below do for their own formats. (Dense/attention/shared-
+    # expert weights are NOT affected -- those still flow through
+    # load_weight's eager iter_weights path, which is fine: verified against
+    # the real target checkpoint, they dequantize to ~5GB, a small fraction
+    # of the ~66GB MoE problem this issue exists to fix.)
+    from freetoken.models.gguf import is_gguf_path
+
+    if is_gguf_path(model_path):
+        return stream_moe_expert_sources_gguf_kquant(model_path, config)
     iter_weights = _iter_weights_fn(model_path, spec)
     src = iter_weights(
         model_path,
@@ -257,11 +276,12 @@ def checkpoint_quant_method(model_path: str) -> Optional[str]:
     ``ModelConfig``/``parse_config``, which does not stash this today.
 
     A GGUF checkpoint (issue #273) has no ``config.json``/``quantization_
-    config`` at all -- its own per-tensor GGML quant type is resolved and
-    fully dequantized by ``freetoken.models.gguf.iter_weights`` before any
-    tensor is yielded, so from here on a GGUF-sourced bank is always plain
-    bf16, same as an unquantized checkpoint. ``None`` (not detected/
-    unsupported) is the correct answer, not an error.
+    config`` at all -- this function is never consulted for one anyway
+    (``load_moe_expert_sources`` routes a GGUF checkpoint's MoE banks
+    through ``stream_moe_expert_sources_gguf_kquant`` before it would ever
+    call this, see issue `models-gguf-lazy-packed-dequant`, #282). ``None``
+    (not detected/unsupported) is the correct answer for a GGUF path, not an
+    error, in case some other caller invokes this directly.
     """
     from freetoken.models.gguf import is_gguf_path
 
@@ -1580,6 +1600,178 @@ def _finalize_int8_bank(
     )
 
 
+@dataclass(frozen=True)
+class GgufKQuantGateUpBank:
+    """One MoE layer's packed GGUF K-quant bank for the ``gate_up`` slot --
+    the GGUF sibling of :class:`GptqExpertBank` (issue
+    `models-gguf-lazy-packed-dequant`, #282, mirroring the #134/#140 packed-
+    bank epic's precedent for GPTQ/FP8/MXFP4/INT8).
+
+    Unlike every other quant format's ``gate_up`` bank (one FUSED tensor,
+    ``gate_proj`` + ``up_proj`` concatenated on the output axis), GGUF keeps
+    ``gate`` and ``up`` as two SEPARATE per-expert raw byte banks here,
+    never concatenated at the packed-byte level: concatenating raw
+    GGML-quantized bytes is only valid when both halves share the exact
+    same block layout (``ggml_type``), and although the real target
+    checkpoint happens to use ``Q4_K`` for both (verified against its own
+    header), #282's own issue body explicitly warns against assuming quant-
+    type uniformity without checking -- keeping them separate is correct
+    regardless of whether a future checkpoint ever ships mismatched types
+    for the two halves.
+
+    ``raw_gate`` / ``raw_up`` are ``[E, row_bytes]`` ``uint8`` -- one
+    expert's exact packed GGML bytes per row, read straight from disk by
+    :func:`freetoken.models.gguf.iter_moe_expert_raw_banks`, never
+    dequantized here. ``row_bytes`` may be PADDED with trailing zero bytes
+    to the max row length across this bank's ``num_layers`` layers (see
+    :func:`stream_moe_expert_sources_gguf_kquant`'s own docstring for why);
+    ``ggml_type_gate`` / ``ggml_type_up`` (this layer's own GGML quant type
+    for each half -- NOT necessarily the same value across layers, see that
+    same docstring) let a consumer (``SlotWeightAccessor``) recover the
+    real, unpadded byte length via
+    :func:`freetoken.models.gguf.gguf_expert_row_bytes` before decoding.
+    """
+
+    raw_gate: torch.Tensor  # [E, row_bytes_gate] uint8, packed GGML bytes
+    ggml_type_gate: int
+    raw_up: torch.Tensor  # [E, row_bytes_up] uint8, packed GGML bytes
+    ggml_type_up: int
+
+
+@dataclass(frozen=True)
+class GgufKQuantDownBank:
+    """One MoE layer's packed GGUF K-quant bank for the ``down`` slot -- the
+    ``down_proj`` sibling of :class:`GgufKQuantGateUpBank` (see its own
+    docstring). A single raw byte bank + its ``ggml_type`` -- ``down`` has
+    no ``gate``/``up``-style second half to keep separate.
+    """
+
+    raw: torch.Tensor  # [E, row_bytes] uint8, packed GGML bytes
+    ggml_type: int
+
+
+def _pad_expert_rows_to_max(rows: list) -> list:
+    """Zero-pad a bank's per-layer ``[E, row_bytes]`` raw-byte tensors on
+    their trailing (byte) axis to the max ``row_bytes`` across all of them,
+    so :class:`~freetoken.moe.offload_cache.OffloadMoeCache` (a single
+    device slot-cache pool shared across every layer, one fixed row shape
+    per bank) can hold them -- see
+    :func:`stream_moe_expert_sources_gguf_kquant`'s own docstring for why a
+    GGUF bank's row length can genuinely differ per layer (mixed
+    ``ggml_type``s, e.g. the real target checkpoint's ``down`` projection).
+    A no-op (returns ``rows`` unchanged, no copies) when every row is
+    already the same length -- the common case (``gate``/``up`` on the real
+    target checkpoint, and every bank on a checkpoint whose GGML quant type
+    never varies across layers).
+    """
+    if not rows:
+        return rows
+    max_bytes = max(int(r.shape[1]) for r in rows)
+    if all(int(r.shape[1]) == max_bytes for r in rows):
+        return rows
+    out = []
+    for r in rows:
+        if int(r.shape[1]) == max_bytes:
+            out.append(r)
+        else:
+            pad = torch.zeros((r.shape[0], max_bytes - r.shape[1]), dtype=r.dtype)
+            out.append(torch.cat([r, pad], dim=1))
+    return out
+
+
+def stream_moe_expert_sources_gguf_kquant(model_path: str, config) -> Tuple[list, list]:
+    """Stream a GGUF checkpoint's packed, quantized MoE expert bytes into
+    per-layer banks (issue `models-gguf-lazy-packed-dequant`, #282) --
+    the GGUF sibling of :func:`stream_moe_expert_sources_gptq` and the rest
+    of the packed-bank family (#135/#152/#153/#154).
+
+    Reads every MoE layer's raw ``ffn_gate_exps``/``ffn_up_exps``/
+    ``ffn_down_exps`` bytes via
+    :func:`freetoken.models.gguf.iter_moe_expert_raw_banks` -- the packed,
+    quantized bytes, NEVER dequantized here (dequantization happens lazily,
+    per resident slot, at compute time --
+    :class:`freetoken.moe.offload_cache.SlotWeightAccessor`'s
+    ``"gguf_kquant"`` branch). This is the fix for the real RAM blowup
+    #282's own issue body measured: the real target checkpoint (256
+    experts x 41 layers) needs ~66GB of host RAM if the MoE banks are
+    eagerly dequantized to bf16 at load time (what
+    ``freetoken.models.gguf.iter_weights`` does), vs. this function's own
+    packed-bytes-stay-packed result, which stays close to the checkpoint's
+    own on-disk MoE-tensor size (~20GB for the real ``q4_k_m`` target).
+
+    A real, verified complication (per #282's own issue body: GGUF's raw
+    on-disk layout may mix quant types per tensor -- checked against the
+    real target checkpoint's own header rather than assumed): the real
+    checkpoint's ``ffn_gate_exps``/``ffn_up_exps`` are uniformly ``Q4_K``
+    across all 41 layers, but ``ffn_down_exps`` is NOT -- 38 layers are
+    ``Q5_K`` (176 bytes/super-block) and 3 are ``Q6_K`` (210 bytes/
+    super-block), llama.cpp's own "mixed" ``q4_k_m`` quantization heuristic
+    keeping a handful of layers at higher precision. This is a per-LAYER
+    varying quant type (never per-EXPERT within one tensor -- GGUF's own
+    tensor-info section stores exactly one ``ggml_type`` per tensor, so
+    within any single ``ffn_*_exps`` tensor every expert genuinely shares
+    one quant type, confirmed by the format itself, not assumed), but it
+    still breaks ``OffloadMoeCache.set_bank_sources``' implicit assumption
+    that one bank's per-layer host tensors all share ONE row shape (the
+    device slot-cache pool is a single fixed-shape allocation reused by
+    every layer). Fixed here by zero-padding every layer's raw bytes to the
+    bank's own max row length (:func:`_pad_expert_rows_to_max`) -- at most
+    ~34 extra bytes/block wasted for the minority Q5_K layers (~139KB per
+    padded layer, ~5MB total across the whole real checkpoint, negligible
+    next to the ~20GB the fix saves) -- and recording each layer's real
+    ``ggml_type`` (hence its real, unpadded byte length, recoverable via
+    :func:`freetoken.models.gguf.gguf_expert_row_bytes`) in the returned
+    bank objects for ``SlotWeightAccessor`` to use at dequant time.
+
+    Reads the WHOLE checkpoint's MoE bytes before returning (matching every
+    other packed-bank streamer's incremental-but-still-eventually-complete
+    contract) -- this is the intended FINAL resident state (issue #145's
+    "never buffer more than one layer's worth of RAW tensors at once"
+    lesson is about transient buffering beyond the final packed banks, not
+    about the final packed banks themselves, which this port's whole
+    packed-bank design keeps fully host-resident by design, same as GPTQ/
+    FP8/MXFP4/INT8).
+    """
+    from freetoken.models.gguf import iter_moe_expert_raw_banks
+
+    by_layer: Dict[int, Dict[str, Tuple[torch.Tensor, int]]] = {}
+    for layer, bank_name, raw, ggml_type in iter_moe_expert_raw_banks(model_path):
+        if not (0 <= layer < config.num_layers):
+            raise ValueError(f"Unexpected MoE expert layer {layer}; expected [0, {config.num_layers})")
+        if raw.shape[0] != config.num_experts:
+            raise ValueError(
+                f"layer {layer} {bank_name!r}: {raw.shape[0]} experts, expected {config.num_experts}"
+            )
+        by_layer.setdefault(layer, {})[bank_name] = (raw, int(ggml_type))
+
+    missing = [
+        layer
+        for layer in range(config.num_layers)
+        if set(by_layer.get(layer, {})) != {"gate", "up", "down"}
+    ]
+    if missing:
+        raise ValueError(f"Missing/incomplete GGUF MoE expert bank(s) for layer(s): {missing}")
+
+    gate_raws = _pad_expert_rows_to_max([by_layer[layer]["gate"][0] for layer in range(config.num_layers)])
+    up_raws = _pad_expert_rows_to_max([by_layer[layer]["up"][0] for layer in range(config.num_layers)])
+    down_raws = _pad_expert_rows_to_max([by_layer[layer]["down"][0] for layer in range(config.num_layers)])
+
+    gate_up_banks = [
+        GgufKQuantGateUpBank(
+            raw_gate=gate_raws[layer],
+            ggml_type_gate=by_layer[layer]["gate"][1],
+            raw_up=up_raws[layer],
+            ggml_type_up=by_layer[layer]["up"][1],
+        )
+        for layer in range(config.num_layers)
+    ]
+    down_banks = [
+        GgufKQuantDownBank(raw=down_raws[layer], ggml_type=by_layer[layer]["down"][1])
+        for layer in range(config.num_layers)
+    ]
+    return gate_up_banks, down_banks
+
+
 __all__ = [
     "load_weight",
     "load_moe_expert_sources",
@@ -1594,6 +1786,9 @@ __all__ = [
     "stream_moe_expert_sources_mxfp4",
     "Int8ExpertBank",
     "stream_moe_expert_sources_int8",
+    "GgufKQuantGateUpBank",
+    "GgufKQuantDownBank",
+    "stream_moe_expert_sources_gguf_kquant",
     "checkpoint_quant_method",
     "checkpoint_gptq_group_size",
 ]

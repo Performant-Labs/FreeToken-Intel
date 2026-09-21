@@ -62,6 +62,8 @@ __all__ = [
     "load_gguf_metadata",
     "parse_config",
     "iter_weights",
+    "iter_moe_expert_raw_banks",
+    "gguf_expert_row_bytes",
     "GgufModel",
     "GGUF_ARCH_TO_REGISTRY_KEY",
 ]
@@ -633,6 +635,29 @@ def _gguf_block_size_and_type_size(ggml_type: int) -> Tuple[int, int]:
     return _gguf_ref.GGML_QUANT_SIZES[qtype]
 
 
+def gguf_expert_row_bytes(ggml_type: int, n_elements: int) -> int:
+    """Real packed byte length of ONE expert's raw GGML-quantized row, given
+    just ``ggml_type`` and the (architecture-constant) element count of one
+    expert's weight matrix -- issue `models-gguf-lazy-packed-dequant`, #282.
+
+    This is the same arithmetic :func:`iter_moe_expert_raw_banks` uses to
+    slice a whole packed ``ffn_*_exps`` tensor's raw bytes into per-expert
+    rows, exposed here so a caller that only holds a (possibly zero-padded,
+    see :func:`freetoken.models.weight.stream_moe_expert_sources_gguf_kquant`'s
+    own docstring for why a bank row can be padded) bank row can recover the
+    REAL, unpadded byte length before decoding it --
+    :class:`freetoken.moe.offload_cache.SlotWeightAccessor` is exactly this
+    caller, at compute time.
+    """
+    block_size, type_size = _gguf_block_size_and_type_size(ggml_type)
+    if n_elements % block_size != 0:
+        raise GGUFFormatError(
+            f"gguf_expert_row_bytes: {n_elements} elements is not a multiple of "
+            f"block size {block_size} for ggml_type {ggml_type}"
+        )
+    return (n_elements // block_size) * type_size
+
+
 def iter_weights(
     model_path: str,
     device,
@@ -722,6 +747,108 @@ def iter_weights(
                     yield f"{prefix}.mlp.experts.gate_up_proj", gate_up.to("cpu")
                 if down is not None:
                     yield f"{prefix}.mlp.experts.down_proj", _read_and_dequant(down).to("cpu")
+
+
+def iter_moe_expert_raw_banks(model_path: str):
+    """Yield ``(layer, bank_name, raw, ggml_type)`` for every MoE layer's
+    packed routed-expert tensor (``ffn_gate_exps`` / ``ffn_up_exps`` /
+    ``ffn_down_exps``, ``bank_name`` one of ``"gate"``/``"up"``/``"down"``)
+    -- reading the RAW on-disk GGML-quantized bytes straight into a
+    ``[num_experts, row_bytes]`` uint8 tensor, WITHOUT ever dequantizing
+    (issue `models-gguf-lazy-packed-dequant`, #282).
+
+    This is the fix for the RAM blowup :func:`iter_weights` has for the MoE
+    expert banks specifically: that function reads each ``ffn_*_exps``
+    tensor and immediately dequantizes the WHOLE ``[num_experts, ...]``
+    layer to bf16 (a real target checkpoint's own math, from #282's own
+    issue body: 256 experts x 41 layers -> ~66GB of bf16 host RAM, when the
+    on-disk ``q4_k_m`` quant is only 22.7GB). This function instead keeps
+    every expert's bytes in their original packed, quantized form -- the
+    same "packed host bank, dequantize lazily at compute time" design this
+    port already uses for GPTQ/FP8/MXFP4/INT8 (see
+    :mod:`freetoken.moe.offload_cache`'s own module docstring) -- so the
+    resident host RAM after this function is fully consumed is bounded by
+    roughly the checkpoint's own on-disk MoE-tensor size, not its
+    dequantized-to-bf16 expansion.
+
+    GGUF stores each ``ffn_*_exps`` tensor with the expert axis as its own
+    (raw, ne-order) SLOWEST-varying dimension -- verified against the real
+    target checkpoint's own header (Zot: ``general/qwen3.6-35b-a3b:q4_k_m-
+    gguf``): ``ffn_gate_exps.weight``'s raw shape is ``(hidden,
+    moe_intermediate, num_experts)`` (``num_experts`` last), same for
+    ``ffn_up_exps``; ``ffn_down_exps``'s raw shape is ``(moe_intermediate,
+    hidden, num_experts)``. Since GGUF's on-disk byte layout is C-order in
+    that same (ne-index-descending) axis order, expert ``e``'s bytes occupy
+    one CONTIGUOUS ``row_bytes``-sized span, in ascending expert order, with
+    no interleaving between experts -- so the whole tensor's raw byte blob
+    can be read in one ``file.read()`` and reshaped directly into
+    ``[num_experts, row_bytes]``, with no per-expert seek/read and no
+    dequantization at all.
+
+    Verified against the real target checkpoint (issue #282's own safety
+    instructions: read real bytes, never assume a per-expert-varying quant
+    type without checking): the real checkpoint's ``ffn_gate_exps``/
+    ``ffn_up_exps`` are uniformly ``Q4_K`` across all 41 layers, but
+    ``ffn_down_exps`` is NOT uniform -- 38 layers are ``Q5_K`` and 3 are
+    ``Q6_K`` (llama.cpp's own "mixed" quantization heuristic keeps a few
+    layers at higher precision). This is a real, per-LAYER varying
+    ``ggml_type`` (not per-expert WITHIN one tensor -- GGUF's tensor-info
+    section stores exactly one ``ggml_type`` per tensor, so a single
+    ``ffn_*_exps`` tensor's experts always share one quant type), so
+    ``ggml_type`` is yielded per ``(layer, bank_name)``, and
+    :func:`freetoken.models.weight.stream_moe_expert_sources_gguf_kquant`
+    (the caller that folds this generator's output into per-layer banks)
+    handles the resulting per-layer row-byte-length mismatch.
+    """
+    import numpy as _np
+    import torch as _torch
+
+    gguf_file = load_gguf(model_path)
+    arch = gguf_file.metadata.get("general.architecture")
+    num_experts = _arch_get(gguf_file.metadata, arch, "expert_count")
+    if not num_experts:
+        return  # not a MoE checkpoint -- nothing to yield
+    num_experts = int(num_experts)
+
+    by_layer: Dict[int, Dict[str, GGUFTensorInfo]] = {}
+    wanted = {
+        "ffn_gate_exps.weight": "gate",
+        "ffn_up_exps.weight": "up",
+        "ffn_down_exps.weight": "down",
+    }
+    for name, info in gguf_file.tensors.items():
+        m = _LAYER_RE.match(name)
+        if not m:
+            continue
+        suffix = m.group(2)
+        if suffix in wanted:
+            by_layer.setdefault(int(m.group(1)), {})[suffix] = info
+
+    with open(gguf_file.path, "rb") as fh:
+        for layer in sorted(by_layer):
+            suffixes = by_layer[layer]
+            for gguf_suffix, bank_name in wanted.items():
+                info = suffixes.get(gguf_suffix)
+                if info is None:
+                    continue
+                if info.shape[-1] != num_experts:
+                    raise GGUFFormatError(
+                        f"{info.name}: expected the expert axis (last ne-order dim) "
+                        f"to be {num_experts}, got {info.shape[-1]}"
+                    )
+                n_elements_per_expert = info.n_elements // num_experts
+                row_bytes = gguf_expert_row_bytes(info.ggml_type, n_elements_per_expert)
+                n_bytes = row_bytes * num_experts
+                fh.seek(info.offset)
+                raw = fh.read(n_bytes)
+                if len(raw) != n_bytes:
+                    raise GGUFFormatError(
+                        f"{info.name}: read {len(raw)} bytes, expected {n_bytes} "
+                        "(truncated file?)"
+                    )
+                arr = _np.frombuffer(raw, dtype=_np.uint8).reshape(num_experts, row_bytes)
+                tensor = _torch.from_numpy(arr.copy())  # owns its memory, independent of `raw`
+                yield layer, bank_name, tensor, info.ggml_type
 
 
 class GgufModel:
