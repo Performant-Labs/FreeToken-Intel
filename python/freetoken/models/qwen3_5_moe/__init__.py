@@ -635,7 +635,19 @@ def _xpu_available() -> bool:
 
 
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    """L2-norm along ``dim`` (FLA's convention, matching the reference)."""
+    """L2-norm along ``dim`` (FLA's convention, matching the reference).
+
+    issue #287: ggml's own ``ggml_l2_norm`` uses a slightly different eps
+    formula (``x / max(||x||, eps)`` rather than this function's
+    ``x / sqrt(sum(x^2) + eps)``) -- investigated and confirmed
+    numerically negligible for real checkpoint data (eps=1e-6 either way,
+    real vector norms are never close to it) and NOT the source of this
+    issue's actual bug (a separate RMSNorm zero-init un-bake issue, see
+    ``freetoken.models.gguf``'s ``_ZERO_INIT_RMS_NORM_UNBAKE``). Kept at
+    this port's original formula, matching ``tests/reference_qwen35.py``'s
+    own independent cross-check exactly, rather than chasing a
+    ggml-literal match that buys no real correctness here.
+    """
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
 
@@ -690,6 +702,17 @@ class _RMSNorm:
     def forward(self, x):
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whereas Qwen3.5Moe is (x * w).to(float16).
+        # Zero-init weight (matches tests/reference_qwen35.py's own comment
+        # and the real HF/safetensors checkpoint's convention): the trained
+        # parameter is an offset from 1 (0 == identity scale), so the
+        # runtime multiplier is `1 + weight`, not `weight` alone -- this is
+        # correct for a real HF-format checkpoint. See issue #287 / the
+        # GGUF-loading side (`freetoken.models.gguf`) for why a *GGUF*
+        # checkpoint's own `*_norm.weight` bytes need their own load-time
+        # un-transform instead of a change here: GGUF's export already
+        # bakes the `+1` in (mirroring the `ssm_a` `-exp()` bake-in this
+        # same issue found and fixed), so this shared forward must stay
+        # exactly as upstream/HF loading expects it.
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
@@ -984,8 +1007,21 @@ class _GatedDeltaNet:
         key = key.reshape(T, self.num_k_heads, self.head_k_dim)
         value = value.reshape(T, self.num_v_heads, self.head_v_dim)
         if self.group_ratio > 1:
-            query = query.repeat_interleave(self.group_ratio, dim=1)
-            key = key.repeat_interleave(self.group_ratio, dim=1)
+            # issue #287: ggml's GATED_DELTA_NET CPU kernel (llama.cpp,
+            # ggml-cpu/ops.cpp's ggml_compute_forward_gated_delta_net_one_chunk,
+            # confirmed correct against the real checkpoint) maps value head
+            # ``v`` to q/k head ``v % num_k_heads`` -- a TILE grouping
+            # ([q0..q15,q0..q15] for 32 value heads over 16 k heads), not the
+            # HF reference Python's own ``repeat_interleave`` (a BLOCK grouping,
+            # [q0,q0,q1,q1,...]). The two give a different q/k-per-value-head
+            # pairing -- same tensor shape, no crash, silently wrong numbers.
+            # Verified directly against ggml's source (the mapping was
+            # `iv1 % neq1`, not `iv1 // group_ratio`) and against real
+            # `llama-eval-callback` output on this exact checkpoint.
+            # ``.repeat(1, group_ratio, 1)`` (tile) matches ggml's mapping;
+            # ``repeat_interleave`` does not.
+            query = query.repeat(1, self.group_ratio, 1)
+            key = key.repeat(1, self.group_ratio, 1)
         beta = b.sigmoid()
         # The decay rate is computed in float32 (the reference does): upcast the
         # decay-log (A_log) and the per-token decay input (a) + its bias so a
