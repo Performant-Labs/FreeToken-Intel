@@ -136,6 +136,54 @@ def _arch_get(metadata: Dict[str, Any], arch: str, suffix: str, default: Any = N
     return metadata.get(f"{arch}.{suffix}", default)
 
 
+def _gguf_real_num_layers(metadata: Dict[str, Any], arch: str, block_count: int) -> int:
+    """The checkpoint's real decoder-layer count -- ``block_count`` minus any
+    ``nextn_predict_layers`` (issue #287).
+
+    Root cause of #287's "loads and generates, but garbage output" bug:
+    some GGUF checkpoints (this port's own real target, Qwen3.6-35B-A3B,
+    included) append MTP (multi-token-prediction speculative-decode draft
+    head) blocks onto the END of the tensor namespace, using the exact same
+    ``blk.N.*`` naming convention a real decoder layer uses -- including a
+    full spare ``attn_q``/``attn_k``/``attn_v``/``ffn_gate_inp``/
+    ``ffn_*_exps``/``ffn_*_shexp`` tensor set, which is what made this look
+    like a real "extra full-attention layer the interval formula doesn't
+    predict" (see the pre-fix ``_qwen35_moe_layer_types`` docstring, and
+    issue #279's own investigation) rather than what it actually is: an
+    entirely separate, auxiliary module this port's engine never runs.
+
+    The GGUF spec has an explicit, unambiguous signal for this --
+    ``{arch}.nextn_predict_layers`` (verified against the real target
+    checkpoint's own header: ``qwen35moe.block_count=41``,
+    ``qwen35moe.nextn_predict_layers=1``) -- which #279's own
+    implementation read the checkpoint's tensor names for evidence of an
+    extra layer but never cross-checked against this metadata field. An
+    independent reference implementation (``llama.cpp``, built locally with
+    Vulkan) confirms this directly: loading the same real checkpoint file
+    logs ``model has unused tensor blk.40.*.weight -- ignoring`` for
+    *every* tensor of the last block (attn/ffn/shexp AND the ``nextn.*``
+    tensors this port already dropped) and produces a coherent answer,
+    proving upstream treats block 40 as 100% outside the main 40-layer
+    decoder stack, not merely "MTP metadata to ignore within an otherwise
+    real 41st layer."
+
+    Every caller that walks ``blk.N.*`` tensors by real per-layer index
+    (``iter_weights``, ``iter_moe_expert_raw_banks``, and -- via
+    ``cfg.num_layers`` -- ``_qwen35_moe_layer_types``'s own ``range(
+    num_layers)`` loop) must stop before the MTP block(s), or the engine
+    builds and runs a spurious extra decoder layer whose weights are
+    semantically a different module's, corrupting the final hidden state
+    right before ``output_norm``/``lm_head`` -- silently, since it never
+    produces a NaN/Inf, only wrong values (exactly what #287's own
+    numerical tracing found: healthy layer-by-layer hidden-state norms, but
+    incoherent final output).
+    """
+    nextn = _arch_get(metadata, arch, "nextn_predict_layers")
+    if not nextn:
+        return block_count
+    return max(0, block_count - int(nextn))
+
+
 def _apply_key_map(cfg: ModelConfig, metadata: Dict[str, Any], arch: str, key_map: Dict[str, str]) -> None:
     for gguf_suffix, field_name in key_map.items():
         value = _arch_get(metadata, arch, gguf_suffix)
@@ -193,15 +241,19 @@ def _qwen35_moe_layer_types(model_path: Optional[str], num_layers: int) -> Optio
     ``full_attention_interval`` field: the real target checkpoint (Zot:
     ``general/qwen3.6-35b-a3b:q4_k_m-gguf``, directly inspected via an HTTP
     range request while building this issue) does *not* follow a clean
-    interval pattern -- it has 41 layers, ``full_attention_interval=4``
-    (predicting exactly one full-attention layer per 4, i.e. indices
-    3, 7, 11, ..., 39), but its own header shows an EXTRA full-attention
-    layer at index 40 (the very last layer) the formula never predicts.
-    Trusting the formula alone would build a Gated-Delta-Net sub-module for
-    that layer, but the checkpoint's own tensors for it are ``attn_q``/
-    ``attn_k``/``attn_v`` (full-attention), not ``attn_qkv``/``ssm_*`` --
-    every weight for that layer would then silently fail to place (wrong
-    param names) or shape-mismatch. Returns ``None`` (falls back to the
+    interval pattern within its real decoder stack -- ``full_attention_
+    interval=4`` predicts exactly one full-attention layer per 4 (indices
+    3, 7, 11, ..., 39). ``num_layers`` here is already the checkpoint's
+    REAL decoder-layer count (issue #287's own fix,
+    :func:`_gguf_real_num_layers` -- ``block_count`` minus any trailing MTP
+    block(s), e.g. 40 for the real target, not the raw ``block_count`` of
+    41), so this loop never reaches the MTP block at all and needs no
+    special-case for it. (An earlier version of this function treated that
+    MTP block as an extra, formula-defying 41st full-attention layer --
+    that was #287's root cause: an independent reference implementation,
+    ``llama.cpp``, proved the block's attn/ffn tensors are the MTP draft
+    head's own, not a real decoder layer's, by ignoring every one of them
+    during ordinary generation.) Returns ``None`` (falls back to the
     ``qwen3_5_moe`` forward's own interval-formula default) when
     ``model_path`` is absent or not a readable GGUF file -- e.g. a caller
     that only has the raw metadata dict (this module's own synthetic
@@ -346,6 +398,8 @@ def parse_config(
     cfg = ModelConfig(architectures=[str(metadata.get("general.name") or arch)])
     _apply_key_map(cfg, metadata, arch, _DENSE_KEYS)
     _apply_key_map(cfg, metadata, arch, _ATTENTION_KEYS)
+    if cfg.num_layers is not None:
+        cfg.num_layers = _gguf_real_num_layers(metadata, arch, int(cfg.num_layers))
 
     # vocab_size: prefer the checkpoint's own explicit KV entry, but every
     # real GGUF file also carries the tokenizer's own token list -- fall back
@@ -701,13 +755,25 @@ def iter_weights(
     arch = gguf_file.metadata.get("general.architecture")
     suffix_map = GGUF_ARCH_TO_SUFFIX_MAP.get(arch, _DENSE_SUFFIX_MAP)
     reshape_map = _QWEN35_MOE_RESHAPE if arch in _QWEN35_MOE_ARCHITECTURES else {}
+    block_count = _arch_get(gguf_file.metadata, arch, "block_count")
+    real_num_layers = (
+        _gguf_real_num_layers(gguf_file.metadata, arch, int(block_count)) if block_count else None
+    )
 
     by_layer: Dict[int, Dict[str, GGUFTensorInfo]] = {}
     top_level: Dict[str, GGUFTensorInfo] = {}
     for name, info in gguf_file.tensors.items():
         m = _LAYER_RE.match(name)
         if m:
-            by_layer.setdefault(int(m.group(1)), {})[m.group(2)] = info
+            layer_idx = int(m.group(1))
+            # Issue #287: a trailing MTP (multi-token-prediction) block uses
+            # the exact same blk.N.* naming as a real decoder layer -- see
+            # _gguf_real_num_layers's own docstring for why every one of its
+            # tensors (not just nextn.*) must be excluded here, not just
+            # skipped by suffix.
+            if real_num_layers is not None and layer_idx >= real_num_layers:
+                continue
+            by_layer.setdefault(layer_idx, {})[m.group(2)] = info
         else:
             top_level[name] = info
 
@@ -809,6 +875,10 @@ def iter_moe_expert_raw_banks(model_path: str):
     if not num_experts:
         return  # not a MoE checkpoint -- nothing to yield
     num_experts = int(num_experts)
+    block_count = _arch_get(gguf_file.metadata, arch, "block_count")
+    real_num_layers = (
+        _gguf_real_num_layers(gguf_file.metadata, arch, int(block_count)) if block_count else None
+    )
 
     by_layer: Dict[int, Dict[str, GGUFTensorInfo]] = {}
     wanted = {
@@ -820,9 +890,14 @@ def iter_moe_expert_raw_banks(model_path: str):
         m = _LAYER_RE.match(name)
         if not m:
             continue
+        layer_idx = int(m.group(1))
+        # Issue #287: exclude a trailing MTP block's routed-expert-shaped
+        # tensors too -- see _gguf_real_num_layers's own docstring.
+        if real_num_layers is not None and layer_idx >= real_num_layers:
+            continue
         suffix = m.group(2)
         if suffix in wanted:
-            by_layer.setdefault(int(m.group(1)), {})[suffix] = info
+            by_layer.setdefault(layer_idx, {})[suffix] = info
 
     with open(gguf_file.path, "rb") as fh:
         for layer in sorted(by_layer):
