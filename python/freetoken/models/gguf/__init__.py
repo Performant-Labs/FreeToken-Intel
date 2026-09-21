@@ -639,6 +639,36 @@ _QWEN35_MOE_RESHAPE = {
 # *same* forward code stays correct for both loading paths -- this is a
 # checkpoint-format quirk of GGUF's own export, not a real difference in
 # what the model parameter means.
+_ZERO_INIT_RMS_NORM_SUFFIXES = (
+    "attn_norm.weight",
+    "post_attention_norm.weight",
+    "attn_q_norm.weight",
+    "attn_k_norm.weight",
+)
+# issue #287 (second bug, found by direct numerical comparison against a real
+# llama-eval-callback dump of this exact checkpoint): `_RMSNorm.forward`
+# (qwen3_5_moe/__init__.py) computes `output * (1.0 + weight)` -- a real,
+# zero-init HF convention (see tests/reference_qwen35.py's own "(1+weight),
+# zero-init" comment and its independent-reference cross-check, which this
+# fix keeps passing) where the trained parameter is an *offset* from 1 (0 ==
+# identity scale). llama.cpp's own GGUF export bakes that `+1` in at
+# conversion time (its own runtime `build_norm`/`ggml_rms_norm` graph is a
+# plain multiply, no separate `+1` node anywhere), so a real checkpoint's
+# on-disk `*_norm.weight` bytes are already `1 + true_weight` -- centered on
+# ~1.0 (verified: blk.0.attn_norm.weight's real dequantized values have mean
+# 1.031, range 0.92-1.33, never near 0). Applying the shared `(1.0 + weight)`
+# forward on top of that pre-shifted value double-adds the offset (effective
+# multiplier ~2.0 instead of ~1.0) -- this alone produced almost exactly the
+# ~2x magnitude divergence this issue chased from `linear_attn_qkv_mixed`
+# onward (-653.92 this port vs. -317.92 llama.cpp, pre-fix). Every `_RMSNorm`
+# (never `_RMSNormGated`, whose own forward has no `1 +` and needs no
+# transform here) instance's own weight tensor needs the same un-transform:
+# q_norm/k_norm (full-attention layers), input_layernorm/post_attention_
+# layernorm (every layer), and the top-level final norm (`output_norm.weight`
+# -> `model.norm.weight`, handled separately in `iter_weights` below, since
+# the per-layer suffix-map loop never reaches a top-level tensor name).
+_ZERO_INIT_RMS_NORM_UNBAKE = lambda t: t - 1.0  # noqa: E731
+
 _QWEN35_MOE_VALUE_TRANSFORM = {
     # Tensor methods only (no bare `torch.*` call) -- this dict is defined at
     # module scope, which must stay torch-free at *import* time; the lambda
@@ -647,6 +677,14 @@ _QWEN35_MOE_VALUE_TRANSFORM = {
     # would need `torch` bound as a module-level global, which this file
     # deliberately never does (see reader.py's own torch-free docstring).
     "ssm_a": lambda t: (-t).log(),
+    **{suffix: _ZERO_INIT_RMS_NORM_UNBAKE for suffix in _ZERO_INIT_RMS_NORM_SUFFIXES},
+}
+# The top-level (non-per-layer) counterpart: `output_norm.weight` ->
+# `model.norm.weight` feeds the same zero-init `_RMSNorm`, so it needs the
+# identical un-transform -- keyed by its OWN gguf name (not a per-layer
+# suffix), applied in `iter_weights`'s top-level loop below.
+_QWEN35_MOE_TOP_LEVEL_VALUE_TRANSFORM = {
+    "output_norm.weight": _ZERO_INIT_RMS_NORM_UNBAKE,
 }
 
 # GGUF architecture string -> the suffix map iter_weights uses for that
@@ -787,6 +825,9 @@ def iter_weights(
     suffix_map = GGUF_ARCH_TO_SUFFIX_MAP.get(arch, _DENSE_SUFFIX_MAP)
     reshape_map = _QWEN35_MOE_RESHAPE if arch in _QWEN35_MOE_ARCHITECTURES else {}
     value_transform_map = _QWEN35_MOE_VALUE_TRANSFORM if arch in _QWEN35_MOE_ARCHITECTURES else {}
+    top_level_value_transform_map = (
+        _QWEN35_MOE_TOP_LEVEL_VALUE_TRANSFORM if arch in _QWEN35_MOE_ARCHITECTURES else {}
+    )
     block_count = _arch_get(gguf_file.metadata, arch, "block_count")
     real_num_layers = (
         _gguf_real_num_layers(gguf_file.metadata, arch, int(block_count)) if block_count else None
@@ -822,7 +863,11 @@ def iter_weights(
             for gguf_name, hf_name in _TOP_LEVEL_MAP.items():
                 info = top_level.get(gguf_name)
                 if info is not None:
-                    yield hf_name, _read_and_dequant(info).to(device)
+                    tensor = _read_and_dequant(info)
+                    transform = top_level_value_transform_map.get(gguf_name)
+                    if transform is not None:
+                        tensor = transform(tensor)
+                    yield hf_name, tensor.to(device)
 
         for layer in sorted(by_layer):
             suffixes = by_layer[layer]
