@@ -179,6 +179,97 @@ def _qwen35_moe_attrs(metadata: Dict[str, Any], arch: str) -> Dict[str, Any]:
     }
 
 
+def _qwen35_moe_layer_types(model_path: Optional[str], num_layers: int) -> Optional[list]:
+    """Per-layer ``'full_attention'`` / ``'linear_attention'`` split, read
+    directly from a real ``qwen35moe`` GGUF file's own per-layer tensor
+    names (issue #279) -- a full-attention layer carries ``attn_q.weight``,
+    a linear-attention (Gated-Delta-Net) layer carries ``attn_qkv.weight``
+    instead (see ``_QWEN35_MOE_SUFFIX_MAP``'s own docstring for the full
+    tensor-name evidence).
+
+    This is NOT redundant with ``_qwen35_moe_attrs``'s own
+    ``full_attention_interval`` field: the real target checkpoint (Zot:
+    ``general/qwen3.6-35b-a3b:q4_k_m-gguf``, directly inspected via an HTTP
+    range request while building this issue) does *not* follow a clean
+    interval pattern -- it has 41 layers, ``full_attention_interval=4``
+    (predicting exactly one full-attention layer per 4, i.e. indices
+    3, 7, 11, ..., 39), but its own header shows an EXTRA full-attention
+    layer at index 40 (the very last layer) the formula never predicts.
+    Trusting the formula alone would build a Gated-Delta-Net sub-module for
+    that layer, but the checkpoint's own tensors for it are ``attn_q``/
+    ``attn_k``/``attn_v`` (full-attention), not ``attn_qkv``/``ssm_*`` --
+    every weight for that layer would then silently fail to place (wrong
+    param names) or shape-mismatch. Returns ``None`` (falls back to the
+    ``qwen3_5_moe`` forward's own interval-formula default) when
+    ``model_path`` is absent or not a readable GGUF file -- e.g. a caller
+    that only has the raw metadata dict (this module's own synthetic
+    config-only tests), matching the pre-#279 behavior for that case.
+    """
+    if not model_path:
+        return None
+    try:
+        names = set(gguf_tensor_names(model_path))
+    except Exception:
+        return None
+    layer_types = []
+    for i in range(num_layers):
+        if f"blk.{i}.attn_qkv.weight" in names:
+            layer_types.append("linear_attention")
+        elif f"blk.{i}.attn_q.weight" in names:
+            layer_types.append("full_attention")
+        else:
+            # An unrecognized/missing layer shape (e.g. a caller-crafted
+            # metadata-only path that doesn't correspond to this file's real
+            # tensors) -- rather than guess, defer to the interval-formula
+            # fallback for every layer.
+            return None
+    return layer_types
+
+
+def _qwen35_moe_text_config(
+    metadata: Dict[str, Any],
+    arch: str,
+    cfg: ModelConfig,
+    linear_attrs: Dict[str, Any],
+    model_path: Optional[str],
+) -> Dict[str, Any]:
+    """The ``cfg.attrs["text_config"]`` shape ``freetoken.models.qwen3_5_moe``'s
+    own forward pass (``_Qwen35DecoderLayer.__init__``,
+    ``Qwen3_5MoEForCausalLM.__init__``, ``_Qwen35MoE.__init__``) actually
+    reads -- built from the same GDN-role fields ``_qwen35_moe_attrs``
+    already extracted (``linear_attrs``, this module's own #272 convention),
+    plus the handful of extra fields that convention doesn't carry
+    (``partial_rotary_factor`` as a *fraction*, not a raw dim count;
+    ``shared_expert_intermediate_size``; the exact per-layer ``layer_types``
+    split, see :func:`_qwen35_moe_layer_types`).
+    """
+    head_dim = cfg.head_dim or (
+        (cfg.hidden_size // cfg.num_attention_heads) if cfg.num_attention_heads else None
+    )
+    partial_rotary_dim = linear_attrs.get("partial_rotary_dim")
+    partial_rotary_factor = (
+        (partial_rotary_dim / head_dim) if partial_rotary_dim and head_dim else 1.0
+    )
+    text_config: Dict[str, Any] = {
+        "rms_norm_eps": cfg.attrs.get("rms_norm_eps", 1e-6),
+        "linear_num_key_heads": linear_attrs.get("linear_num_key_heads"),
+        "linear_num_value_heads": linear_attrs.get("linear_num_value_heads"),
+        "linear_key_head_dim": linear_attrs.get("linear_key_head_dim"),
+        "linear_value_head_dim": linear_attrs.get("linear_value_head_dim"),
+        "linear_conv_kernel_dim": linear_attrs.get("linear_conv_kernel_dim"),
+        "partial_rotary_factor": partial_rotary_factor,
+    }
+    if linear_attrs.get("full_attention_interval") is not None:
+        text_config["full_attention_interval"] = linear_attrs["full_attention_interval"]
+    shared_inter = _arch_get(metadata, arch, "expert_shared_feed_forward_length")
+    if shared_inter is not None:
+        text_config["shared_expert_intermediate_size"] = shared_inter
+    layer_types = _qwen35_moe_layer_types(model_path, int(cfg.num_layers or 0))
+    if layer_types is not None:
+        text_config["layer_types"] = layer_types
+    return text_config
+
+
 def parse_config(
     path_or_metadata: "str | Dict[str, Any]",
     *,
@@ -213,10 +304,17 @@ def parse_config(
     ``use_offload_moe`` / ``use_cpu_moe`` / ``use_hybrid`` / ``moe_cpu_layers``
     mirror every other architecture's ``parse_config`` signature (the loader
     calls every architecture uniformly); ``model_path`` is accepted for the
-    same reason and unused here (GGUF's metadata never needs a checkpoint-
-    shape probe the way ``qwen3_moe``'s ``head_dim`` recovery does).
+    same reason and is mostly unused here (GGUF's metadata never needs a
+    checkpoint-shape probe the way ``qwen3_moe``'s ``head_dim`` recovery
+    does) -- EXCEPT for ``qwen35moe``'s per-layer hybrid split (issue
+    #279): the real target checkpoint's own header does not follow a clean
+    ``full_attention_interval`` pattern (it carries one extra full-attention
+    layer beyond what the formula predicts, confirmed against the real
+    Qwen3.6-35B-A3B checkpoint's own header), so when ``model_path`` names a
+    readable GGUF file, ``_qwen35_moe_layer_types`` reads the actual
+    per-layer tensor names to build an exact ``layer_types`` list instead of
+    trusting the formula.
     """
-    del model_path  # accepted for call-signature parity with the other architectures' parse_config; unused.
     if isinstance(path_or_metadata, dict):
         metadata = path_or_metadata
     elif hasattr(path_or_metadata, "to_dict"):
@@ -232,6 +330,12 @@ def parse_config(
         metadata = path_or_metadata.to_dict()
     else:
         metadata = load_gguf_metadata(path_or_metadata)
+        # A caller that passed the GGUF path directly as path_or_metadata
+        # (rather than via the model_path kwarg the real loader always
+        # supplies) still gets the tensor-name-verified qwen35moe
+        # layer_types split below -- there is no reason to require both.
+        if model_path is None:
+            model_path = path_or_metadata
 
     arch = metadata.get("general.architecture")
     if not arch:
@@ -279,7 +383,24 @@ def parse_config(
         cfg.num_moe_layers = (cfg.num_layers - cfg.first_k_dense_replace) if cfg.num_layers else None
 
     if arch in _QWEN35_MOE_ARCHITECTURES:
-        cfg.attrs["gguf_linear_attention"] = _qwen35_moe_attrs(metadata, arch)
+        linear_attrs = _qwen35_moe_attrs(metadata, arch)
+        cfg.attrs["gguf_linear_attention"] = linear_attrs
+        # freetoken.models.qwen3_5_moe's own forward (_Qwen35DecoderLayer /
+        # _Qwen35Attention / Qwen3_5MoEForCausalLM.__init__) does NOT read
+        # the GDN dims from cfg.attrs["gguf_linear_attention"] above (that
+        # key is this module's own #272 convention) -- it reads
+        # cfg.attrs["head_dim"], cfg.attrs["rope_theta"], and
+        # cfg.attrs["text_config"][...] (its own HF-sourced convention, see
+        # that module's own parse_config). A GGUF-loaded qwen35moe config
+        # must therefore ALSO populate those exact keys, or model
+        # construction crashes with a KeyError the moment the loader builds
+        # the real forward-side model -- found empirically while wiring
+        # this issue end to end (#278's own qwen3moe path never hits this:
+        # Qwen3MoeForCausalLM's forward reads plain ModelConfig fields, not
+        # config.attrs["text_config"]).
+        cfg.attrs["head_dim"] = cfg.head_dim
+        cfg.attrs["rope_theta"] = cfg.rope_theta
+        cfg.attrs["text_config"] = _qwen35_moe_text_config(metadata, arch, cfg, linear_attrs, model_path)
 
     cfg.use_offload_moe = bool(use_offload_moe)
     cfg.use_cpu_moe = bool(use_cpu_moe)
@@ -301,11 +422,11 @@ _LAYER_RE = _re.compile(r"^blk\.(\d+)\.(.+)$")
 # gguf-py's own MODEL_TENSORS[MODEL_ARCH.QWEN3MOE] table (matches upstream
 # llama.cpp's real tensor names 1:1 with Qwen3MoeForCausalLM's own HF
 # key spelling -- q/k/v are separate projections with their own q_norm/
-# k_norm, unlike qwen35moe's fused attn_qkv + Gated-Delta-Net layers,
-# which are NOT covered here: qwen35moe is excluded from the hybrid
-# split already (see qwen3_5_moe._forward_hybrid's "gguf" exclusion)
-# and its GDN tensor wiring (ssm_*, attn_gate, shared-expert ffn_*_shexp)
-# is real, separable follow-up work, not in this issue's scope).
+# k_norm), used for every architecture EXCEPT qwen35moe (dispatched via
+# GGUF_ARCH_TO_SUFFIX_MAP below): qwen35moe's fused attn_qkv +
+# Gated-Delta-Net linear-attention layers + shared-expert MoE use a
+# genuinely different tensor set, mapped separately by
+# _QWEN35_MOE_SUFFIX_MAP (issue #279).
 _DENSE_SUFFIX_MAP = {
     "attn_norm.weight": "input_layernorm.weight",
     "attn_q.weight": "self_attn.q_proj.weight",
@@ -327,6 +448,126 @@ _TOP_LEVEL_MAP = {
     "token_embd.weight": "model.embed_tokens.weight",
     "output_norm.weight": "model.norm.weight",
     "output.weight": "lm_head.weight",
+}
+
+# qwen35moe (Qwen3.5/3.6's hybrid linear-attention + shared-expert MoE,
+# issue #279): the real target's own tensor set. Verified directly against
+# the real target checkpoint's own header (Zot registry:
+# ``general/qwen3.6-35b-a3b:q4_k_m-gguf``, read via an HTTP range request,
+# no full 22.7GB pull needed) AND against gguf-py's own
+# ``MODEL_TENSORS[MODEL_ARCH.QWEN35MOE]`` table -- the real file's actual
+# per-layer tensor names for both layer kinds, cross-checked against
+# freetoken.models.qwen3_5_moe's own real parameter names (that module's
+# ``_GatedDeltaNet`` / ``_Qwen35Attention`` / ``_Qwen35MoE`` /
+# ``_Qwen35DecoderLayer`` __init__ bodies, read in full while building this
+# mapping -- NOT guessed):
+#
+# Full-attention (gated GQA) layer -- identical spelling to _DENSE_SUFFIX_MAP's
+# qwen3moe entries (separate q/k/v, their own q_norm/k_norm), EXCEPT the
+# post-attention norm's own GGUF name: qwen35moe spells it
+# "post_attention_norm.weight", not qwen3moe's "ffn_norm.weight" (confirmed
+# against the real checkpoint's own header -- both layer kinds share this
+# tensor).
+#
+# Linear-attention (Gated-Delta-Net) layer -- the real per-layer tensor set,
+# with shapes (GGUF's ne-order, reversed per _gguf_to_pytorch_shape) checked
+# against _GatedDeltaNet's own constructor one by one on the real checkpoint:
+#   attn_qkv.weight    [key_dim*2+value_dim, hidden]  -> in_proj_qkv.weight
+#   attn_gate.weight   [value_dim, hidden]             -> in_proj_z.weight
+#     (NOT the full-attention output gate -- qwen35moe's full-attention gate
+#     is fused into attn_q's own doubled output width instead, matching
+#     _Qwen35Attention.q_proj's own [num_heads*head_dim*2, hidden] shape; a
+#     linear-attention layer never has an attn_q tensor at all, so there is
+#     no ambiguity between the two roles.)
+#   ssm_alpha.weight   [num_v_heads, hidden]           -> in_proj_a.weight
+#     (_GatedDeltaNet.forward's own "a" -- the decay-rate input; GGUF's own
+#     "alpha" name matches this role's own math exactly, not a guess.)
+#   ssm_beta.weight    [num_v_heads, hidden]           -> in_proj_b.weight
+#     (_GatedDeltaNet.forward's own "b" -- the delta-rule beta input.)
+#   ssm_conv1d.weight  [conv_dim, kernel] (2-D on disk) -> conv1d.weight
+#     (nn.Conv1d's own weight is 3-D, [conv_dim, 1, kernel] -- groups=conv_dim
+#     means in_channels/groups=1 -- so this ONE tensor needs an inserted
+#     middle dim at load time; see _QWEN35_MOE_RESHAPE / iter_weights.)
+#   ssm_dt.bias        [num_v_heads]                   -> dt_bias
+#     (stored under a ".bias" GGUF suffix, not ".weight" -- copied as-is,
+#     already the exact target shape.)
+#   ssm_a              [num_v_heads] (no suffix at all) -> A_log
+#   ssm_norm.weight    [head_v_dim]                     -> norm.weight
+#     (_RMSNormGated's own weight -- the Gated-Delta-Net output norm.)
+#   ssm_out.weight     [hidden, value_dim]               -> out_proj.weight
+#
+# Shared expert (always-on, dense -- never in the routed-expert banks):
+#   ffn_gate_inp_shexp.weight  [hidden] (1-D on disk)  -> shared_expert_gate.weight
+#     (LinearReplicated(hidden, 1)'s weight is 2-D, [1, hidden] -- this ONE
+#     tensor needs a leading dim inserted at load time; see
+#     _QWEN35_MOE_RESHAPE / iter_weights.)
+#   ffn_gate_shexp.weight / ffn_up_shexp.weight / ffn_down_shexp.weight
+#     -> shared_expert.gate_proj.weight / up_proj.weight / down_proj.weight
+#     (plain dense Linear weights, same shape convention as a routed
+#     expert's own gate_proj/up_proj/down_proj -- but NOT packed into the
+#     [E, ...] bank format: the shared expert is always dense/on-device, see
+#     _Qwen35MoE.__init__'s own ``self.shared_expert`` -- a single
+#     _Qwen35Expert, not an nn.ModuleList.)
+#
+# Routed experts (ffn_gate_exps / ffn_up_exps / ffn_down_exps) and the
+# router (ffn_gate_inp.weight -> mlp.gate.weight) are NOT listed here: the
+# generic per-expert packing logic in iter_weights (issue #273/#278) already
+# handles those identically for every MoE architecture, unconditional on
+# this suffix map.
+#
+# Also NOT listed (and so silently dropped by iter_weights, by design): the
+# real checkpoint's very last layer additionally carries a
+# ``nextn.{hnorm,enorm,eh_proj,shared_head_norm}.weight`` MTP (multi-token-
+# prediction) draft-head tensor set (matching its ``nextn_predict_layers=1``
+# KV entry) -- confirmed directly against the real checkpoint's own header.
+# This port's engine does not run MTP, so these are intentionally never
+# mapped, mirroring ``freetoken.models.qwen3_5_moe.iter_weights``'s own
+# ``mtp.*`` drop for the safetensors checkpoint shape of this same model.
+_QWEN35_MOE_SUFFIX_MAP = {
+    "attn_norm.weight": "input_layernorm.weight",
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "ffn_gate_inp.weight": "mlp.gate.weight",
+    # Full-attention (gated GQA) layers.
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_output.weight": "self_attn.o_proj.weight",
+    # Linear-attention (Gated-Delta-Net) layers.
+    "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",
+    "attn_gate.weight": "linear_attn.in_proj_z.weight",
+    "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
+    "ssm_beta.weight": "linear_attn.in_proj_b.weight",
+    "ssm_conv1d.weight": "linear_attn.conv1d.weight",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_a": "linear_attn.A_log",
+    "ssm_norm.weight": "linear_attn.norm.weight",
+    "ssm_out.weight": "linear_attn.out_proj.weight",
+    # Shared expert (dense, always-on).
+    "ffn_gate_inp_shexp.weight": "mlp.shared_expert_gate.weight",
+    "ffn_gate_shexp.weight": "mlp.shared_expert.gate_proj.weight",
+    "ffn_up_shexp.weight": "mlp.shared_expert.up_proj.weight",
+    "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
+}
+
+# The two qwen35moe tensors whose on-disk shape is not already the exact
+# target parameter shape (see _QWEN35_MOE_SUFFIX_MAP's own docstring for
+# why each needs exactly this reshape, verified against the real target
+# checkpoint's header): applied to the dequantized (already
+# _gguf_to_pytorch_shape-reversed) tensor, keyed by the GGUF suffix (the
+# same key _QWEN35_MOE_SUFFIX_MAP uses), in iter_weights below.
+_QWEN35_MOE_RESHAPE = {
+    "ssm_conv1d.weight": lambda t: t.unsqueeze(1),  # [C, K] -> [C, 1, K]
+    "ffn_gate_inp_shexp.weight": lambda t: t.unsqueeze(0),  # [H] -> [1, H]
+}
+
+# GGUF architecture string -> the suffix map iter_weights uses for that
+# architecture's per-layer non-MoE-expert tensors (issue #279: qwen35moe
+# needs its own map; every other supported architecture keeps using the
+# generic _DENSE_SUFFIX_MAP, unchanged from #273/#278).
+GGUF_ARCH_TO_SUFFIX_MAP: Dict[str, Dict[str, str]] = {
+    arch: _QWEN35_MOE_SUFFIX_MAP for arch in _QWEN35_MOE_ARCHITECTURES
 }
 
 # GGUF's per-architecture ``general.architecture`` string -> this port's
@@ -418,13 +659,23 @@ def iter_weights(
     .stream_moe_expert_sources`'s own packed-form contract exactly
     (``[E, 2I, H]``, gate then up -- see that function's docstring), so
     this reaches the loader's *existing*, already-tested packed-bank path
-    unchanged, with no new bank-building logic needed.
+    unchanged, with no new bank-building logic needed. This packing is
+    architecture-agnostic (every MoE architecture GGUF ships names its
+    routed-expert tensors this same way), unlike the *non*-expert per-layer
+    tensors, whose suffix map is dispatched by architecture (issue #279:
+    ``qwen35moe``'s fused-QKV / Gated-Delta-Net / shared-expert tensor set
+    is genuinely different from the generic ``_DENSE_SUFFIX_MAP`` every
+    other supported architecture uses -- see ``_QWEN35_MOE_SUFFIX_MAP``'s
+    own docstring).
     """
     import torch as _torch
 
     from .dequant import dequantize as _dequantize
 
     gguf_file = load_gguf(model_path)
+    arch = gguf_file.metadata.get("general.architecture")
+    suffix_map = GGUF_ARCH_TO_SUFFIX_MAP.get(arch, _DENSE_SUFFIX_MAP)
+    reshape_map = _QWEN35_MOE_RESHAPE if arch in _QWEN35_MOE_ARCHITECTURES else {}
 
     by_layer: Dict[int, Dict[str, GGUFTensorInfo]] = {}
     top_level: Dict[str, GGUFTensorInfo] = {}
@@ -454,10 +705,14 @@ def iter_weights(
             suffixes = by_layer[layer]
             prefix = f"model.layers.{layer}"
             if include_non_moe:
-                for gguf_suffix, hf_suffix in _DENSE_SUFFIX_MAP.items():
+                for gguf_suffix, hf_suffix in suffix_map.items():
                     info = suffixes.get(gguf_suffix)
                     if info is not None:
-                        yield f"{prefix}.{hf_suffix}", _read_and_dequant(info).to(device)
+                        tensor = _read_and_dequant(info)
+                        reshape = reshape_map.get(gguf_suffix)
+                        if reshape is not None:
+                            tensor = reshape(tensor)
+                        yield f"{prefix}.{hf_suffix}", tensor.to(device)
             if include_moe_experts:
                 gate = suffixes.get("ffn_gate_exps.weight")
                 up = suffixes.get("ffn_up_exps.weight")
