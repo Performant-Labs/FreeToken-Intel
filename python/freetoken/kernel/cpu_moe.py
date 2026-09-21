@@ -132,9 +132,19 @@ def cxx_flags() -> list[str]:
 
     No SIMD flags (``-mavx512f`` etc.) here on purpose -- vectorization is
     issue #252's job on top of this naive port, not this issue's.
+
+    ``-pthread`` is included unconditionally: issue #252 added a thread-pool
+    fast path (``freetoken_cpu_moe_forward_fast``) to this same source file,
+    using ``std::thread`` -- glibc's pthread symbols need to be linked in for
+    that shared object to load, even for callers who only ever use the
+    original single-threaded ``freetoken_cpu_moe_forward`` entry point. This
+    is a link-time requirement, not an ISA/vectorization flag, so it does not
+    touch the "no SIMD flags" guarantee above (see
+    ``test_cxx_flags_excludes_simd_flags``, which only checks for "avx"/"amx"
+    substrings and is unaffected by this).
     """
     find_cxx_compiler()  # fail fast with the helpful message
-    return ["-O2", "-shared", "-fPIC", "-std=c++17"]
+    return ["-O2", "-shared", "-fPIC", "-std=c++17", "-pthread"]
 
 
 # --- Build key / cache (mirrors kernel/utils.py's _build_key) -------------
@@ -253,6 +263,46 @@ def _bind_forward(module: KernelModule):
     return fn
 
 
+def _bind_forward_fast(module: KernelModule):
+    fn = module.loaded.freetoken_cpu_moe_forward_fast
+    fn.argtypes = [
+        ctypes.POINTER(ctypes.c_float),  # x
+        ctypes.c_int,  # num_tokens
+        ctypes.c_int,  # hidden
+        ctypes.POINTER(ctypes.c_int32),  # expert_ids
+        ctypes.POINTER(ctypes.c_float),  # expert_weights
+        ctypes.c_int,  # topk
+        ctypes.POINTER(ctypes.c_float),  # gate_up
+        ctypes.POINTER(ctypes.c_float),  # down
+        ctypes.c_int,  # num_experts
+        ctypes.c_int,  # intermediate
+        ctypes.POINTER(ctypes.c_uint8),  # expert_mask (nullable)
+        ctypes.c_int,  # num_threads (<=0 == auto)
+        ctypes.c_int,  # force_scalar (nonzero forces the scalar row-compute)
+        ctypes.POINTER(ctypes.c_float),  # out
+    ]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def _bind_avx512_available(module: KernelModule):
+    fn = module.loaded.freetoken_cpu_moe_avx512_available
+    fn.argtypes = []
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def cpu_moe_avx512_available(module: KernelModule) -> bool:
+    """Whether this process's CPU supports AVX-512F (the fast path's gate).
+
+    A pure runtime probe -- independent of how the .so was compiled, since
+    the AVX-512 row-compute is emitted via a per-function
+    ``__attribute__((target(...)))`` rather than a global ``-mavx512f`` flag
+    (see ``cxx_flags``'s docstring / the kernel source for why).
+    """
+    return bool(_bind_avx512_available(module)())
+
+
 def _as_c_float_ptr(t: torch.Tensor):
     return t.contiguous().numpy().ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
@@ -336,10 +386,101 @@ def cpu_moe_forward(
     return out
 
 
+def cpu_moe_forward_fast(
+    module: KernelModule,
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_weights: torch.Tensor,
+    gate_up: torch.Tensor,
+    down: torch.Tensor,
+    num_experts: int,
+    intermediate: int,
+    expert_mask: Optional[Iterable[int]] = None,
+    *,
+    threads: int = 0,
+    force_scalar: bool = False,
+) -> torch.Tensor:
+    """Issue #252's fast path: runtime AVX-512 dispatch + thread-pool parallelism.
+
+    Same math, arguments, and expert-major/top-k-column accumulation contract
+    as :func:`cpu_moe_forward`; this entry point additionally vectorizes the
+    per-row GEMM with AVX-512 when the host CPU supports it (falling back to
+    the identical scalar math otherwise) and, when ``threads`` requests more
+    than one worker, parallelizes across the expert range. Multi-threaded
+    runs are only guaranteed to match :func:`cpu_moe_forward` within float32
+    tolerance (summation order differs across threads/lanes), not bit-exact
+    -- see the kernel source's design note.
+
+    Args:
+        threads: worker thread count. ``0`` (the default) means "auto"
+            (``std::thread::hardware_concurrency()``, clamped to
+            ``num_experts``); ``1`` runs single-threaded with the exact same
+            iteration order as :func:`cpu_moe_forward`.
+        force_scalar: forces the scalar row-compute even when AVX-512 is
+            available -- a deterministic test hook for exercising the
+            fallback branch on a host that does have AVX-512 (mirrors this
+            project's "force what the host can't otherwise exercise"
+            testing pattern). Also settable via the
+            ``FREETOKEN_CPU_MOE_FORCE_SCALAR`` environment variable (checked
+            when this argument is left at its default ``False``), so a test
+            run or deployment can force the fallback without touching call
+            sites.
+    """
+    import torch  # lazy: torch is an optional extra, see the top-of-file note
+
+    fn = _bind_forward_fast(module)
+
+    x_c = x.to("cpu", dtype=torch.float32).contiguous()
+    ids_c = expert_ids.to("cpu", dtype=torch.int32).contiguous()
+    w_c = expert_weights.to("cpu", dtype=torch.float32).contiguous()
+    gu_c = gate_up.to("cpu", dtype=torch.float32).contiguous()
+    dn_c = down.to("cpu", dtype=torch.float32).contiguous()
+
+    num_tokens, hidden = int(x_c.shape[0]), int(x_c.shape[1])
+    topk = int(ids_c.shape[1]) if ids_c.dim() == 2 else int(expert_weights.shape[-1])
+
+    out = torch.zeros((num_tokens, hidden), dtype=torch.float32)
+
+    mask_ptr = None
+    if expert_mask is not None:
+        mask = bytearray(num_experts)
+        for e in expert_mask:
+            mask[int(e)] = 1
+        mask_arr = (ctypes.c_uint8 * num_experts).from_buffer(mask)
+        mask_ptr = ctypes.cast(mask_arr, ctypes.POINTER(ctypes.c_uint8))
+
+    force_scalar_effective = force_scalar or os.environ.get("FREETOKEN_CPU_MOE_FORCE_SCALAR", "") not in (
+        "",
+        "0",
+    )
+
+    rc = fn(
+        _as_c_float_ptr(x_c),
+        num_tokens,
+        hidden,
+        ids_c.numpy().ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        _as_c_float_ptr(w_c),
+        topk,
+        _as_c_float_ptr(gu_c),
+        _as_c_float_ptr(dn_c),
+        int(num_experts),
+        int(intermediate),
+        mask_ptr,
+        int(threads),
+        1 if force_scalar_effective else 0,
+        out.numpy().ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    if rc != 0:
+        raise RuntimeError(f"freetoken_cpu_moe_forward_fast failed (rc={rc})")
+    return out
+
+
 __all__ = [
     "CPU_MOE_SRC",
     "cpu_moe",
+    "cpu_moe_avx512_available",
     "cpu_moe_forward",
+    "cpu_moe_forward_fast",
     "cxx_flags",
     "cxx_version",
     "find_cxx_compiler",
