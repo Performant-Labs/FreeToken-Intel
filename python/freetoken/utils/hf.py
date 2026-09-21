@@ -137,10 +137,29 @@ def download_hf_weight(model_path: str) -> str:
 
 
 def load_tokenizer(model_path: str):
-    """Load the checkpoint's tokenizer (offline for a local directory)."""
+    """Load the checkpoint's tokenizer (offline for a local directory).
+
+    A GGUF checkpoint (issue #274, found via real-checkpoint validation)
+    ships no separate HF tokenizer directory at all -- its vocab is embedded
+    in the file's own KV-metadata (see ``freetoken.models.gguf.tokenizer``,
+    issue #272). ``download_hf_weight``/``AutoTokenizer.from_pretrained``
+    have no notion of that, so this checks ``is_gguf_path`` first (mirroring
+    the same GGUF-detection branch already present in ``loader.py``/
+    ``weight.py``/``engine/config.py``) and materializes a real HF tokenizer
+    directory on the fly via ``materialize_hf_tokenizer_dir`` when the
+    checkpoint is GGUF, instead of trying to resolve it as an HF hub id or
+    local safetensors directory.
+    """
     from transformers import AutoTokenizer
 
-    local = download_hf_weight(model_path)
+    from freetoken.models.gguf import is_gguf_path
+
+    if is_gguf_path(model_path):
+        from freetoken.models.gguf.tokenizer import materialize_hf_tokenizer_dir
+
+        local = materialize_hf_tokenizer_dir(model_path)
+    else:
+        local = download_hf_weight(model_path)
     return AutoTokenizer.from_pretrained(local)
 
 
