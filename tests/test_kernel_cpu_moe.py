@@ -1,0 +1,170 @@
+"""Tests for the native CPU MoE expert-GEMM kernel (issue #250).
+
+CPU-safe: no XPU needed. The native path is compared against the pure-Python
+reference math it ports (``CpuMoeExecutor.forward`` /
+``_Qwen3MoE._cpu_subset_math``), reimplemented inline here from the same
+SwiGLU-and-accumulation-order description both those functions document, so
+this test does not depend on constructing a full engine/model just to reach
+the math.
+
+Compiling and loading the kernel needs a real C++ compiler (``cpu_moe.py``
+looks for ``FREETOKEN_CXX`` / ``c++`` / ``g++`` / ``clang++`` -- see that
+module's docstring for why this is a plain system toolchain lookup, not
+``icpx``). When none is found, :func:`freetoken.kernel.cpu_moe.cpu_moe`
+raises :class:`~freetoken.kernel._toolchain.ToolchainError`, which this file
+turns into a graceful skip (never a failure/error) -- mirroring how the SYCL
+kernel tests treat an absent toolchain in ``test_kernel_toolchain.py``.
+"""
+from __future__ import annotations
+
+import pytest
+
+torch = pytest.importorskip("torch")
+import torch.nn.functional as F  # noqa: E402
+
+from freetoken.kernel._toolchain import ToolchainError  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def native_module():
+    from freetoken.kernel.cpu_moe import cpu_moe
+
+    try:
+        return cpu_moe()
+    except ToolchainError as exc:
+        pytest.skip(f"no C++ compiler available for the native CPU MoE kernel: {exc}")
+
+
+def _reference_forward(x, top_idx, top_w, gate_up, down, num_experts, intermediate, candidates):
+    """Expert-major then top-k-column SwiGLU reference (mirrors both Python sources).
+
+    ``candidates`` restricts which experts contribute (``None`` = every
+    expert, matching ``CpuMoeExecutor.forward``; a concrete set matches
+    ``_Qwen3MoE._cpu_subset_math``'s ``cpu_experts`` restriction).
+    """
+    T, H = x.shape
+    k = top_idx.shape[1]
+    out = torch.zeros(T, H, dtype=torch.float32)
+    I = intermediate
+    for e in range(num_experts):
+        if candidates is not None and e not in candidates:
+            continue
+        for j in range(k):
+            sel = top_idx[:, j] == e
+            if not bool(sel.any()):
+                continue
+            idx = sel.nonzero(as_tuple=True)[0]
+            x_sel = x.index_select(0, idx)
+            gate = x_sel @ gate_up[e, :I].t()
+            up = x_sel @ gate_up[e, I : 2 * I].t()
+            y = (F.silu(gate) * up) @ down[e].t()
+            w = top_w.index_select(0, idx)[:, j, None]
+            out.index_add_(0, idx, w * y)
+    return out
+
+
+def _synthetic_case(seed: int = 0):
+    torch.manual_seed(seed)
+    num_tokens, hidden, intermediate, num_experts, topk = 7, 6, 5, 4, 2
+    x = torch.randn(num_tokens, hidden, dtype=torch.float32)
+    gate_up = torch.randn(num_experts, 2 * intermediate, hidden, dtype=torch.float32)
+    down = torch.randn(num_experts, hidden, intermediate, dtype=torch.float32)
+    top_idx = torch.randint(0, num_experts, (num_tokens, topk))
+    top_w = torch.rand(num_tokens, topk)
+    top_w = top_w / top_w.sum(dim=1, keepdim=True)
+    return x, top_idx, top_w, gate_up, down, num_experts, intermediate
+
+
+def test_native_cpu_moe_matches_reference_full_backend(native_module):
+    """expert_mask=None (the plain ``cpu`` backend's use case: every expert a candidate)."""
+    from freetoken.kernel.cpu_moe import cpu_moe_forward
+
+    x, top_idx, top_w, gate_up, down, num_experts, intermediate = _synthetic_case(seed=0)
+
+    expected = _reference_forward(x, top_idx, top_w, gate_up, down, num_experts, intermediate, None)
+    actual = cpu_moe_forward(
+        native_module, x, top_idx, top_w, gate_up, down, num_experts, intermediate, expert_mask=None
+    )
+
+    assert actual.shape == expected.shape
+    assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-5), (actual - expected).abs().max()
+
+
+def test_native_cpu_moe_matches_reference_subset(native_module):
+    """expert_mask names a subset (the hybrid split's CPU-computed ``cpu_experts``)."""
+    from freetoken.kernel.cpu_moe import cpu_moe_forward
+
+    x, top_idx, top_w, gate_up, down, num_experts, intermediate = _synthetic_case(seed=1)
+    cpu_experts = {0, 2}
+
+    expected = _reference_forward(
+        x, top_idx, top_w, gate_up, down, num_experts, intermediate, cpu_experts
+    )
+    actual = cpu_moe_forward(
+        native_module,
+        x,
+        top_idx,
+        top_w,
+        gate_up,
+        down,
+        num_experts,
+        intermediate,
+        expert_mask=cpu_experts,
+    )
+
+    assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-5), (actual - expected).abs().max()
+    # Rows that only routed to non-candidate experts must be exactly zero (the
+    # hybrid split's contract: a row not served by this half contributes
+    # nothing, the XPU half serves it instead).
+    fully_excluded_rows = ~torch.isin(top_idx, torch.tensor(sorted(cpu_experts))).any(dim=1)
+    if bool(fully_excluded_rows.any()):
+        assert torch.all(actual[fully_excluded_rows] == 0)
+
+
+def test_native_cpu_moe_empty_expert_set_is_zero(native_module):
+    """An empty candidate set must return all zeros (mirrors ``_cpu_subset_math``'s early return)."""
+    from freetoken.kernel.cpu_moe import cpu_moe_forward
+
+    x, top_idx, top_w, gate_up, down, num_experts, intermediate = _synthetic_case(seed=2)
+
+    actual = cpu_moe_forward(
+        native_module,
+        x,
+        top_idx,
+        top_w,
+        gate_up,
+        down,
+        num_experts,
+        intermediate,
+        expert_mask=set(),
+    )
+    assert torch.all(actual == 0)
+
+
+def test_cpu_moe_module_cache_hit_skips_recompile(tmp_path, monkeypatch):
+    """Same "cache hit skips recompile" shape as ``kernel.utils.hello_copy``."""
+    import os
+    import subprocess
+    import sys
+
+    cache_dir = tmp_path / "cache"
+    env = {**os.environ, "FREETOKEN_JIT_CACHE_DIR": str(cache_dir)}
+    code = (
+        "import freetoken.kernel.cpu_moe as cm\n"
+        "from freetoken.kernel._toolchain import ToolchainError\n"
+        "try:\n"
+        "    m = cm.cpu_moe()\n"
+        "except ToolchainError:\n"
+        "    print('SKIP')\n"
+        "else:\n"
+        "    print('FROM_CACHE', m.from_cache)\n"
+    )
+    first = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert first.returncode == 0, first.stderr
+    if "SKIP" in first.stdout:
+        pytest.skip("no C++ compiler available for the native CPU MoE kernel")
+    assert "FROM_CACHE False" in first.stdout, "first run should be a cold compile"
+
+    second = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert second.returncode == 0, second.stderr
+    assert "FROM_CACHE True" in second.stdout, "second process should be a cache hit"
