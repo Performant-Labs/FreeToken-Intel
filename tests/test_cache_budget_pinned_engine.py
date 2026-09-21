@@ -37,11 +37,19 @@ def _clean_global_ctx():
 def test_pinned_pool_caps_and_warns_when_demand_exceeds_vram(tmp_path, monkeypatch, caplog):
     model_path = _write_tiny_checkpoint(tmp_path)
 
-    # A tiny fake VRAM budget: far too small to hold
-    # max_running_req(2) * max_seq_len(32) KV pages for this tiny model's real
-    # per-token byte cost, so the pinned path's fit check must kick in.
+    # A fake VRAM budget that fits the pinned MoE cache (this tiny model's
+    # cache footprint is 147456 bytes) plus only a few KV pages -- clearly too
+    # small for max_running_req(2) * max_seq_len(32) = 64 pages, but NOT so
+    # small that the MoE cache alone overflows the budget (that hits
+    # check_pinned_kv_fit's "nothing fits, not even the cache" raise branch
+    # instead of the cap-and-warn branch this test exercises; a too-tiny
+    # value here, e.g. 4096, was the original bug in this test). 165000 caps
+    # to 3 pages -- well below 64, a comfortable margin for the assertion
+    # below rather than sitting on an off-by-one boundary (the pool's own
+    # "+1 slack page" logic means a cap that lands exactly at 64 would not
+    # satisfy `< 64`).
     monkeypatch.setattr(
-        "freetoken.utils.arch.xpu_total_memory", lambda: 4096
+        "freetoken.utils.arch.xpu_total_memory", lambda: 165_000
     )
 
     config = _engine_config(model_path, device=DEVICE)
