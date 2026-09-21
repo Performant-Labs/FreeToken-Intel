@@ -27,12 +27,17 @@ from freetoken.kernel._toolchain import ToolchainError  # noqa: E402
 
 @pytest.fixture(scope="module")
 def native_module():
-    from freetoken.kernel.cpu_moe import cpu_moe
+    from freetoken.kernel.cpu_moe import cpu_moe, find_cxx_compiler
 
+    # Only a missing toolchain is a skip. cpu_moe() itself can also raise
+    # ToolchainError when the *compile* fails (a real bug in cpu_moe.cpp),
+    # and that must fail this test, not skip it silently -- catching it here
+    # too would let a broken kernel build merge with green CI.
     try:
-        return cpu_moe()
+        find_cxx_compiler()
     except ToolchainError as exc:
         pytest.skip(f"no C++ compiler available for the native CPU MoE kernel: {exc}")
+    return cpu_moe()
 
 
 def _reference_forward(x, top_idx, top_w, gate_up, down, num_experts, intermediate, candidates):
@@ -149,14 +154,20 @@ def test_cpu_moe_module_cache_hit_skips_recompile(tmp_path, monkeypatch):
 
     cache_dir = tmp_path / "cache"
     env = {**os.environ, "FREETOKEN_JIT_CACHE_DIR": str(cache_dir)}
+    # Only find_cxx_compiler() failing is a skip (no toolchain). cm.cpu_moe()
+    # itself runs outside that try/except, so a real compile failure crashes
+    # the subprocess (non-zero exit) and the assert below on `returncode == 0`
+    # fails loudly with the compiler's stderr, instead of this test silently
+    # skipping on a broken kernel build.
     code = (
         "import freetoken.kernel.cpu_moe as cm\n"
         "from freetoken.kernel._toolchain import ToolchainError\n"
         "try:\n"
-        "    m = cm.cpu_moe()\n"
+        "    cm.find_cxx_compiler()\n"
         "except ToolchainError:\n"
         "    print('SKIP')\n"
         "else:\n"
+        "    m = cm.cpu_moe()\n"
         "    print('FROM_CACHE', m.from_cache)\n"
     )
     first = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
