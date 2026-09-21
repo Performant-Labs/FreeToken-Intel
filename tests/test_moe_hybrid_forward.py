@@ -261,6 +261,52 @@ def test_hybrid_forward_matches_in_vram_reference(hybrid_ckpt, hybrid_profile, m
 
 
 @XPU
+def test_hybrid_decode_never_fetches_the_cpu_half_into_the_xpu_pool(hybrid_ckpt, hybrid_profile, monkeypatch):
+    """Issue #251 regression: ``ensure_experts`` must never see the CPU half's ids.
+
+    Before this fix, ``_forward_offload``'s decode branch handed
+    ``cache.ensure_experts`` the *full* routed-expert snapshot regardless of
+    ``exclude`` -- so the hybrid split's CPU-designated experts were
+    PCIe-fetched into the XPU LRU pool (and could evict another layer's
+    resident expert doing it) every decode step, exactly as a plain
+    ``offload`` call would. ``exclude`` only gated their contribution to the
+    final accumulate, never their transport -- meaning the hybrid split never
+    actually reduced XPU-side PCIe/LRU traffic, only CPU-side compute.
+
+    With this tiny checkpoint's ``top_k=2`` and a single decode request (so
+    each decode step routes exactly 2 distinct experts) and the profile's
+    fetch_fraction pinned to 0.5, the split is ``n_fetch = round(2*0.5)`` =>
+    1: a correct fix calls ``ensure_experts`` with exactly 1 id per layer per
+    decode step, never 2. (Verified empirically: reverting this fix
+    reproduces exactly 2 ids/call on this same checkpoint.)
+    """
+    monkeypatch.setenv("FREETOKEN_BENCHBW_PATH", hybrid_profile)
+    engine = Engine(_engine_config(hybrid_ckpt, moe_backend="hybrid"))
+    cache = engine.model.moe_cache
+    real_ensure_experts = cache.ensure_experts
+    call_sizes: list[int] = []
+
+    def _spy(layer_id, expert_ids):
+        call_sizes.append(int(expert_ids.numel()))
+        return real_ensure_experts(layer_id, expert_ids)
+
+    monkeypatch.setattr(cache, "ensure_experts", _spy)
+
+    _add_prompt(engine, output_len=8)
+    tokens = engine.generate()
+
+    assert len(tokens[0]) == 8
+    # 2 MoE layers x 7 decode steps (prefill uses materialize_layer, never
+    # ensure_experts, so every recorded call here is decode-only).
+    assert call_sizes, "ensure_experts was never called -- the decode path didn't run"
+    assert all(n == 1 for n in call_sizes), (
+        f"ensure_experts saw {call_sizes} id(s) per call; expected exactly 1 (the "
+        "XPU-fetch half only) on every call -- a 2 means the CPU half's expert "
+        "leaked back into the PCIe-fetch/LRU-eviction path (issue #251's bug)"
+    )
+
+
+@XPU
 def test_hybrid_max_fetch_cap_stays_correct(hybrid_ckpt, hybrid_profile, monkeypatch):
     """--moe-hybrid-max-fetch must cap the XPU half without changing the math.
 

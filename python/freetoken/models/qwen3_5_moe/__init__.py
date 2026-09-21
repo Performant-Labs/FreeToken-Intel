@@ -1595,7 +1595,19 @@ class _Qwen35MoE:
         if is_prefill:
             cache.materialize_layer(layer_id)
         else:
-            cache.ensure_experts(layer_id, expert_ids)
+            # Issue #251: `exclude` (the hybrid split's CPU-computed experts)
+            # must never reach the XPU LRU pool at all -- see the mirrored
+            # qwen3_moe._forward_offload's docstring note for the full
+            # rationale. `ensure_experts` has no `exclude` concept itself, so
+            # filter it out of the ids it's handed; the CPU half never reads
+            # this pool (it reads the host bank directly), so this changes no
+            # numerics, only which experts get PCIe-fetched/LRU-bumped.
+            fetch_ids = expert_ids
+            if exclude:
+                flat_ids = expert_ids.reshape(-1).tolist()
+                kept = [e for e in flat_ids if e not in exclude]
+                fetch_ids = torch.tensor(kept, dtype=expert_ids.dtype) if kept else expert_ids.new_empty(0)
+            cache.ensure_experts(layer_id, fetch_ids)
         cache.copy_missing()
         # 3) Map expert -> slot on the host from the cache's own (Python) map.
         #    An expert the pool evicted maps to -1 -> clamped to 0 with valid=False.
