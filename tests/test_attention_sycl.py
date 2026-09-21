@@ -299,6 +299,44 @@ def test_sycl_backend_matches_reference_on_xpu(tmp_path):
 
 
 @pytest.mark.xpu
+def test_sycl_backend_bf16_output_dtype_matches_model_on_xpu(tmp_path):
+    """Regression test for this PR's own output-dtype fix, isolated from #264.
+
+    Deliberately zeroed weights (the same fixture ``test_sycl_backend_matches_
+    reference_on_xpu`` above uses), NOT random weights: #264's numerical
+    divergence only manifests under non-zero weights (see that test's own
+    docstring -- with every KV slot reading 0.0, a wrong-slot-read bug is
+    invisible). This test's only job is the dtype cast-back this PR added
+    (``sycl.py``'s ``forward()`` now casts the kernel's always-float32 ``out``
+    back to ``q``'s original dtype) -- it must run un-xfailed, because the
+    parametrized ``test_sycl_backend_matches_reference_random_weights_on_xpu``
+    right below is marked ``xfail`` for #264, which would also silently
+    swallow a *regression* of this fix (a reintroduced dtype-mismatch crash
+    raises the same kind of exception `xfail` treats as "expected").
+    """
+    import torch
+
+    assert torch.xpu.is_available()
+    model_path = _write_tiny_checkpoint(tmp_path)
+
+    from freetoken.core import reset_global_ctx
+    from freetoken.engine.engine import Engine
+
+    reset_global_ctx()
+    sycl_engine = Engine(
+        _engine_config(model_path, device="xpu", attention_backend="sycl", dtype=torch.bfloat16)
+    )
+    _add_prompt(sycl_engine, output_len=4, prompt_ids=[1, 2, 3])
+    # The real regression this guards: before this PR's fix, this line raised
+    # "RuntimeError: expected mat1 and mat2 to have the same dtype, but got:
+    # float != c10::BFloat16" inside o_proj, every time, on any bf16 model.
+    sycl_tokens = sycl_engine.generate()
+    reset_global_ctx()
+
+    assert len(sycl_tokens) == 1
+
+
+@pytest.mark.xpu
 def test_sycl_backend_multi_request_decode_on_xpu(tmp_path):
     """Two requests in one decode step (bs>1) -- exercises the kernel's batch axis."""
     import torch
