@@ -984,8 +984,21 @@ class _GatedDeltaNet:
         key = key.reshape(T, self.num_k_heads, self.head_k_dim)
         value = value.reshape(T, self.num_v_heads, self.head_v_dim)
         if self.group_ratio > 1:
-            query = query.repeat_interleave(self.group_ratio, dim=1)
-            key = key.repeat_interleave(self.group_ratio, dim=1)
+            # issue #287: ggml's GATED_DELTA_NET CPU kernel (llama.cpp,
+            # ggml-cpu/ops.cpp's ggml_compute_forward_gated_delta_net_one_chunk,
+            # confirmed correct against the real checkpoint) maps value head
+            # ``v`` to q/k head ``v % num_k_heads`` -- a TILE grouping
+            # ([q0..q15,q0..q15] for 32 value heads over 16 k heads), not the
+            # HF reference Python's own ``repeat_interleave`` (a BLOCK grouping,
+            # [q0,q0,q1,q1,...]). The two give a different q/k-per-value-head
+            # pairing -- same tensor shape, no crash, silently wrong numbers.
+            # Verified directly against ggml's source (the mapping was
+            # `iv1 % neq1`, not `iv1 // group_ratio`) and against real
+            # `llama-eval-callback` output on this exact checkpoint.
+            # ``.repeat(1, group_ratio, 1)`` (tile) matches ggml's mapping;
+            # ``repeat_interleave`` does not.
+            query = query.repeat(1, self.group_ratio, 1)
+            key = key.repeat(1, self.group_ratio, 1)
         beta = b.sigmoid()
         # The decay rate is computed in float32 (the reference does): upcast the
         # decay-log (A_log) and the per-token decay input (a) + its bias so a

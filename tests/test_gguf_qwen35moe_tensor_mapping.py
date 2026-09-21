@@ -88,6 +88,22 @@ def _f32_tensor_bytes(shape) -> bytes:
     return struct.pack(f"<{n}f", *[0.02 * ((i % 7) - 3) for i in range(n)])
 
 
+def _ssm_a_tensor_bytes(shape) -> bytes:
+    """Issue #287: a real GGUF-exported qwen35moe checkpoint's `ssm_a` tensor
+    is llama.cpp's own precomputed `-exp(A_log)` decay rate, always negative
+    (see `freetoken.models.gguf._QWEN35_MOE_VALUE_TRANSFORM`'s own docstring
+    for the full evidence) -- `iter_weights` un-transforms it back to raw
+    A_log via `log(-t)`, which is only defined for negative input. The
+    generic `_f32_tensor_bytes` pattern produces mixed-sign values, so this
+    fixture needs its own always-negative generator for `ssm_a` specifically,
+    matching the real invariant instead of accidentally violating it.
+    """
+    n = 1
+    for d in shape:
+        n *= d
+    return struct.pack(f"<{n}f", *[-(0.1 + 0.02 * (i % 7)) for i in range(n)])
+
+
 def _build_synthetic_qwen35moe_gguf(tmp_path) -> str:
     kv = [
         _kv_string("general.architecture", "qwen35moe"),
@@ -119,9 +135,9 @@ def _build_synthetic_qwen35moe_gguf(tmp_path) -> str:
     data_chunks: list[bytes] = []
     offset = 0
 
-    def add(name: str, shape: tuple):
+    def add(name: str, shape: tuple, *, payload_fn=_f32_tensor_bytes):
         nonlocal offset
-        payload = _f32_tensor_bytes(shape)
+        payload = payload_fn(shape)
         tensors.append((name, shape, 0, offset))  # ggml_type 0 == F32
         data_chunks.append(payload)
         offset += len(payload)
@@ -148,7 +164,7 @@ def _build_synthetic_qwen35moe_gguf(tmp_path) -> str:
             add(f"{p}.ssm_beta.weight", (HIDDEN, NUM_VALUE_HEADS))
             add(f"{p}.ssm_conv1d.weight", (CONV_KERNEL, CONV_DIM))
             add(f"{p}.ssm_dt.bias", (NUM_VALUE_HEADS,))
-            add(f"{p}.ssm_a", (NUM_VALUE_HEADS,))
+            add(f"{p}.ssm_a", (NUM_VALUE_HEADS,), payload_fn=_ssm_a_tensor_bytes)
             add(f"{p}.ssm_norm.weight", (VALUE_HEAD_DIM,))
             add(f"{p}.ssm_out.weight", (VALUE_DIM, HIDDEN))
         add(f"{p}.ffn_gate_inp.weight", (HIDDEN, EXPERTS))
@@ -401,9 +417,9 @@ def _build_synthetic_qwen35moe_gguf_with_mtp_block(tmp_path) -> str:
     data_chunks: list[bytes] = []
     offset = 0
 
-    def add(name: str, shape: tuple):
+    def add(name: str, shape: tuple, *, payload_fn=_f32_tensor_bytes):
         nonlocal offset
-        payload = _f32_tensor_bytes(shape)
+        payload = payload_fn(shape)
         tensors.append((name, shape, 0, offset))
         data_chunks.append(payload)
         offset += len(payload)
@@ -429,7 +445,7 @@ def _build_synthetic_qwen35moe_gguf_with_mtp_block(tmp_path) -> str:
             add(f"{p}.ssm_beta.weight", (HIDDEN, NUM_VALUE_HEADS))
             add(f"{p}.ssm_conv1d.weight", (CONV_KERNEL, CONV_DIM))
             add(f"{p}.ssm_dt.bias", (NUM_VALUE_HEADS,))
-            add(f"{p}.ssm_a", (NUM_VALUE_HEADS,))
+            add(f"{p}.ssm_a", (NUM_VALUE_HEADS,), payload_fn=_ssm_a_tensor_bytes)
             add(f"{p}.ssm_norm.weight", (VALUE_HEAD_DIM,))
             add(f"{p}.ssm_out.weight", (VALUE_DIM, HIDDEN))
         add(f"{p}.ffn_gate_inp.weight", (HIDDEN, EXPERTS))

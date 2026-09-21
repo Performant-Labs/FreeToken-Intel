@@ -618,6 +618,37 @@ _QWEN35_MOE_RESHAPE = {
     "ffn_gate_inp_shexp.weight": lambda t: t.unsqueeze(0),  # [H] -> [1, H]
 }
 
+# issue #287: `ssm_a` is the one qwen35moe tensor whose on-disk VALUE (not
+# shape) needs a transform. `_GatedDeltaNet.forward` (qwen3_5_moe/__init__.py)
+# computes the GDN decay rate as `g = -self.A_log.float().exp() * softplus(...)`
+# -- correct for the HF/safetensors loading path, whose `A_log` really is the
+# raw log-parameter (matches transformers' own `modeling_qwen3_5_moe.py`
+# reference exactly). But llama.cpp's own GGUF export bakes the `-exp()`
+# transform in at conversion time: `src/models/qwen35moe.cpp`'s graph does a
+# single `ggml_mul(alpha_softplus, layer.ssm_a)` with no exp/neg node
+# anywhere (comment: "-A_log.exp() * softplus"), and the real per-token
+# `gate-0` values (dumped via `llama-eval-callback` against the real staged
+# checkpoint) are uniformly negative and boundedly small -- the signature of
+# an already-decay-rate value, not a raw log-parameter (which can be
+# positive, up to ~log(16)=2.77, per the HF init `A_log = log(uniform(0,16))`).
+# So GGUF's `ssm_a` bytes are `-exp(true_A_log)`, not `true_A_log` -- loading
+# them straight into the `A_log` parameter and letting the *shared* forward
+# code apply `-exp()` again is a silent double-transform (same shape/dtype
+# throughout, no crash, just wrong numbers). Un-transform at load time
+# instead (`true_A_log = log(-ssm_a)`, valid since ssm_a < 0 always) so the
+# *same* forward code stays correct for both loading paths -- this is a
+# checkpoint-format quirk of GGUF's own export, not a real difference in
+# what the model parameter means.
+_QWEN35_MOE_VALUE_TRANSFORM = {
+    # Tensor methods only (no bare `torch.*` call) -- this dict is defined at
+    # module scope, which must stay torch-free at *import* time; the lambda
+    # itself is fine (Python only resolves it when called, from inside
+    # iter_weights, which is torch-required), but calling `torch.log(...)`
+    # would need `torch` bound as a module-level global, which this file
+    # deliberately never does (see reader.py's own torch-free docstring).
+    "ssm_a": lambda t: (-t).log(),
+}
+
 # GGUF architecture string -> the suffix map iter_weights uses for that
 # architecture's per-layer non-MoE-expert tensors (issue #279: qwen35moe
 # needs its own map; every other supported architecture keeps using the
@@ -755,6 +786,7 @@ def iter_weights(
     arch = gguf_file.metadata.get("general.architecture")
     suffix_map = GGUF_ARCH_TO_SUFFIX_MAP.get(arch, _DENSE_SUFFIX_MAP)
     reshape_map = _QWEN35_MOE_RESHAPE if arch in _QWEN35_MOE_ARCHITECTURES else {}
+    value_transform_map = _QWEN35_MOE_VALUE_TRANSFORM if arch in _QWEN35_MOE_ARCHITECTURES else {}
     block_count = _arch_get(gguf_file.metadata, arch, "block_count")
     real_num_layers = (
         _gguf_real_num_layers(gguf_file.metadata, arch, int(block_count)) if block_count else None
@@ -800,6 +832,9 @@ def iter_weights(
                     info = suffixes.get(gguf_suffix)
                     if info is not None:
                         tensor = _read_and_dequant(info)
+                        transform = value_transform_map.get(gguf_suffix)
+                        if transform is not None:
+                            tensor = transform(tensor)
                         reshape = reshape_map.get(gguf_suffix)
                         if reshape is not None:
                             tensor = reshape(tensor)
