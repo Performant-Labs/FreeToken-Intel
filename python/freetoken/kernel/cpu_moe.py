@@ -128,17 +128,22 @@ def cxx_version() -> Optional[str]:
 
 
 def cxx_flags() -> list[str]:
-    """The compiler flags for a naive, single-threaded, optimized shared object.
+    """The compiler flags for a naive, optimized shared object.
 
     No SIMD flags (``-mavx512f`` etc.) here on purpose -- vectorization is
     issue #252's job on top of this naive port, not this issue's.
 
-    ``-pthread`` is included unconditionally: issue #252 added a thread-pool
-    fast path (``freetoken_cpu_moe_forward_fast``) to this same source file,
-    using ``std::thread`` -- glibc's pthread symbols need to be linked in for
-    that shared object to load, even for callers who only ever use the
-    original single-threaded ``freetoken_cpu_moe_forward`` entry point. This
-    is a link-time requirement, not an ISA/vectorization flag, so it does not
+    ``-pthread`` is included unconditionally, needed for two independent
+    reasons that both landed in ``cpu_moe.cpp``: issue #252's thread-pooled
+    fast path (``freetoken_cpu_moe_forward_fast``, partitioning experts
+    across ``std::thread`` workers) and issue #248's persistent *dispatch*
+    worker thread (``std::thread`` + ``<mutex>``/``<condition_variable>``,
+    the async submit/wait entry points). Either alone would require it;
+    every libstdc++/libc++ on Linux needs it linked in to actually spawn and
+    join a thread (a plain ``-lpthread`` would work for glibc but
+    ``-pthread`` is the portable spelling recommended for both GCC and
+    Clang, and also flips on the right preprocessor defines). This is a
+    link-time requirement, not an ISA/vectorization flag, so it does not
     touch the "no SIMD flags" guarantee above (see
     ``test_cxx_flags_excludes_simd_flags``, which only checks for "avx"/"amx"
     substrings and is unaffected by this).
@@ -475,13 +480,283 @@ def cpu_moe_forward_fast(
     return out
 
 
+# --- Async ctypes call (issue #248) ----------------------------------------
+
+
+def _bind_submit(module: KernelModule):
+    fn = module.loaded.freetoken_cpu_moe_submit
+    fn.argtypes = [
+        ctypes.POINTER(ctypes.c_float),  # x
+        ctypes.c_int,  # num_tokens
+        ctypes.c_int,  # hidden
+        ctypes.POINTER(ctypes.c_int32),  # expert_ids
+        ctypes.POINTER(ctypes.c_float),  # expert_weights
+        ctypes.c_int,  # topk
+        ctypes.POINTER(ctypes.c_float),  # gate_up
+        ctypes.POINTER(ctypes.c_float),  # down
+        ctypes.c_int,  # num_experts
+        ctypes.c_int,  # intermediate
+        ctypes.POINTER(ctypes.c_uint8),  # expert_mask (nullable)
+        ctypes.POINTER(ctypes.c_float),  # out
+    ]
+    fn.restype = ctypes.c_int64
+    return fn
+
+
+def _bind_wait(module: KernelModule):
+    fn = module.loaded.freetoken_cpu_moe_wait
+    fn.argtypes = [ctypes.c_int64]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+class CpuMoeJob:
+    """A job submitted to the native CPU MoE worker thread (issue #248).
+
+    Returned by :func:`cpu_moe_submit`. Call :meth:`result` (mirrors
+    ``concurrent.futures.Future.result()`` -- the shape the old
+    ``ThreadPoolExecutor`` handoff had, so call sites keep the same
+    submit-then-later-call-result() structure) once to block until the
+    native worker thread signals completion and get the output tensor.
+    ``wait()`` is an alias, matching the ``cpu_moe_wait(job_handle)``
+    language issue #248 itself uses.
+
+    Holds a reference to every buffer the native call was hand the raw
+    address of (``ctypes...ctypes.data_as`` pointers are only valid for as
+    long as the backing numpy/torch storage is alive) -- none of them may be
+    garbage collected before :meth:`result` returns, since the worker thread
+    may still be reading or writing them at any point before then.
+    """
+
+    __slots__ = ("_module", "_handle", "_out", "_keep_alive", "_done")
+
+    def __init__(self, module: KernelModule, handle: int, out: "torch.Tensor", keep_alive: tuple) -> None:
+        self._module = module
+        self._handle = handle
+        self._out = out
+        self._keep_alive = keep_alive
+        self._done = False
+
+    def result(self) -> "torch.Tensor":
+        if self._done:
+            # Already collected: cheap to allow a second call to return the
+            # same tensor (unlike a real Future this cannot re-block on the
+            # native side -- the slot was already freed for reuse), but a
+            # *third* party calling result() twice more likely indicates a
+            # logic bug (double-consuming a job) than a legitimate re-read,
+            # so this stays intentionally strict rather than silently
+            # re-returning a value that might no longer be this job's.
+            raise RuntimeError("CpuMoeJob.result() already called for this job")
+        self._done = True
+        fn = _bind_wait(self._module)
+        rc = fn(self._handle)
+        if rc != 0:
+            raise RuntimeError(f"freetoken_cpu_moe_wait failed (rc={rc})")
+        return self._out
+
+    def wait(self) -> "torch.Tensor":
+        """Alias for :meth:`result` (the ``cpu_moe_wait`` naming issue #248 uses)."""
+        return self.result()
+
+
+def cpu_moe_submit(
+    module: KernelModule,
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_weights: torch.Tensor,
+    gate_up: torch.Tensor,
+    down: torch.Tensor,
+    num_experts: int,
+    intermediate: int,
+    expert_mask: Optional[Iterable[int]] = None,
+) -> CpuMoeJob:
+    """Hand a CPU MoE forward job to the persistent native worker thread; return immediately.
+
+    Same argument contract as :func:`cpu_moe_forward` (identical dtypes,
+    layout, and expert-major-then-top-k-column accumulation order -- see that
+    function's docstring). The only difference is *where* the compute runs:
+    asynchronously, on the native module's persistent ``std::thread`` worker
+    (issue #248), rather than synchronously on the calling thread. Because
+    ``ctypes`` releases the GIL for the duration of this call, the (cheap --
+    just claiming a job slot and handing off a struct) act of submitting does
+    not itself contend with whatever the caller does next; call
+    :meth:`CpuMoeJob.result` on the returned job once that other work is done
+    to block for this job's result.
+    """
+    import torch  # lazy: torch is an optional extra, see the top-of-file note
+
+    fn = _bind_submit(module)
+
+    x_c = x.to("cpu", dtype=torch.float32).contiguous()
+    ids_c = expert_ids.to("cpu", dtype=torch.int32).contiguous()
+    w_c = expert_weights.to("cpu", dtype=torch.float32).contiguous()
+    gu_c = gate_up.to("cpu", dtype=torch.float32).contiguous()
+    dn_c = down.to("cpu", dtype=torch.float32).contiguous()
+
+    num_tokens, hidden = int(x_c.shape[0]), int(x_c.shape[1])
+    topk = int(ids_c.shape[1]) if ids_c.dim() == 2 else int(expert_weights.shape[-1])
+
+    out = torch.zeros((num_tokens, hidden), dtype=torch.float32)
+
+    mask_buf = None
+    mask_ptr = None
+    if expert_mask is not None:
+        mask_buf = bytearray(num_experts)
+        for e in expert_mask:
+            mask_buf[int(e)] = 1
+        mask_arr = (ctypes.c_uint8 * num_experts).from_buffer(mask_buf)
+        mask_ptr = ctypes.cast(mask_arr, ctypes.POINTER(ctypes.c_uint8))
+
+    handle = fn(
+        _as_c_float_ptr(x_c),
+        num_tokens,
+        hidden,
+        ids_c.numpy().ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        _as_c_float_ptr(w_c),
+        topk,
+        _as_c_float_ptr(gu_c),
+        _as_c_float_ptr(dn_c),
+        int(num_experts),
+        int(intermediate),
+        mask_ptr,
+        out.numpy().ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    if handle < 0:
+        raise RuntimeError(f"freetoken_cpu_moe_submit failed (rc={handle})")
+    # Every buffer the native side now holds a raw pointer into must outlive
+    # the worker thread's read/write window, which ends only when
+    # CpuMoeJob.result()'s freetoken_cpu_moe_wait() call returns -- so the
+    # job keeps a reference to all of them (mask_buf may be None; that's a
+    # harmless no-op entry in the tuple).
+    return CpuMoeJob(module, handle, out, (x_c, ids_c, w_c, gu_c, dn_c, mask_buf))
+
+
+def cpu_moe_wait(job: CpuMoeJob) -> "torch.Tensor":
+    """Block until ``job`` (from :func:`cpu_moe_submit`) has finished; return its result."""
+    return job.result()
+
+
+def hybrid_subset_submit(
+    module: KernelModule,
+    x: torch.Tensor,
+    top_idx: torch.Tensor,
+    top_w: Optional[torch.Tensor],
+    gate_up: torch.Tensor,
+    down: torch.Tensor,
+    candidate_experts: Iterable[int],
+    intermediate: int,
+) -> CpuMoeJob:
+    """Submit the hybrid MoE split's CPU-half job (issue #248), touching only
+    ``candidate_experts``' bank bytes -- not the whole per-layer bank.
+
+    A plain ``cpu_moe_submit(..., expert_mask=candidate_experts)`` call would
+    still have to copy *every* expert's ``gate_up``/``down`` rows to a
+    contiguous float32 buffer first (the native call's pointer arithmetic
+    needs the full ``[num_experts, ...]`` stride, even for the masked-out
+    rows it never reads). On a many-expert model -- the real target here is
+    Qwen3.6-35B-A3B, 256 experts/layer -- that is tens of megabytes of wasted
+    bf16->float32 conversion per layer per decode step even when the hybrid
+    split names only half of them, which would quietly recreate a version of
+    the exact per-layer tax this issue exists to eliminate (#247).
+
+    Instead: gather just the ``candidate_experts`` bank rows into a compact
+    ``[len(candidate_experts), ...]`` buffer and remap ``top_idx`` to that
+    buffer's local indices (0..``len(candidate_experts)``-1); a routed slot
+    whose *global* expert id is not a candidate remaps to -1, which the
+    native loop's ``expert_ids[...] == e`` check (``e`` always in
+    ``[0, len(candidate_experts))``) never matches, so it contributes
+    nothing -- exactly mirroring the old per-expert Python loop
+    (``_cpu_subset_math``), which only ever touched the candidate experts'
+    tensor slices. ``candidate_experts`` is sorted before assigning local
+    indices, so accumulation stays in ascending *global* expert-id order
+    (then top-k-column), matching every other backend's accumulation order.
+
+    ``top_w=None`` means every routed slot contributes with an implicit
+    weight of 1.0 -- the ``qwen3_5_moe`` hybrid split's CPU half never
+    applied the real per-row router weight (its own code documents this as
+    "always identically 1.0 here", i.e. a no-op multiply); passing a real
+    tensor (the ``qwen3_moe`` hybrid split's contract) applies it.
+    """
+    import torch  # lazy: torch is an optional extra, see the top-of-file note
+
+    top_idx_cpu = top_idx.to("cpu")
+    ids_sorted = sorted(int(e) for e in candidate_experts)
+    n_local = len(ids_sorted)
+
+    id_tensor = torch.tensor(ids_sorted, dtype=torch.long)
+    gu_compact = gate_up.index_select(0, id_tensor.to(gate_up.device))
+    dn_compact = down.index_select(0, id_tensor.to(down.device))
+
+    # expert id -> local index (0..n_local-1); every id not named by
+    # candidate_experts maps to -1 (never matched by the native loop, whose
+    # `e` always stays in [0, n_local)). Sized to the largest id that can
+    # legitimately appear in top_idx_cpu; candidate_experts is always a
+    # subset of top_idx_cpu's own values in every real call site, so this is
+    # always big enough to hold every id in ids_sorted too.
+    table_size = int(top_idx_cpu.max().item()) + 1 if top_idx_cpu.numel() else 1
+    remap = torch.full((max(table_size, 1),), -1, dtype=torch.int64)
+    for local_i, e in enumerate(ids_sorted):
+        remap[e] = local_i
+    local_top_idx = remap[top_idx_cpu]
+
+    if top_w is not None:
+        weight = top_w.to("cpu")
+    else:
+        weight = torch.ones(top_idx_cpu.shape, dtype=torch.float32)
+
+    return cpu_moe_submit(
+        module,
+        x,
+        local_top_idx,
+        weight,
+        gu_compact,
+        dn_compact,
+        n_local,
+        intermediate,
+        expert_mask=None,
+    )
+
+
+class HybridCpuPool:
+    """Persistent native-worker dispatch pool for the hybrid MoE split's CPU
+    half (issue #248), replacing the previous per-model ``ThreadPoolExecutor``
+    (see ``_Qwen3MoE._hybrid_cpu_pool`` / ``_Qwen35MoE._hybrid_cpu_pool``,
+    which cache one instance of this class on the model exactly as they
+    cached the old executor -- compiling/loading the native module once and
+    reusing its persistent worker thread across every layer / every decode
+    step, not per call).
+    """
+
+    def __init__(self, name: str = "cpu_moe") -> None:
+        self._module = cpu_moe(name)
+
+    def submit(
+        self,
+        x: torch.Tensor,
+        top_idx: torch.Tensor,
+        top_w: Optional[torch.Tensor],
+        gate_up: torch.Tensor,
+        down: torch.Tensor,
+        candidate_experts: Iterable[int],
+        intermediate: int,
+    ) -> CpuMoeJob:
+        return hybrid_subset_submit(
+            self._module, x, top_idx, top_w, gate_up, down, candidate_experts, intermediate
+        )
+
+
 __all__ = [
     "CPU_MOE_SRC",
+    "CpuMoeJob",
+    "HybridCpuPool",
     "cpu_moe",
     "cpu_moe_avx512_available",
     "cpu_moe_forward",
     "cpu_moe_forward_fast",
+    "cpu_moe_submit",
+    "cpu_moe_wait",
     "cxx_flags",
     "cxx_version",
     "find_cxx_compiler",
+    "hybrid_subset_submit",
 ]
