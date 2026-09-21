@@ -174,13 +174,16 @@ def parse_args(args: list[str] | None = None, prog: str | None = None) -> Server
     parser.add_argument("--shell-mode", dest="shell_mode", action="store_true", help="Run the server attached to a terminal shell (ft shell).")
     parser.add_argument(
         "--moe-backend",
+        "--moe-strategy",
         dest="moe_backend",
         default="auto",
         choices=("auto", "cpu", "offload", "hybrid"),
         help="MoE backend. 'auto' (default) picks host-RAM offload on a B70 MoE; "
         "'cpu' runs routed-expert GEMMs on the host CPU (issue #8); 'offload' streams "
         "activated experts to the XPU; 'hybrid' (issue #9) splits hot experts to XPU "
-        "and the tail to CPU.",
+        "and the tail to CPU. '--moe-strategy' is upstream FreeToken's flag name for "
+        "the same setting (issue #289); this port does not accept upstream's 'fused' "
+        "choice (that lands with moe-fused-not-a-loop).",
     )
     parser.add_argument(
         "--moe-cpu-threads",

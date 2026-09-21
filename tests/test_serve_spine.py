@@ -144,3 +144,40 @@ def test_device_report_line_is_shared():
     # The spine and `ft device` must never drift: both read the same helper.
     assert isinstance(device_report_line(), str)
     assert device_report_line()  # non-empty on every machine
+
+
+def test_serve_help_documents_the_single_parser(capsys):
+    # Issue #289: there is exactly one ``ArgumentParser`` on the serve path
+    # (server/args.py). ``--help`` must show its port (1919, not the old
+    # outer parser's 8080) and the flags that only that parser used to know
+    # about.
+    from freetoken.server import launch_server
+
+    capsys.readouterr()
+    assert launch_server(["--help"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "1919" in out
+    assert "8080" not in out
+    for flag in ("--dtype", "--tool-call-parser", "--reasoning-parser", "--moe-cache-size"):
+        assert flag in out
+
+
+def test_serve_rejects_no_second_parser_flag(capsys):
+    # A flag that only the (now-deleted) second parser used to understand
+    # must reach argparse successfully rather than dying as "unrecognized
+    # arguments" in an outer parser.
+    from freetoken.server import launch
+    from freetoken.server.args import parse_args
+
+    launch.set_serve_argv(["some-model", "--dtype", "bfloat16", "--tool-call-parser", "qwen3_coder"])
+    server_args = parse_args(launch._SERVE_ARGV, prog="ft serve")
+    assert server_args.dtype == "bfloat16"
+    assert server_args.tool_call_parser == "qwen3_coder"
+
+
+def test_moe_strategy_is_an_alias_of_moe_backend():
+    from freetoken.server.args import parse_args
+
+    by_backend = parse_args(["m", "--moe-backend", "offload"])
+    by_strategy = parse_args(["m", "--moe-strategy", "offload"])
+    assert by_backend.moe_backend == by_strategy.moe_backend == "offload"

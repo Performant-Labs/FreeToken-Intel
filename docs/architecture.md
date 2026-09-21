@@ -7,8 +7,13 @@ CUDA (RTX 30/40/50). This port targets **Intel Arc Pro B70** (Battlemage G31 /
 Xe2-HPG, 32 GB GDDR6, 608 GB/s). Why each layer of that stack was chosen:
 [stack.md](stack.md). Decisions: [adr/](adr/).
 
-Most modules are **stubs**. Each stub names the GitHub issue slug that owns
-the real implementation. `freetoken._stub.unimplemented()` raises
+The end-to-end path is real: `ft serve <model>` walks device → args →
+resolve → loader → engine → server, and (for a registered, non-stub
+architecture) starts serving. What's still a stub: several model
+architectures (`docs/models.md` has the per-architecture list), CUDA-only
+kernel tiers this port doesn't need, and a handful of the CLI subcommands.
+Each remaining stub names the GitHub issue slug that owns the real
+implementation; `freetoken._stub.unimplemented()` raises
 `NotYetImplemented` with that slug.
 
 ## Hardware target
@@ -57,15 +62,25 @@ python/freetoken/
 | `SM90` / `SM100` probes | `is_xe2_family()` / `is_battlemage()` |
 | IPEX-LLM | **not used** (archived Jan 2026) |
 
-MoE backend names are unchanged: `fused`, `offload`, `cpu`, `hybrid`, `auto`.
+MoE policy names are unchanged: `fused`, `offload`, `cpu`, `hybrid`, `auto`.
+`ft serve --moe-backend` only accepts `auto`/`cpu`/`offload`/`hybrid` today
+— `fused` is an internal `auto`-resolution outcome for a dense model, not a
+CLI choice ([#292](https://github.com/Performant-Labs/FreeToken-Intel/issues/292)
+adds it to the CLI once the in-VRAM path is a grouped GEMM instead of a
+Python loop). See `docs/models.md` for where `hybrid`'s quantized-checkpoint
+behavior and `cpu`'s native-GEMM wiring currently drift from upstream.
 
-Attention backends drop CUDA-only `fi` / `fa` / `trtllm`. Intel registers
-`triton` and `sycl`.
+Attention backends drop CUDA-only `fi` / `fa` / `trtllm` and the sparse
+CUDA backends; Intel registers `torch` (pure-PyTorch GQA — what `auto`
+resolves to, `triton` and `sycl` are opt-in), `triton`, and `sycl`. `ft
+serve --attention-backend` selects between them
+([#293](https://github.com/Performant-Labs/FreeToken-Intel/issues/293)).
 
 ## First model
 
-`Qwen/Qwen3.6-35B-A3B` (and FP8 / MXFP4 variants that fit a 32 GB card with
-offload). Other architectures are registered as stubs.
+`Qwen/Qwen3.5-35B-A3B` / `Qwen3.6-35B-A3B` (and FP8 / MXFP4 / GGUF variants
+that fit a 32 GB card with offload) — see `docs/models.md` for the full
+registry and which architectures still have a stub `forward`.
 
 ## Issue slugs
 
@@ -76,12 +91,12 @@ Stub modules mention the slug in `unimplemented(..., "<slug>")`.
 | --- | --- |
 | `device-layer` | [#2](https://github.com/Performant-Labs/FreeToken-Intel/issues/2) |
 | `kernel-sycl` | [#3](https://github.com/Performant-Labs/FreeToken-Intel/issues/3) |
-| `attn-triton` | [#4](https://github.com/Performant-Labs/FreeToken-Intel/issues/4) |
-| `attn-sycl` | [#5](https://github.com/Performant-Labs/FreeToken-Intel/issues/5) |
+| `attn-triton` | [#4](https://github.com/Performant-Labs/FreeToken-Intel/issues/4) — registered as `torch`/`triton` (same pure-PyTorch GQA implementation today); `attention_backend="auto"` always resolves to `torch`, not a hardware ladder. `ft serve --attention-backend` can now select `triton`/`sycl` explicitly ([#293](https://github.com/Performant-Labs/FreeToken-Intel/issues/293)). |
+| `attn-sycl` | [#5](https://github.com/Performant-Labs/FreeToken-Intel/issues/5) — registered, opt-in only (`--attention-backend sycl`), never auto-selected. |
 | `moe-fused` | [#6](https://github.com/Performant-Labs/FreeToken-Intel/issues/6) |
 | `moe-offload` | [#7](https://github.com/Performant-Labs/FreeToken-Intel/issues/7) |
-| `moe-cpu` | [#8](https://github.com/Performant-Labs/FreeToken-Intel/issues/8) — done: `--moe-backend cpu` runs the routed-expert GEMM on the host from the pinned banks (pure-PyTorch single-thread `CpuMoeExecutor`, ADR 0002), and `--moe-cpu-layers` partitions MoE layers between the CPU executor and the XPU offload slot pool (`parse_moe_cpu_layers`, pure-Python). The AVX-512/AMX thread-pool GEMM (`kernel/csrc/cpu_moe/placeholder.cpp`) is a deferred kernel follow-up, not part of this slice. |
-| `moe-hybrid` | [#9](https://github.com/Performant-Labs/FreeToken-Intel/issues/9) — done: `--moe-backend hybrid` splits each decode step's routed-expert misses between PCIe-fetch→XPU-GEMM and host-CPU-GEMM by the `ft bench bw` profile's bandwidth-adaptive `q*` fetch fraction (recommend `hybrid` iff `cpu_moe_bw > 2× pcie_gather_bw`; fraction `= pcie/(pcie+cpu)`, clamped, offload when no usable profile). `moe/bench_profile.py` (torch-free, CPU-venv import-safe) reads the per-XPU-UUID calibration at `$XDG_CACHE_HOME/freetoken/benchbw/<uuid>.json` (legacy `benchbw.json` fallback); `moe/benchbw.py` is the `ft bench bw` calibration command. `--moe-hybrid-max-fetch` caps the per-step fetch count (default -1 = fully profile-driven). |
+| `moe-cpu` | [#8](https://github.com/Performant-Labs/FreeToken-Intel/issues/8) — done: `--moe-backend cpu` runs the routed-expert GEMM on the host from the pinned banks, and `--moe-cpu-layers` partitions MoE layers between the CPU executor and the XPU offload slot pool (`parse_moe_cpu_layers`, pure-Python). **Drifted from upstream since:** `CpuMoeExecutor.forward` is still the pure-PyTorch loop and `--moe-cpu-threads` is a no-op — the native AVX-512 GEMM epic #249 built (#250, #252) is not wired into this executor. Tracked as [#291](https://github.com/Performant-Labs/FreeToken-Intel/issues/291). |
+| `moe-hybrid` | [#9](https://github.com/Performant-Labs/FreeToken-Intel/issues/9) — done: `--moe-backend hybrid` splits each decode step's routed-expert misses between PCIe-fetch→XPU-GEMM and host-CPU-GEMM by the `ft bench bw` profile's bandwidth-adaptive `q*` fetch fraction (recommend `hybrid` iff `cpu_moe_bw > 2× pcie_gather_bw`; fraction `= pcie/(pcie+cpu)`, clamped, offload when no usable profile). `moe/bench_profile.py` (torch-free, CPU-venv import-safe) reads the per-XPU-UUID calibration at `$XDG_CACHE_HOME/freetoken/benchbw/<uuid>.json` (legacy `benchbw.json` fallback); `moe/benchbw.py` is the `ft bench bw` calibration command. `--moe-hybrid-max-fetch` caps the per-step fetch count (default -1 = fully profile-driven). **Drifted from upstream since:** the `q*` formula matches upstream for bf16 only — on GPTQ/FP8/MXFP4/INT8/GGUF checkpoints `hybrid` forces `fetch_frac = 1.0` (silently runs as `offload`, no error). Tracked as [#290](https://github.com/Performant-Labs/FreeToken-Intel/issues/290). |
 | `quant-xpu` | [#10](https://github.com/Performant-Labs/FreeToken-Intel/issues/10) |
 | `ftw-checkpoint` | [#11](https://github.com/Performant-Labs/FreeToken-Intel/issues/11) |
 | `kvcache` | [#12](https://github.com/Performant-Labs/FreeToken-Intel/issues/12) — done: paged MHA/GQA pool (`allocate`/`free` + `[L,S,H,D]` buffer) and radix prefix match/insert/evict (`_compare.py` pure-torch key fallback). `hybrid_swa_pool.py` (M5) and `scheduler/cache.py` (engine wiring, #14) remain stubs. |

@@ -194,29 +194,6 @@ LAYERS: tuple[Layer, ...] = (
 )
 
 
-def _parse_args(argv: list[str], prog: str) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog=prog,
-        description="Start the FreeToken-Intel API server on an Intel Arc Pro B70.",
-    )
-    parser.add_argument("model", help="model reference (HF repo id, FTW path, or registered name)")
-    parser.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")
-    # MoE backend selection (ADR 0002 / issue #8). Accepted here (and in the
-    # server/args.py re-parse) so ``ft serve --moe-backend cpu`` does not trip the
-    # outer parser's "unrecognized arguments" before the real server args are read.
-    parser.add_argument(
-        "--moe-backend",
-        default="auto",
-        choices=("auto", "cpu", "offload", "hybrid"),
-        help="MoE backend: 'auto' (default) / 'cpu' (issue #8) / 'offload' / 'hybrid' (issue #9).",
-    )
-    parser.add_argument("--moe-cpu-threads", type=int, default=0, help="Host CPU threads for the CPU MoE GEMM (issue #8). 0 = torch default.")
-    parser.add_argument("--moe-cpu-layers", default=None, help="Comma-separated MoE layer indices to run on the CPU (issue #8). Omitted = all MoE layers when the backend is cpu/hybrid.")
-    parser.add_argument("--moe-hybrid-max-fetch", type=int, default=-1, help="Issue #9: cap on the per-step PCIe-fetched expert count. -1 (default) = fully profile-driven via the `ft bench bw` fetch fraction; a non-negative int caps the routed experts fetched to the XPU each decode step (the rest compute on the host CPU).")
-    return parser.parse_args(argv)
-
-
 def _walk(layers: tuple[Layer, ...], args: argparse.Namespace, out: TextIO) -> int:
     for layer in layers:
         try:
@@ -252,15 +229,21 @@ def launch_server(argv: list[str] | None = None, prog: str = "ft serve", out: Te
     stream = out if out is not None else sys.stdout
     argv = list(argv) if argv is not None else []
     set_serve_argv(argv)
-    # argparse prints to the real sys.stdout and raises SystemExit on both
-    # --help (0) and usage errors (2); honor whatever it chose.
+    # Single parser (issue #289): server/args.py is both the ``--help`` source
+    # and the object the server binds from. It is torch-free, so this — and
+    # therefore the ``--help`` / usage-error paths below — works on a
+    # CPU-only machine with no torch installed. argparse prints to the real
+    # sys.stdout and raises SystemExit on both --help (0) and usage errors
+    # (2); honor whatever it chose.
+    from freetoken.server.args import parse_args
+
     try:
-        args = _parse_args(argv, prog=prog)
+        server_args = parse_args(argv, prog=prog)
     except SystemExit as exc:
         return int(exc.code if exc.code is not None else EXIT_OK)
 
-    stream.write(f"ft serve {args.model}\n")
-    result = _walk(LAYERS, args, stream)
+    stream.write(f"ft serve {server_args.model}\n")
+    result = _walk(LAYERS, server_args, stream)
     if result != EXIT_OK:
         from freetoken.version import __version__
 
@@ -271,10 +254,8 @@ def launch_server(argv: list[str] | None = None, prog: str = "ft serve", out: Te
     # only once loader (#17) and engine (#14) are implemented, so it imports
     # the torch-bound stack only now.
     stream.write("all layers live — starting server\n")
-    from freetoken.server.args import parse_args
     from freetoken.server.api_server import run_api_server
 
-    server_args = parse_args(_SERVE_ARGV, prog=prog)
     return run_api_server(server_args, _build_engine_holder(server_args))
 
 
