@@ -319,6 +319,69 @@ def test_pinned_fit_raises_when_even_one_page_cannot_fit():
         )
 
 
+def test_pinned_fit_reserved_pages_leaves_room_for_the_slack_page():
+    # issue #260 PR review: Engine.__init__ unconditionally adds "+1 page of
+    # slack" (MHAKVCache's reserved slot 0, #173) AFTER this check returns --
+    # for EVERY path, not just the pinned one. A fit check that returns an
+    # exact-fit cap (fit_pages == requested_num_pages) would let that +1 push
+    # the real allocation back over budget, the exact failure this function
+    # exists to prevent. reserved_pages must be subtracted from the capacity
+    # BEFORE deciding whether/how much to cap, not after.
+    kv_bytes_per_page = _bytes_per_kv_token(
+        BASE["num_layers"], BASE["num_kv_heads"], BASE["head_dim"], BASE["dtype_bytes"]
+    )
+    moe_bytes = BASE["num_experts"] * _bytes_per_expert_slot(
+        BASE["num_experts"], BASE["moe_intermediate_size"], BASE["hidden_size"], BASE["dtype_bytes"]
+    )
+    # A budget that fits EXACTLY 10 KV pages once the MoE cache is set aside
+    # (integer division floors, so we pad by less than one more page's worth
+    # of bytes to stay at exactly 10, not 11).
+    n_pages_exact = 10
+    total_vram_bytes = int((moe_bytes + n_pages_exact * kv_bytes_per_page) / BASE["memory_ratio"]) + 1
+
+    # Without reserved_pages: the naive check reports this "fits" (10 == 10),
+    # even though the caller's own +1 slack would then need an 11th page this
+    # budget cannot hold.
+    effective_naive, reason_naive = check_pinned_kv_fit(
+        total_vram_bytes=total_vram_bytes,
+        memory_ratio=BASE["memory_ratio"],
+        moe_cache_size=BASE["num_experts"],
+        num_layers=BASE["num_layers"],
+        num_kv_heads=BASE["num_kv_heads"],
+        head_dim=BASE["head_dim"],
+        dtype_bytes=BASE["dtype_bytes"],
+        requested_num_pages=n_pages_exact,
+        moe_intermediate_size=BASE["moe_intermediate_size"],
+        hidden_size=BASE["hidden_size"],
+    )
+    assert effective_naive == n_pages_exact
+    assert reason_naive is None  # "fits" -- but only without the +1 slack
+
+    # With reserved_pages=1 (the real call site's usage): the same request
+    # must now cap to 9, leaving exactly 1 page of headroom for the caller's
+    # own +1 -- 9 + 1 == 10, which fits; 10 + 1 == 11 would not.
+    effective, reason = check_pinned_kv_fit(
+        total_vram_bytes=total_vram_bytes,
+        memory_ratio=BASE["memory_ratio"],
+        moe_cache_size=BASE["num_experts"],
+        num_layers=BASE["num_layers"],
+        num_kv_heads=BASE["num_kv_heads"],
+        head_dim=BASE["head_dim"],
+        dtype_bytes=BASE["dtype_bytes"],
+        requested_num_pages=n_pages_exact,
+        moe_intermediate_size=BASE["moe_intermediate_size"],
+        hidden_size=BASE["hidden_size"],
+        reserved_pages=1,
+    )
+    assert effective == n_pages_exact - 1
+    assert reason is not None
+    # The reason describes the caller's real demand (10), not the +1-inflated
+    # internal arithmetic -- reserved_pages is invisible in the numbers quoted
+    # back to the operator, only in the cap it produces.
+    assert str(n_pages_exact) in reason
+    assert str(effective) in reason
+
+
 def test_pinned_fit_dense_model_skips_moe_bytes():
     # moe_cache_size=0 (a dense / non-MoE model): the check still runs (KV
     # bytes alone against the budget) but never touches the expert-slot math.

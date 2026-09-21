@@ -481,6 +481,16 @@ class Engine:
             requested_num_pages=requested_num_pages,
             moe_intermediate_size=moe_intermediate,
             hidden_size=hidden_size,
+            # issue #260 review: __init__ unconditionally adds "+1 page of
+            # slack" (MHAKVCache's reserved slot 0, issue #173) AFTER this
+            # check returns, for every path including this one -- so that
+            # extra page must also fit in the same VRAM budget, or a fit
+            # check that returns an exact-fit cap would let the caller's own
+            # +1 push the real allocation back over budget. Passing it here
+            # keeps the returned page count (and the reason string) describing
+            # the caller's real conventional demand; the +1 itself is still
+            # added back by __init__ exactly as before.
+            reserved_pages=1,
         )
 
     def _build_sampler(self, config, model_config, device) -> "object":
