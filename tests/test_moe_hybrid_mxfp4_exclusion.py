@@ -43,6 +43,17 @@ def _fake_self(cls, *, cache_quant_format: str, fetch_fraction: float = 0.5):
     model.moe_cache.quant_format = cache_quant_format
     model.moe_hybrid_fetch_fraction = fetch_fraction
     model.moe_hybrid_max_fetch = -1
+    # issue #248: the bf16-split path now resolves this layer's host bank
+    # (model.moe_layer_id[self.layer_id] -> bank_sources[...][moe_idx]) eagerly
+    # before calling the (fully mocked) native dispatch pool, so self.layer_id
+    # and these model attributes must resolve even though the actual submit()
+    # call is stubbed and never reads them for real.
+    self_.layer_id = 0
+    model.moe_layer_id = {0: 0}
+    model.moe_cache.bank_sources = {
+        "gate_up": {0: torch.zeros(1, 4, 3)},
+        "down": {0: torch.zeros(1, 3, 2)},
+    }
     if cls is _Qwen35MoE:
         ctx = MagicMock()
         ctx.model = model

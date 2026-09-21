@@ -40,11 +40,18 @@ instantiating :class:`Qwen3_5MoEForCausalLM` does.
 from __future__ import annotations
 
 import importlib.util
+import os
 from typing import Any, Dict, Optional
 
 from freetoken.models.config import ModelConfig
 
 __all__ = ["parse_config", "iter_weights", "Qwen3_5MoEForCausalLM"]
+
+# issue #247 / #248: per-layer hybrid-split timing trace, populated only
+# when FT_HYBRID_TRACE is set (see _Qwen35MoE._forward_hybrid). A plain
+# module list rather than a logger so a live-serve script can read it back
+# directly. Mirrors qwen3_moe's own _HYBRID_TRACE.
+_HYBRID_TRACE: list = []
 
 # The text tower's prefix inside the multimodal checkpoint; remapped to
 # ``model.*`` so the loader's MoE-bank plumbing (and the forward pass) sees
@@ -1444,17 +1451,26 @@ class _Qwen35MoE:
         cpu_experts = set(seen_sorted[: n - n_fetch])  # (1 - f) share -> CPU
 
         # The two halves run CONCURRENTLY (issue moe-hybrid-overlap): the
-        # host-CPU half's pure-CPU matmuls (no XPU tensor touched) run on a
-        # persistent single-worker background thread while the XPU half's
-        # PCIe fetch + gather runs on *this* (main) thread -- the same regime
-        # benchbw._bench_overlap measures. A decode step then costs
-        # max(cpu_half, pcie_half), not their sum, matching the q* fetch
-        # fraction's bandwidth-matched assumption. The pool is reused across
-        # every layer / every step (cached on the model) rather than spawning
-        # a fresh thread per call: thread-creation overhead alone was large
-        # enough relative to a small model's per-expert matmul cost to erase
-        # most of the overlap's benefit when measured with a fresh Thread
-        # each time.
+        # host-CPU half runs on a persistent NATIVE worker thread (issue
+        # #248 -- a real std::thread owned entirely by cpu_moe.cpp, reached
+        # via ctypes submit()/wait(); see freetoken.kernel.cpu_moe's module
+        # docstring) while the XPU half's PCIe fetch + gather runs on *this*
+        # (main) thread -- the same regime benchbw._bench_overlap measures.
+        # A decode step then costs max(cpu_half, pcie_half), not their sum,
+        # matching the q* fetch fraction's bandwidth-matched assumption.
+        #
+        # This replaces the previous Python `ThreadPoolExecutor.submit()` /
+        # `future.result()` handoff, measured (issue #247) at 40-50ms/layer
+        # of pure Python-level GIL-contention/synchronization overhead --
+        # dwarfing the actual sub-millisecond expert GEMM. ctypes releases
+        # the GIL for the duration of a foreign call, and the worker thread
+        # this dispatches to is a C++ std::thread (never a Python thread), so
+        # unlike the old handoff it never needs to re-acquire the GIL to pick
+        # up work or hand back a result. The pool (really: the compiled
+        # native module + its persistent worker thread) is reused across
+        # every layer / every step (cached on the model), for the same reason
+        # the old ThreadPoolExecutor was cached: thread/module setup cost
+        # would otherwise be paid on every one of the ~40 MoE layers/step.
         #
         # The device<->host transfers (flat -> CPU in, the CPU result -> device
         # out) must stay on this thread: the XPU runtime faults that sync when
@@ -1462,84 +1478,92 @@ class _Qwen35MoE:
         # test_serve_live_engine_xpu.py's docstring for the same constraint).
         # So the CPU half's input is prepared here before the submit, and its
         # output is moved back to the device here after the result is
-        # collected.
+        # collected -- the native worker itself never touches an XPU tensor
+        # (it never touches a Python object at all -- only raw pointers).
+        # issue #247: env-gated per-layer timing trace, zero overhead unless
+        # FT_HYBRID_TRACE is set (mirrors qwen3_moe's own probe; kept here
+        # rather than instrumenting-then-reverting so #251's later live
+        # validation can reuse it).
+        trace = os.environ.get("FT_HYBRID_TRACE")
+        if trace:
+            import time
+
+            t0 = time.perf_counter()
+
         x_cpu = flat.to("cpu", non_blocking=True)
 
-        future = self._hybrid_cpu_pool(model).submit(
-            self._cpu_subset_math, x_cpu, expert_ids_cpu, ctx, cpu_experts
+        if trace:
+            t1 = time.perf_counter()
+
+        # Host banks for this MoE layer (the pinned loader-built banks; the
+        # same source the XPU slot pool streams from -- ADR 0002). The
+        # native submit only gathers the ``cpu_experts`` rows (see
+        # ``hybrid_subset_submit``'s docstring), so handing it the full
+        # per-layer bank here does not mean the whole bank gets touched.
+        moe_idx = model.moe_layer_id[self.layer_id]
+        sources = model.moe_cache.bank_sources
+        gate_up = sources["gate_up"][moe_idx]
+        down = sources["down"][moe_idx]
+        intermediate = gate_up.shape[1] // 2
+
+        # top_w=None: this half never applied the real per-row router weight
+        # (the pre-overlap code's ``cpu_top_w`` argument was always
+        # identically 1.0 here -- a no-op multiply), so the native call is
+        # told to use an implicit weight of 1.0 for every routed slot rather
+        # than reintroducing a real weight (see ``hybrid_subset_submit``'s
+        # docstring).
+        job = self._hybrid_cpu_pool(model).submit(
+            x_cpu, expert_ids_cpu, None, gate_up, down, cpu_experts, intermediate
         )
+
+        if trace:
+            t2 = time.perf_counter()
 
         out = self._forward_offload_core(
             flat, top_idx, top_w, ctx, batch,
             exclude=cpu_experts,
         )
 
-        cpu_out = future.result()
+        if trace:
+            t3 = time.perf_counter()
+
+        cpu_out = job.result()
+
+        if trace:
+            t4 = time.perf_counter()
+
         # The host-CPU half's (disjoint) share, so the per-row sum matches the
         # sequential version exactly regardless of which half finishes first.
-        out += cpu_out.to(flat.device, non_blocking=True)
+        out += cpu_out.to(flat.device, non_blocking=True).to(flat.dtype)
+
+        if trace:
+            _HYBRID_TRACE.append({
+                "layer": self.layer_id,
+                "n_experts": n,
+                "n_fetch": n_fetch,
+                "n_cpu": len(cpu_experts),
+                "prep_ms": 1000 * (t1 - t0),
+                "submit_ms": 1000 * (t2 - t1),
+                "xpu_half_ms": 1000 * (t3 - t2),
+                "job_wait_ms": 1000 * (t4 - t3),
+                "combine_ms": 1000 * (time.perf_counter() - t4),
+            })
         return out
 
     @staticmethod
     def _hybrid_cpu_pool(model):
-        """A single-worker thread pool for the hybrid CPU half, cached on the
-        model so it survives across decode steps / layers instead of paying
-        thread-creation cost on every call (see ``_forward_hybrid``)."""
+        """The native async dispatch pool for the hybrid CPU half (issue
+        #248), cached on the model so the compiled module and its persistent
+        worker thread survive across decode steps / layers instead of being
+        rebuilt on every call (see ``_forward_hybrid``). Replaces the
+        previous ``ThreadPoolExecutor`` cache of the same shape."""
         pool = getattr(model, "_moe_hybrid_cpu_pool", None)
         if pool is None:
-            from concurrent.futures import ThreadPoolExecutor
+            from freetoken.kernel.cpu_moe import HybridCpuPool
 
-            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="moe-hybrid-cpu")
+            pool = HybridCpuPool()
             model._moe_hybrid_cpu_pool = pool
         return pool
-
-    def _cpu_subset_math(self, x_cpu, expert_ids_cpu, ctx, cpu_experts):
-        """Pure-CPU math for the hybrid split's host-CPU half.
-
-        Computes *only* the routed experts in ``cpu_experts`` (from the pinned
-        host banks) and returns their per-row contribution, on the CPU -- so
-        this is safe to run on a background thread (no XPU tensor is read or
-        written anywhere in this method; the device<->host transfers around it
-        are the caller's job, on the main thread). A row that routes to an
-        expert not in ``cpu_experts`` contributes nothing (that row is served
-        by the XPU half).
-
-        Accumulation is expert-major then top-k-column (matching
-        ``_forward_cpu`` / the in-VRAM reference), so the per-row result the
-        hybrid path sums is numerically identical to what the pure CPU backend
-        would produce for that subset. The upstream per-row weight for this
-        half (``cpu_top_w`` in the pre-overlap code) was always identically
-        1.0 -- applying it was a no-op multiply -- so it is omitted here
-        rather than reintroduced as a real weight.
-        """
-        model = ctx.model
-        moe_idx = model.moe_layer_id[self.layer_id]
-        sources = model.moe_cache.bank_sources
-        gate_up = sources["gate_up"][moe_idx]
-        down = sources["down"][moe_idx]
-        B, k = expert_ids_cpu.shape
-        num_experts = self.num_experts
-        out = torch.zeros_like(x_cpu)
-        for e in range(num_experts):
-            if e not in cpu_experts:
-                continue
-            for j in range(k):
-                sel = expert_ids_cpu[:, j] == e
-                if not bool(sel.any()):
-                    continue
-                idx = torch.nonzero(sel, as_tuple=False).view(-1)
-                x_sel = x_cpu.index_select(0, idx)
-                y = self._expert_compute_cpu(gate_up, down, e, x_sel)
-                out.index_add_(0, idx, y)
-        return out
-
-    @staticmethod
-    def _expert_compute_cpu(gate_up, down, e, x_cpu):
-        """One expert on the host from the bank row (the CPU half's GEMM)."""
-        I = gate_up.shape[1] // 2
-        gate = x_cpu @ gate_up[e, 0:I].t()
-        up = x_cpu @ gate_up[e, I : 2 * I].t()
-        return (F.silu(gate) * up) @ down[e].t()
 
     def _forward_offload_core(self, flat, top_idx, top_w, ctx, batch, *, exclude):
         model = ctx.model
