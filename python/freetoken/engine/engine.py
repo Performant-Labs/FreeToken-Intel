@@ -144,9 +144,9 @@ class Engine:
         # allocates the full max_seq_len up front -- without a cap the first
         # request dies with "KV pool full". Cap the SERVED context to the
         # planned pool (the same resolve_served_context_len decision the
-        # server's /v1/models report uses) and log it loudly. The conventional
-        # (non-auto) pool is max_running_req * max_seq_len, always >= the
-        # demand, so planned None never caps.
+        # server's /v1/models report uses) and log it loudly. Planned None
+        # (the pinned path) is handled separately below (issue #260): it used
+        # to be assumed "always >= the demand" here with no check at all.
         max_seq_len, cap_reason = resolve_served_context_len(
             max_seq_len=max_seq_len, planned_kv_pages=planned_num_pages
         )
@@ -158,10 +158,30 @@ class Engine:
         # Otherwise keep the conventional override-vs-default resolution.
         if planned_num_pages is not None:
             num_pages = planned_num_pages
-        elif config.num_page_override:
-            num_pages = max(config.num_page_override, default_num_pages)
         else:
-            num_pages = default_num_pages
+            if config.num_page_override:
+                num_pages = max(config.num_page_override, default_num_pages)
+            else:
+                num_pages = default_num_pages
+            # Issue #260: the pinned path (planned_num_pages is None -- the
+            # operator pinned --moe-cache-size, or nothing planned VRAM at
+            # all) used to trust `max_running_req * max_seq_len` as "always
+            # >= the demand" with no VRAM measurement, unlike the auto path's
+            # own fit assert above. Check it against the same total-VRAM
+            # query the auto planner uses (None on a CPU box -- nothing to
+            # check, request unchanged) and cap+warn instead of silently
+            # OOMing inside create_kv_pool below.
+            num_pages, pinned_cap_reason = self._check_pinned_kv_fit(
+                model_config, dtype, planned_cache_size, num_pages
+            )
+            if pinned_cap_reason:
+                logger.warning("issue #260: %s", pinned_cap_reason)
+                if num_pages < max_seq_len:
+                    max_seq_len, reserved_cap_reason = resolve_served_context_len(
+                        max_seq_len=max_seq_len, planned_kv_pages=num_pages
+                    )
+                    if reserved_cap_reason:
+                        logger.warning("issue #260: %s", reserved_cap_reason)
         # +1 page of slack: MHAKVCache (issue #173) reserves slot 0 as a
         # dummy/padding slot, so the pool's real allocatable capacity is one
         # page short of `num_pages * page_size` slots -- without this, the
@@ -388,6 +408,80 @@ class Engine:
             moe_fraction=rate if rate else None,
         )
         return (cache.moe_cache_size, cache.kv_num_pages)
+
+    def _check_pinned_kv_fit(self, model_config, dtype, planned_cache_size, requested_num_pages):
+        """Issue #260: VRAM fit-check for the pinned (non-auto) KV pool.
+
+        The pinned path never ran the auto planner (:meth:`_plan_cache_budget`
+        returned ``planned_num_pages=None``), so unlike that path this
+        conventional ``max_running_req * max_seq_len`` pool size was never
+        checked against actual VRAM -- it was asserted "always >= the demand"
+        from first principles. This reads the same total-VRAM query the auto
+        planner uses and, when a live device is present, caps
+        ``requested_num_pages`` down to what the pinned MoE cache leaves for
+        KV via :func:`~freetoken.engine.cache_budget.check_pinned_kv_fit`.
+
+        Returns ``(requested_num_pages, None)`` unchanged whenever there is no
+        live XPU to measure against (a CPU box), or whenever the pool
+        genuinely fits -- i.e. this is a no-op for every existing (fitting)
+        deployment, exactly like #246's auto-path cap.
+        """
+        from freetoken.utils.arch import xpu_total_memory
+
+        total_vram = xpu_total_memory()
+        if total_vram is None:
+            return requested_num_pages, None
+
+        num_experts = int(getattr(model_config, "num_experts", 0) or 0)
+        num_moe_layers = int(
+            getattr(model_config, "num_moe_layers", None)
+            or (
+                int(getattr(model_config, "num_layers", 0) or 0)
+                - int(getattr(model_config, "first_k_dense_replace", 0) or 0)
+            )
+            or 0
+        )
+        # The loader's own conventional MoE cache size when the operator did
+        # NOT pin one (mirrors ``freetoken.models.loader``'s
+        # ``moe_cache_size and moe_cache_size >= num_experts`` fallback) --
+        # needed so the fit check reasons about the cache size actually built,
+        # not just an explicit pin.
+        if planned_cache_size and num_experts and planned_cache_size >= num_experts:
+            moe_cache_size = int(planned_cache_size)
+        elif num_experts and num_moe_layers:
+            moe_cache_size = num_experts + max(2, num_moe_layers)
+        else:
+            moe_cache_size = 0  # dense (non-MoE) model: no expert cache to reserve
+
+        moe_intermediate = int(getattr(model_config, "moe_intermediate_size", 0) or 0)
+        hidden_size = int(getattr(model_config, "hidden_size", 0) or 0)
+        num_layers = int(getattr(model_config, "num_layers", 0) or 0)
+        num_kv_heads = int(getattr(model_config, "num_key_value_heads", 0) or 0)
+        head_dim = int(
+            getattr(model_config, "head_dim", None)
+            or (
+                int(getattr(model_config, "hidden_size", 0) or 0)
+                // max(1, int(getattr(model_config, "num_attention_heads", 0) or 0))
+            )
+            or 0
+        )
+        dtype_bytes = getattr(dtype, "itemsize", 2) or 2
+        memory_ratio = float(getattr(self.config, "memory_ratio", 0.9) or 0.9)
+
+        from freetoken.engine.cache_budget import check_pinned_kv_fit
+
+        return check_pinned_kv_fit(
+            total_vram_bytes=total_vram,
+            memory_ratio=memory_ratio,
+            moe_cache_size=moe_cache_size,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype_bytes=dtype_bytes,
+            requested_num_pages=requested_num_pages,
+            moe_intermediate_size=moe_intermediate,
+            hidden_size=hidden_size,
+        )
 
     def _build_sampler(self, config, model_config, device) -> "object":
         from freetoken.engine.sample import Sampler
