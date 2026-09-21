@@ -297,6 +297,9 @@ def _build_engine_holder(server_args):
             # on a B70 MoE; "cpu" runs routed-expert GEMMs on the host CPU
             # (issue #8); "hybrid" (issue #9) splits hot experts to XPU.
             moe_backend=server_args.moe_backend,
+            # Issue #293: --attention-backend. "auto" resolves to the `torch`
+            # backend (pure-PyTorch GQA) -- see docs/stack.md.
+            attention_backend=server_args.attention_backend,
             moe_cpu_threads=server_args.moe_cpu_threads,
             moe_cpu_layers=server_args.moe_cpu_layers,
             moe_hybrid_max_fetch=server_args.moe_hybrid_max_fetch,

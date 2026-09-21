@@ -50,6 +50,12 @@ class ServerArgs:
     server_port: int = DEFAULT_PORT
     dtype: str = "auto"
     served_model_name: str | None = None
+    # Attention backend selection (issue #293). "auto" resolves to `torch`:
+    # pure-PyTorch GQA. That is a deliberate Intel-port choice, not a
+    # fallback for a missing package — see docs/stack.md. `triton` and
+    # `sycl` are opt-in; this port does not walk the upstream CUDA hardware
+    # ladder (trtllm / fa,fi / sparse backends are not registered).
+    attention_backend: str = "auto"
     tool_call_parser: str = "auto"
     reasoning_parser: str | None = "auto"
     max_output_tokens: int | None = None
@@ -167,6 +173,15 @@ def parse_args(args: list[str] | None = None, prog: str | None = None) -> Server
     parser.add_argument("--host", dest="server_host", default=DEFAULT_HOST, help=f"Bind host (default: {DEFAULT_HOST})")
     parser.add_argument("--port", dest="server_port", type=int, default=DEFAULT_PORT, help=f"Bind port (default: {DEFAULT_PORT})")
     parser.add_argument("--dtype", default="auto", choices=DTYPE_CHOICES, help="Weight dtype; 'auto' follows the checkpoint.")
+    parser.add_argument(
+        "--attention-backend",
+        dest="attention_backend",
+        default="auto",
+        choices=("auto", "torch", "triton", "sycl"),
+        help="Attention backend (issue #293). 'auto' (default) is pure-PyTorch GQA "
+        "on this port (the `torch` backend) -- not the upstream CUDA hardware ladder. "
+        "'triton' and 'sycl' are opt-in.",
+    )
     parser.add_argument("--served-model-name", dest="served_model_name", default=None, help="Model id reported by /v1/models (default: model basename).")
     parser.add_argument("--tool-call-parser", dest="tool_call_parser", default="auto", choices=TOOL_CALL_PARSER_CHOICES, help="Tool-call grammar for OpenAI tool responses.")
     parser.add_argument("--reasoning-parser", dest="reasoning_parser", default="auto", choices=REASONING_PARSER_CHOICES, help="Split chain-of-thought into reasoning_content. 'off' disables.")
