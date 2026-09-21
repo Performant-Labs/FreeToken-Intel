@@ -473,6 +473,7 @@ class SyclAttentionBackend(BaseAttnBackend):
         # model, same as k_cache/v_cache), so it must be cast to float32
         # here -- a small, freshly-built per-request tensor, not the KV pool
         # itself, so this cast is cheap (unlike widening the whole pool).
+        q_dtype = q.dtype
         q_tok = q.transpose(0, 1).contiguous()
         if q_tok.dtype != torch.float32:
             q_tok = q_tok.to(torch.float32)
@@ -528,7 +529,22 @@ class SyclAttentionBackend(BaseAttnBackend):
             torch.xpu.synchronize()
         # The kernel wrote token-major [ext, qh, d]; the model wants head-major
         # [qh, ext, d] (it does o_proj on out.transpose(1, 2)).
-        return out.transpose(0, 1).contiguous()
+        #
+        # The kernel's out buffer is always float32 (issue #259: q/out stay
+        # float32 regardless of the KV pool's storage dtype -- only k/v widen
+        # in-register). But the caller's o_proj expects this attention
+        # output in the *model's* dtype (bf16 by default on a real model),
+        # matching every other attention backend's contract (e.g.
+        # triton.py's `out = torch.empty_like(q)`) -- this cast-back was
+        # missing before this fix, a pre-existing gap on `main` that #259's
+        # own new bf16 test coverage is what actually caught it (the
+        # float32-only fixtures every prior test used made q_dtype ==
+        # torch.float32 always, so this cast was a no-op and the bug never
+        # surfaced until a real bf16 model went through this path).
+        result = out.transpose(0, 1).contiguous()
+        if result.dtype != q_dtype:
+            result = result.to(q_dtype)
+        return result
 
 
 __all__ = ["SyclAttentionBackend", "SyclMetadata"]
