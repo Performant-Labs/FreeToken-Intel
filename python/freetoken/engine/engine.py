@@ -42,13 +42,17 @@ import torch
 
 from freetoken.attention import create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
+from freetoken.engine.cache_budget import resolve_served_context_len
 from freetoken.engine.config import EngineConfig
 from freetoken.kvcache import create_kv_pool
 from freetoken.models.loader import load_model
 from freetoken.scheduler import Scheduler, SchedulerConfig, make_pending_req
 from freetoken.scheduler.cache import CacheManager
 from freetoken.scheduler.prefill import ChunkedReq
+from freetoken.utils import init_logger
 from freetoken.utils.arch import is_xpu_available
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -135,6 +139,19 @@ class Engine:
         # and overrun the gather on decode) but never shrinks a large model's
         # ``max_running_req * max_seq_len`` pool below what its context needs.
         max_seq_len = config.max_seq_len
+        # Issue #246: the auto planner can return FEWER KV pages than the
+        # checkpoint's own context (the MoE-priority split), while admission
+        # allocates the full max_seq_len up front -- without a cap the first
+        # request dies with "KV pool full". Cap the SERVED context to the
+        # planned pool (the same resolve_served_context_len decision the
+        # server's /v1/models report uses) and log it loudly. The conventional
+        # (non-auto) pool is max_running_req * max_seq_len, always >= the
+        # demand, so planned None never caps.
+        max_seq_len, cap_reason = resolve_served_context_len(
+            max_seq_len=max_seq_len, planned_kv_pages=planned_num_pages
+        )
+        if cap_reason:
+            logger.warning("issue #246: %s", cap_reason)
         default_num_pages = config.max_running_req * max_seq_len
         # When the budget planner sized the KV pool (auto mode), use the planned
         # count (it is at least the KV floor and reflects the real free VRAM).

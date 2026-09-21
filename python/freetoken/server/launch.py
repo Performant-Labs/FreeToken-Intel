@@ -329,6 +329,10 @@ def _build_engine_holder(server_args):
             moe_cache_rate=server_args.moe_cache_rate,
             memory_ratio=server_args.memory_ratio,
             kv_reserve_tokens=server_args.kv_reserve_tokens,
+            # Issue #246: the operator's served-context cap. The engine further
+            # caps this to the auto-planned KV pool when VRAM cannot fit the
+            # full context (resolve_served_context_len) and logs that loudly.
+            max_seq_len_override=server_args.max_model_len,
             # A single in-flight request per server: keeps the paged KV pool
             # small and the serve path trivially correct. (Batching is #13.)
             max_running_req=1,
@@ -343,6 +347,13 @@ def _build_engine_holder(server_args):
             num_page_override=2048,
         )
         engine = Engine(engine_config)
+        # Issue #246: the engine's EFFECTIVE served context (the checkpoint's
+        # full context possibly capped to the auto-planned KV pool). Stashed on
+        # this function object so /v1/models can report max_model_len without
+        # building the engine just to answer a listing -- the attribute only
+        # exists once the engine has been built, and create_app's cheap-build
+        # contract means pre-build listings simply omit the field.
+        engine_holder.max_model_len = engine.max_seq_len
         # Attach the message frontend (#95) to the engine so the per-request
         # encode / decode path resolves it directly. Loading the tokenizer is
         # torch-free (AutoTokenizer) and happens once, here, at first request.

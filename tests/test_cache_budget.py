@@ -27,6 +27,7 @@ from freetoken.engine.cache_budget import (
     _bytes_per_expert_slot,
     _bytes_per_kv_token,
     plan_cache_budget,
+    resolve_served_context_len,
 )
 
 # A Qwen3-30B-A3B-shaped MoE (the B70 hero) at bf16, on a 32 GB card. The
@@ -174,3 +175,58 @@ def test_bytes_per_slot_override_rejects_non_positive():
         plan_cache_budget(**{**BASE, "bytes_per_slot_override": 0})
     with pytest.raises(ValueError, match="bytes_per_slot_override"):
         plan_cache_budget(**{**BASE, "bytes_per_slot_override": -1})
+
+
+# --- resolve_served_context_len (issue #246) ---------------------------------
+#
+# Admission allocates a request's FULL max_seq_len up front; the auto planner
+# can return fewer KV pages than the checkpoint's context. This is the single
+# reconciliation point: cap the served context to the planned pool, never cap
+# on the conventional (planned None) path.
+
+
+def test_resolve_uncapped_when_no_plan():
+    # planned None = conventional pool (max_running_req * max_seq_len >= the
+    # demand): the checkpoint's full context is servable, no cap, no reason.
+    assert resolve_served_context_len(max_seq_len=40960, planned_kv_pages=None) == (
+        40960,
+        None,
+    )
+
+
+def test_resolve_uncapped_when_pool_fits_context():
+    # The planner returned at least the checkpoint's context: untouched.
+    assert resolve_served_context_len(max_seq_len=40960, planned_kv_pages=40960) == (
+        40960,
+        None,
+    )
+    assert resolve_served_context_len(max_seq_len=40960, planned_kv_pages=65536) == (
+        40960,
+        None,
+    )
+
+
+def test_resolve_caps_to_planned_pages():
+    # The #246 repro: a 40960-context checkpoint on a card whose MoE-priority
+    # plan left only 8489 KV pages. Serve 8489, not crash on the first request.
+    effective, reason = resolve_served_context_len(max_seq_len=40960, planned_kv_pages=8489)
+    assert effective == 8489
+    # The reason must be loud and operator-actionable: name the real numbers and
+    # the knobs that lift the cap.
+    assert "8489" in reason and "40960" in reason
+    for knob in ("--kv-reserve-tokens", "--max-model-len", "--moe-cache-size"):
+        assert knob in reason
+
+
+def test_resolve_cap_matches_a_real_plan_shape():
+    # End-to-end shape: plan a budget-starved split, then resolve against it.
+    # A 32GB card, 0.9 ratio, KV floor 8192, a hero whose expert cache eats the
+    # budget -> planned pages land between the floor and the full context.
+    c = plan_cache_budget(**BASE)
+    assert c.kv_num_pages >= BASE["kv_reserve_tokens"]
+    full_ctx = 200_000  # more than any plausible planned pool here
+    effective, reason = resolve_served_context_len(
+        max_seq_len=full_ctx, planned_kv_pages=c.kv_num_pages
+    )
+    assert effective == c.kv_num_pages
+    assert reason is not None

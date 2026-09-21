@@ -192,3 +192,62 @@ def test_pinned_cache_size_disables_auto(tiny_model_path):
     assert engine.model.moe_cache.cache_size == 40
     # The KV pool kept its conventional size (planning was off).
     assert engine._cache_budget == (None, None) or engine._cache_budget[1] is None
+
+
+def test_planned_pool_smaller_than_context_caps_served_len(tiny_model_path, monkeypatch, caplog):
+    """Issue #246: when the auto-planned KV pool cannot cover the requested
+    context, the engine must CAP the served context to the planned pool (and
+    say so), never admit a request it cannot allocate. The original failure:
+    a 40960-context checkpoint, 8489 planned pages, first add_request died
+    with "KV pool full". A 64 MB fake total VRAM forces the planner to floor
+    the KV pool at kv_reserve_tokens (256 pages) against a 100000-token
+    context request -- the same shape, at toy cost."""
+    if xpu_total_memory() is None:
+        pytest.skip("no XPU total memory reported")
+
+    import freetoken.utils.arch as arch
+
+    monkeypatch.setattr(arch, "xpu_total_memory", lambda: 64 * 1024 * 1024)
+
+    config = EngineConfig(
+        model_path=tiny_model_path,
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        device=DEVICE,
+        attention_backend="auto",
+        moe_backend="offload",
+        moe_cache_auto=True,
+        kv_reserve_tokens=256,
+        max_running_req=1,
+        max_seq_len_override=100_000,  # far above anything a 64 MB card can plan
+        use_dummy_weight=True,
+    )
+    engine = Engine(config)
+    planned_pages = engine._cache_budget[1]
+    assert planned_pages is not None, "auto planning ran"
+    assert planned_pages < 100_000, "test precondition: planned pool < requested context"
+    # The served context is capped to the planned pool, and the pools / page
+    # table were built at the CAPPED length.
+    assert engine.max_seq_len == planned_pages
+    assert engine._pool_num_pages >= planned_pages
+    # The cap was logged loudly (the operator-actionable reason).
+    assert any("capping" in rec.message.lower() for rec in caplog.records), [
+        rec.getMessage() for rec in caplog.records
+    ]
+    # And admission survives: a full request runs to completion instead of
+    # raising "KV pool full" on the first allocate.
+    from freetoken.core import Req, SamplingParams
+
+    engine.add_request(
+        Req(
+            input_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+            table_idx=0,
+            cached_len=0,
+            output_len=4,
+            uid=0,
+            sampling_params=SamplingParams(max_tokens=4),
+            cache_handle=None,
+        )
+    )
+    out = engine.generate()
+    assert out and len(out[0]) == 4

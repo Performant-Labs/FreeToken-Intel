@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-__all__ = ["CacheBudget", "plan_cache_budget", "MoeCachePlan"]
+__all__ = ["CacheBudget", "MoeCachePlan", "plan_cache_budget", "resolve_served_context_len"]
 
 
 @dataclass(frozen=True)
@@ -249,3 +249,42 @@ def plan_cache_budget(
         kv_num_pages=kv_num_pages,
         kv_is_floored=kv_num_pages == kv_reserve_tokens,
     )
+
+
+def resolve_served_context_len(
+    *,
+    max_seq_len: int,
+    planned_kv_pages: int | None,
+) -> tuple[int, str | None]:
+    """Cap the served context to what the auto-planned KV pool can actually admit.
+
+    Admission (``Engine._allocate_slot``) allocates a request's FULL ``max_seq_len``
+    up front, but the auto planner (:func:`plan_cache_budget`) can return FEWER KV
+    pages than the checkpoint's ``max_position_embeddings`` whenever the MoE cache
+    takes priority (issue #246): the engine then plans, say, 8489 pages, the first
+    ``add_request`` asks for 40960, and every request dies with "KV pool full".
+    This is the single place that reconciles the two -- the engine applies the
+    returned cap to its pool / page table / ``self.max_seq_len`` and the server
+    reports the same number as ``max_model_len`` on ``/v1/models``.
+
+    ``planned_kv_pages is None`` means "no auto plan" (a pinned ``--moe-cache-size``
+    or a dense model): the conventional pool is ``max_running_req * max_seq_len``
+    which always covers the demand, so no cap. The planned count is what the pool
+    allocates INCLUDING the engine's +1 slack page minus MHAKVCache's reserved
+    slot 0, so capping to exactly ``planned_kv_pages`` leaves admission a exact fit.
+
+    Returns:
+        ``(effective_max_seq_len, cap_reason)`` -- ``cap_reason`` is ``None`` when
+        the checkpoint's full context is servable, else a loud, operator-actionable
+        explanation of the cap.
+    """
+    if planned_kv_pages is None or planned_kv_pages >= max_seq_len:
+        return max_seq_len, None
+    reason = (
+        f"auto-planned KV pool has {planned_kv_pages} pages but the checkpoint "
+        f"needs {max_seq_len} per request; capping the served context "
+        f"(max_model_len) to {planned_kv_pages} tokens. Raise --kv-reserve-tokens, "
+        f"pass a smaller --max-model-len, or pin --moe-cache-size to take the "
+        f"conventional full-context pool."
+    )
+    return planned_kv_pages, reason

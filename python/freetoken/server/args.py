@@ -82,10 +82,16 @@ class ServerArgs:
     memory_ratio: float = 0.9
     # KV pool floor, in tokens, reserved for long-context scheduling.
     kv_reserve_tokens: int = 8192
+    # Issue #246: cap the served context length (-> EngineConfig.max_seq_len_override).
+    # None = serve the checkpoint's full context, additionally capped to the
+    # auto-planned KV pool when VRAM cannot fit it (resolve_served_context_len).
+    max_model_len: int | None = None
 
     def __post_init__(self) -> None:
         if self.server_port < 0 or self.server_port > 65535:
             raise ValueError(f"server_port must be in [0, 65535], got {self.server_port}")
+        if self.max_model_len is not None and self.max_model_len <= 0:
+            raise ValueError(f"max_model_len must be a positive token count, got {self.max_model_len}")
 
     @property
     def model_path(self) -> str:
@@ -247,6 +253,16 @@ def parse_args(args: list[str] | None = None, prog: str | None = None) -> Server
         default=8192,
         help="KV pool floor in tokens, always reserved for long-context scheduling "
         "(issue #16). The MoE cache is sized from the VRAM left after this floor.",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        dest="max_model_len",
+        type=int,
+        default=None,
+        help="Cap the served context length in tokens (issue #246). Default: the "
+        "checkpoint's full context, additionally capped to the auto-planned KV "
+        "pool when VRAM cannot fit it (logged at startup). Reported as "
+        "max_model_len on /v1/models once the engine is up.",
     )
 
     ns = parser.parse_args(args)

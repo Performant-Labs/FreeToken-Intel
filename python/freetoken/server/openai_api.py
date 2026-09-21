@@ -96,17 +96,20 @@ def register_openai_routes(app: FastAPI, engine_holder) -> None:
     @app.get("/v1/models")
     def list_models() -> dict:
         name = _served_name(app)
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": name,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "freetoken-intel",
-                }
-            ],
+        entry = {
+            "id": name,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "freetoken-intel",
         }
+        # Issue #246: the effective served context (checkpoint context capped to
+        # the auto-planned KV pool). Known only after the engine has been built
+        # (launch.py's holder stashes it); a pre-build listing omits the field
+        # rather than guess, keeping create_app's cheap-build contract.
+        served_len = getattr(engine_holder, "max_model_len", None)
+        if served_len is not None:
+            entry["max_model_len"] = served_len
+        return {"object": "list", "data": [entry]}
 
     @app.post("/v1/chat/completions")
     def chat_completions(request: ChatCompletionRequest) -> object:
