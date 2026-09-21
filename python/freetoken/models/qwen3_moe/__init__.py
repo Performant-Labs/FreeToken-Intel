@@ -575,7 +575,30 @@ class _Qwen3MoE(nn.Module):
         if is_prefill:
             cache.materialize_layer(layer_id)
         else:
-            cache.ensure_experts(layer_id, expert_ids)
+            # Issue #251 (hybrid split, follow-up to #248/#257): `exclude` is
+            # the set of experts the hybrid split's CPU half is computing this
+            # step -- they must never be PCIe-fetched into the XPU LRU pool at
+            # all, not just skipped at the final accumulate below.
+            # `ensure_experts` has no notion of `exclude` itself: it treats
+            # every id in whatever tensor it's handed as "route this expert
+            # through the XPU pool this step" (residency bump on a hit, an
+            # LRU eviction + host->device copy on a miss). Passing it the
+            # *full* routed set here (pre-#251) meant the CPU-designated
+            # experts got fetched/evicted-for exactly as a plain offload call
+            # would, wasting PCIe bandwidth and LRU slots on experts whose
+            # result the XPU half was going to discard anyway (`exclude` only
+            # gated their contribution to `out`, never their transport). The
+            # CPU half reads its own weights straight from the host bank
+            # (`hybrid_subset_submit`), never through this pool, so omitting
+            # them here changes no numerics -- the groups-building loop below
+            # already independently re-skips anything in `exclude` regardless
+            # of its slot/residency state.
+            fetch_ids = expert_ids
+            if exclude:
+                flat_ids = expert_ids.reshape(-1).tolist()
+                kept = [e for e in flat_ids if e not in exclude]
+                fetch_ids = torch.tensor(kept, dtype=expert_ids.dtype) if kept else expert_ids.new_empty(0)
+            cache.ensure_experts(layer_id, fetch_ids)
         cache.copy_missing()
 
         # 3) Map expert -> slot on the host from the cache's own (Python) map.
