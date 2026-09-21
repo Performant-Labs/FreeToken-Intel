@@ -254,16 +254,23 @@ def test_engine_generate_produces_in_vocab_tokens(synthetic_gguf_path):
 def test_engine_offload_backend_generate_produces_in_vocab_tokens(synthetic_gguf_path):
     """The offload/cpu/hybrid backends all route through the same
     _attach_offload_cache path -- confirm offload actually builds a working
-    OffloadMoeCache from GGUF-sourced banks (plain bf16 _PlainBank tensors,
-    dequantized eagerly by iter_weights -- see that function's own
-    docstring for why this needs no GGUF-specific bank/quant_format
-    handling anywhere downstream, unlike the packed GPTQ/FP8/MXFP4/INT8
-    formats) and actually generates through it.
+    OffloadMoeCache from GGUF-sourced banks.
+
+    As of issue `models-gguf-lazy-packed-dequant` (#282), EVERY GGUF
+    checkpoint's MoE expert banks -- including this test's own synthetic
+    F32 fixture -- are routed through the packed, lazy-dequant
+    ``"gguf_kquant"`` path (``stream_moe_expert_sources_gguf_kquant``),
+    never through the plain-bf16-eager-dequant path ``iter_weights`` alone
+    used to produce (see #282's own issue body: that eager path is exactly
+    the ~66GB RAM blowup this issue exists to fix, for the real target
+    checkpoint). See ``tests/test_gguf_lazy_dequant.py`` for the packed-bank
+    round-trip / correctness coverage this format needs (mirroring #152/
+    #154's own established pattern for the other packed formats).
     """
     reset_global_ctx()
     engine = Engine(_engine_config(synthetic_gguf_path, moe_backend="offload"))
     assert engine.model.moe_cache is not None
-    assert engine.model.moe_cache.quant_format == "bf16"
+    assert engine.model.moe_cache.quant_format == "gguf_kquant"
     engine.add_request(
         Req(
             input_ids=[1, 2, 3],

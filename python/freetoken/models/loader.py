@@ -590,6 +590,63 @@ def _place_gptq_expert_weights(model, gate_up_banks, down_banks, device, group_s
         )
 
 
+def _place_gguf_kquant_expert_weights(model, gate_up_banks, down_banks, device) -> None:
+    """Fill the model's already-built plain bf16 expert modules from packed
+    GGUF K-quant banks (issue `models-gguf-lazy-packed-dequant`, #282's own
+    in-VRAM fallback).
+
+    Unlike the other packed formats' own ``_place_*`` siblings (MXFP4/FP8/
+    INT8/GPTQ above, which keep the packed bytes device-resident and
+    dequantize lazily at forward time via a native fused Triton kernel),
+    GGUF has no such kernel -- ``freetoken.models.gguf.dequant``'s kernels
+    are CPU-numpy-only (see that module's own docstring). The in-VRAM
+    (``moe_backend`` unset / ``"fused"``) path is only reachable at all for
+    a checkpoint small enough to be fully XPU-resident in the first place
+    -- the real 256-expert/41-layer target this issue's RAM fix targets
+    does not fit in VRAM regardless of quant format, so it never reaches
+    this function (it always uses ``moe_backend="offload"``/``"hybrid"``/
+    ``"cpu"``, which route through :func:`_attach_offload_cache`'s own
+    ``"gguf_kquant"`` branch and `SlotWeightAccessor`'s lazy, per-slot
+    dequant instead). For the small-checkpoint case this function DOES
+    serve, dequantizing once per expert at PLACEMENT time -- not lazily,
+    per forward call -- is a safe, correctness-preserving simplification:
+    it mirrors the plain-bf16 :func:`_place_expert_weights` exactly, with
+    one extra :func:`~freetoken.models.gguf.dequantize` call per packed row.
+    """
+    import torch
+
+    from freetoken.models.gguf import dequantize as _gguf_dequantize
+    from freetoken.models.gguf import gguf_expert_row_bytes
+
+    intermediate = int(getattr(model.config, "moe_intermediate_size", 0))
+    hidden = int(getattr(model.config, "hidden_size", 0))
+    dtype = getattr(model.config, "dtype", torch.bfloat16)
+
+    def _dequant_row(raw_row: torch.Tensor, ggml_type: int, shape: tuple) -> torch.Tensor:
+        row_bytes = gguf_expert_row_bytes(ggml_type, shape[0] * shape[1])
+        raw_cpu = raw_row[:row_bytes]
+        if raw_cpu.device.type != "cpu":
+            raw_cpu = raw_cpu.to("cpu")
+        return _gguf_dequantize(ggml_type, bytes(raw_cpu.numpy()), shape, out_dtype=dtype)
+
+    for i, layer_id in enumerate(_moe_layers(model.config)):
+        moe = getattr(getattr(model, "layers", [None] * (layer_id + 1))[layer_id], "mlp", None)
+        experts = getattr(moe, "experts", None)
+        if experts is None:
+            continue
+        # MoE-layer-order-compacted (see _place_expert_weights' own comment).
+        gu_bank = gate_up_banks[i]
+        dn_bank = down_banks[i]
+        for e in range(len(experts)):
+            gate_w = _dequant_row(gu_bank.raw_gate[e], gu_bank.ggml_type_gate, (intermediate, hidden))
+            up_w = _dequant_row(gu_bank.raw_up[e], gu_bank.ggml_type_up, (intermediate, hidden))
+            down_w = _dequant_row(dn_bank.raw[e], dn_bank.ggml_type, (hidden, intermediate))
+            with torch.no_grad():
+                experts[e].gate_proj.weight.copy_(gate_w.to(device))
+                experts[e].up_proj.weight.copy_(up_w.to(device))
+                experts[e].down_proj.weight.copy_(down_w.to(device))
+
+
 def _place_expert_weights_any(model, gate_up_banks, down_banks, device, model_path: str | None = None) -> None:
     """Dispatch the in-VRAM (``moe_backend="fused"``) expert placement by
     bank type: a plain bf16 stacked tensor goes through
@@ -605,10 +662,18 @@ def _place_expert_weights_any(model, gate_up_banks, down_banks, device, model_pa
     field -- see :func:`~freetoken.models.weight.checkpoint_gptq_group_size`);
     every other branch ignores it, and callers on those paths may omit it.
     """
-    from freetoken.models.weight import Fp8BlockExpertBank, GptqExpertBank, Int8ExpertBank, MxfpExpertBank
+    from freetoken.models.weight import (
+        Fp8BlockExpertBank,
+        GgufKQuantGateUpBank,
+        GptqExpertBank,
+        Int8ExpertBank,
+        MxfpExpertBank,
+    )
 
     first = next((b for b in gate_up_banks if b is not None), None)
-    if isinstance(first, MxfpExpertBank):
+    if isinstance(first, GgufKQuantGateUpBank):
+        _place_gguf_kquant_expert_weights(model, gate_up_banks, down_banks, device)
+    elif isinstance(first, MxfpExpertBank):
         _place_mxfp4_expert_weights(model, gate_up_banks, down_banks, device)
     elif isinstance(first, Fp8BlockExpertBank):
         _place_fp8_expert_weights(model, gate_up_banks, down_banks, device)
@@ -648,7 +713,13 @@ def _attach_offload_cache(
     while the model's blocks are indexed by *absolute layer id*, so we also give
     the model the ``moe_layer_id`` map (layer_id -> MoE index) the forward uses.
     """
-    from freetoken.models.weight import Fp8BlockExpertBank, GptqExpertBank, Int8ExpertBank, MxfpExpertBank
+    from freetoken.models.weight import (
+        Fp8BlockExpertBank,
+        GgufKQuantGateUpBank,
+        GptqExpertBank,
+        Int8ExpertBank,
+        MxfpExpertBank,
+    )
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     num_experts = int(getattr(model_config, "num_experts", 0) or 0)
@@ -690,6 +761,11 @@ def _attach_offload_cache(
     # are Int8ExpertBank, detected the same way is_gptq is -- from the bank
     # type itself, not re-derived from the checkpoint path here.
     is_int8 = bool(gate_up_banks) and isinstance(gate_up_banks[0], Int8ExpertBank)
+    # A GGUF checkpoint's banks (issue `models-gguf-lazy-packed-dequant`,
+    # #282) are GgufKQuantGateUpBank, detected the same way as every other
+    # packed format here -- from the bank type itself (load_moe_expert_sources
+    # already dispatched to stream_moe_expert_sources_gguf_kquant for these).
+    is_gguf_kquant = bool(gate_up_banks) and isinstance(gate_up_banks[0], GgufKQuantGateUpBank)
     if is_gptq:
         quant_format = "gptq_int4"
     elif is_fp8_block:
@@ -698,6 +774,8 @@ def _attach_offload_cache(
         quant_format = "mxfp4"
     elif is_int8:
         quant_format = "int8_channel"
+    elif is_gguf_kquant:
+        quant_format = "gguf_kquant"
     else:
         quant_format = "bf16"
     cache = OffloadMoeCache(
@@ -792,6 +870,41 @@ def _attach_offload_cache(
                 "scale_down": [b.weight_scale_inv for b in down_banks],
             }
         )
+    elif is_gguf_kquant:
+        # Three packed banks (_BANK_SCHEMAS["gguf_kquant"]) -- every bank is
+        # one row per expert, so set_bank_sources' generic per-expert-row
+        # contract applies unchanged (the rows are raw uint8 bytes rather
+        # than a typed quantized tensor, but set_bank_sources never assumes
+        # a dtype beyond "whatever the source tensor's own dtype is").
+        # Unlike GPTQ's g_idx there is no shared-across-experts side
+        # tensor, but there IS real per-layer metadata this format needs:
+        # each layer's own GGML quant type (which may genuinely differ
+        # across layers -- see GgufKQuantGateUpBank's own docstring),
+        # needed by SlotWeightAccessor to recover a padded bank row's real,
+        # unpadded byte length at dequant time.
+        cache.set_bank_sources(
+            {
+                "raw_gate": [b.raw_gate for b in gate_up_banks],
+                "raw_up": [b.raw_up for b in gate_up_banks],
+                "raw_down": [b.raw for b in down_banks],
+            }
+        )
+        cache.set_extra_metadata("gguf_ggml_type_gate", [b.ggml_type_gate for b in gate_up_banks])
+        cache.set_extra_metadata("gguf_ggml_type_up", [b.ggml_type_up for b in gate_up_banks])
+        cache.set_extra_metadata("gguf_ggml_type_down", [b.ggml_type for b in down_banks])
+        # hidden_size / moe_intermediate_size: architecture constants
+        # SlotWeightAccessor needs to reshape a dequantized row (a raw
+        # uint8 byte bank carries no element-shaped axis of its own, unlike
+        # every other packed format's bank rows) -- refuses to guess, same
+        # "loader is the one place with both the cache and the parsed
+        # config" rationale as gptq_group_size / int8_k_gate_up above.
+        cache.gguf_hidden_size = int(getattr(model_config, "hidden_size", 0) or 0)
+        cache.gguf_moe_intermediate_size = int(getattr(model_config, "moe_intermediate_size", 0) or 0)
+        if not cache.gguf_hidden_size or not cache.gguf_moe_intermediate_size:
+            raise ValueError(
+                "_attach_offload_cache needs model_config.hidden_size / "
+                "moe_intermediate_size to wire a GGUF K-quant checkpoint's cache"
+            )
     else:
         # The banks are indexed by MoE-layer order (moe_layers), matching the
         # cache's 0-based MoE-layer ids.

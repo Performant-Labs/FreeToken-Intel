@@ -90,6 +90,33 @@ logger = init_logger(__name__)
 # genuinely one-row-per-expert, so (like gptq_int4) they fit
 # set_bank_sources/copy_missing/rebuild unchanged.
 #
+# "gguf_kquant" (issue `models-gguf-lazy-packed-dequant`, #282): a GGUF
+# checkpoint's routed-expert tensors, kept as raw packed GGML-quantized
+# bytes instead of dequantizing eagerly (the real target checkpoint, 256
+# experts x 41 layers, needs ~66GB of host RAM if dequantized eagerly to
+# bf16 -- see the issue's own math). Three banks (not four/six like the
+# other formats): "raw_gate"/"raw_up"/"raw_down", each one ``[E, row_bytes]``
+# ``uint8`` tensor per layer -- one expert's exact packed GGML bytes per
+# row, straight from disk (freetoken.models.weight
+# .stream_moe_expert_sources_gguf_kquant /
+# freetoken.models.gguf.iter_moe_expert_raw_banks). Unlike every other
+# format here, "gate" and "up" are NOT fused into one "gate_up" bank at the
+# packed-byte level -- concatenating raw GGML bytes is only valid when both
+# halves share an identical block layout, and this port does not assume
+# that (verified against the real checkpoint: true today, but #282's own
+# issue body explicitly warns against assuming it) -- so they stay two
+# separate per-expert-row banks, joined only after each is independently
+# dequantized (SlotWeightAccessor.get). Unlike GPTQ's g_idx, there is no
+# bank-shaped side tensor here, but there IS real per-layer metadata this
+# format needs beyond the per-expert rows: each layer's raw bytes may have
+# been zero-padded to the bank's max row length (a real, verified
+# complication -- the real target checkpoint's own "down" projection mixes
+# Q5_K and Q6_K across layers, different byte sizes; see
+# stream_moe_expert_sources_gguf_kquant's own docstring), so each layer's
+# REAL ggml_type (hence its real, unpadded byte length) is carried via
+# OffloadMoeCache.extra_metadata ("gguf_ggml_type_gate"/"_up"/"_down"),
+# mirroring how g_idx rides extra_metadata for GPTQ.
+#
 # "int8_channel" (issue moe-quant-banks-int8, #154): compressed-tensors'
 # "pack-quantized" INT8 scheme (verified against a real checkpoint,
 # rj1013/gemma-4-26B-A4B-it_q8 -- an EARLIER, unverified draft of this
@@ -137,6 +164,11 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
         "weight_scale_gate_up",
         "weight_packed_down",
         "weight_scale_down",
+    ),
+    "gguf_kquant": (
+        "raw_gate",
+        "raw_up",
+        "raw_down",
     ),
 }
 
@@ -693,7 +725,14 @@ class SlotWeightAccessor:
     reason, not to the checkpoint's own scale dtype.
     """
 
-    def __init__(self, cache: "OffloadMoeCache", intermediate: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        cache: "OffloadMoeCache",
+        intermediate: int,
+        dtype: torch.dtype,
+        *,
+        layer_id: Optional[int] = None,
+    ) -> None:
         self.quant_format = getattr(cache, "quant_format", "bf16")
         self._intermediate = intermediate
         self._dtype = dtype
@@ -759,6 +798,44 @@ class SlotWeightAccessor:
                 )
             self._int8_k_gate_up = int(k_gate_up)
             self._int8_k_down = int(k_down)
+        elif self.quant_format == "gguf_kquant":
+            self._banks = dict(zip(cache.bank_schema, cache.bank_views()))
+            # Each layer's raw bank rows may be zero-padded (see
+            # _BANK_SCHEMAS["gguf_kquant"]'s own comment); the REAL ggml_type
+            # per (layer, gate|up|down) -- hence the real unpadded byte
+            # length -- is per-layer metadata, not a bank-shaped or global
+            # scalar value, so this class needs to know which layer it was
+            # constructed for (unlike gptq_int4's group_size or fp8_block's
+            # block size, both checkpoint-wide constants). Refuses to guess,
+            # matching the "no default" discipline the gptq_int4/int8_channel
+            # branches above already use for their own required parameters.
+            if layer_id is None:
+                raise ValueError(
+                    "SlotWeightAccessor needs layer_id for quant_format='gguf_kquant' "
+                    "-- the real target checkpoint's own GGML quant type can vary per "
+                    "layer (e.g. Q5_K vs Q6_K for the down projection), so this class "
+                    "cannot dequantize a slot's raw bytes without knowing which layer's "
+                    "type applies (SlotWeightAccessor refuses to guess)"
+                )
+            self._gguf_ggml_type_gate = int(cache.get_extra_metadata("gguf_ggml_type_gate", layer_id))
+            self._gguf_ggml_type_up = int(cache.get_extra_metadata("gguf_ggml_type_up", layer_id))
+            self._gguf_ggml_type_down = int(cache.get_extra_metadata("gguf_ggml_type_down", layer_id))
+            # hidden_size / moe_intermediate_size: architecture constants, not
+            # recoverable from a raw uint8 byte bank's own shape (unlike
+            # every other packed format here, whose bank rows keep a real
+            # element-shaped axis to key off) -- the loader must set these,
+            # same "refuse to guess" rationale as gptq_group_size /
+            # int8_k_gate_up above.
+            hidden_size = getattr(cache, "gguf_hidden_size", None)
+            moe_intermediate_size = getattr(cache, "gguf_moe_intermediate_size", None)
+            if not hidden_size or not moe_intermediate_size:
+                raise ValueError(
+                    "OffloadMoeCache.gguf_hidden_size / gguf_moe_intermediate_size are not "
+                    "set -- the loader must set them from the checkpoint's own config before "
+                    "any gguf_kquant forward pass runs (SlotWeightAccessor refuses to guess)"
+                )
+            self._gguf_hidden_size = int(hidden_size)
+            self._gguf_moe_intermediate_size = int(moe_intermediate_size)
         else:
             self._gu, self._dn = cache.bank_views()
 
@@ -970,6 +1047,40 @@ class SlotWeightAccessor:
             )
             i = self._intermediate
             result = (gu_dense[0:i], gu_dense[i : 2 * i], dn_dense)
+            self._cache[s_i] = result
+            return result
+        if self.quant_format == "gguf_kquant":
+            from freetoken.models.gguf import dequantize as _gguf_dequantize
+            from freetoken.models.gguf import gguf_expert_row_bytes
+
+            b = self._banks
+            H = self._gguf_hidden_size
+            I = self._gguf_moe_intermediate_size
+
+            def _dequant_row(raw_row: torch.Tensor, ggml_type: int, shape: tuple) -> torch.Tensor:
+                # dequant.py's kernels are plain numpy (CPU-only, no SYCL/XPU
+                # kernel yet -- see dequant.py's own module docstring), so the
+                # raw bytes must be materialized on the host regardless of
+                # which device the slot-cache pool itself lives on; the
+                # dequantized result is moved back to that device before
+                # this class hands it to the caller's (possibly-XPU) matmul.
+                # This is a real, deliberate per-slot host round-trip unique
+                # to this format among the packed quant formats here (every
+                # other one dequantizes with plain torch ops that already run
+                # on-device) -- documented, not accidental.
+                n_elements = shape[0] * shape[1]
+                row_bytes = gguf_expert_row_bytes(ggml_type, n_elements)
+                raw_cpu = raw_row[:row_bytes]
+                if raw_cpu.device.type != "cpu":
+                    raw_cpu = raw_cpu.to("cpu")
+                raw_bytes = bytes(raw_cpu.numpy())
+                dense = _gguf_dequantize(ggml_type, raw_bytes, shape, out_dtype=self._dtype)
+                return dense.to(raw_row.device) if raw_row.device.type != "cpu" else dense
+
+            gate_w = _dequant_row(b["raw_gate"][s_i], self._gguf_ggml_type_gate, (I, H))
+            up_w = _dequant_row(b["raw_up"][s_i], self._gguf_ggml_type_up, (I, H))
+            down_w = _dequant_row(b["raw_down"][s_i], self._gguf_ggml_type_down, (H, I))
+            result = (gate_w, up_w, down_w)
             self._cache[s_i] = result
             return result
         if self.quant_format == "mxfp4":
