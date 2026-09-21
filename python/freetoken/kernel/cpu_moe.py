@@ -312,6 +312,23 @@ def _as_c_float_ptr(t: torch.Tensor):
     return t.contiguous().numpy().ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
 
+def _as_c_bf16_bits_ptr(t: torch.Tensor):
+    """A ``ctypes.POINTER(c_uint16)`` over a bfloat16 tensor's raw storage.
+
+    ctypes (and numpy) have no native bfloat16 concept, so this reinterprets
+    the tensor's bit pattern as ``uint16`` (same size, same bytes, zero
+    copy) rather than converting the *value* -- ``.view(torch.uint16)`` is
+    exactly this bit-reinterpretation, not a numeric cast (unlike
+    ``.to(torch.uint16)``, which would truncate/round the value). Issue
+    #257: this is how the raw bf16 bytes cross the ctypes boundary with no
+    float32 materialization anywhere on the way.
+    """
+    t = t.contiguous()
+    if t.dtype != torch.bfloat16:
+        raise TypeError(f"expected a bfloat16 tensor, got {t.dtype}")
+    return t.view(torch.uint16).numpy().ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+
+
 def cpu_moe_forward(
     module: KernelModule,
     x: torch.Tensor,
@@ -492,11 +509,12 @@ def _bind_submit(module: KernelModule):
         ctypes.POINTER(ctypes.c_int32),  # expert_ids
         ctypes.POINTER(ctypes.c_float),  # expert_weights
         ctypes.c_int,  # topk
-        ctypes.POINTER(ctypes.c_float),  # gate_up
-        ctypes.POINTER(ctypes.c_float),  # down
+        ctypes.POINTER(ctypes.c_uint16),  # gate_up -- raw bf16 bit patterns (issue #257)
+        ctypes.POINTER(ctypes.c_uint16),  # down -- raw bf16 bit patterns (issue #257)
         ctypes.c_int,  # num_experts
         ctypes.c_int,  # intermediate
         ctypes.POINTER(ctypes.c_uint8),  # expert_mask (nullable)
+        ctypes.c_int,  # force_scalar (nonzero forces the scalar bf16 row-compute)
         ctypes.POINTER(ctypes.c_float),  # out
     ]
     fn.restype = ctypes.c_int64
@@ -569,19 +587,39 @@ def cpu_moe_submit(
     num_experts: int,
     intermediate: int,
     expert_mask: Optional[Iterable[int]] = None,
+    *,
+    force_scalar: bool = False,
 ) -> CpuMoeJob:
     """Hand a CPU MoE forward job to the persistent native worker thread; return immediately.
 
-    Same argument contract as :func:`cpu_moe_forward` (identical dtypes,
-    layout, and expert-major-then-top-k-column accumulation order -- see that
-    function's docstring). The only difference is *where* the compute runs:
-    asynchronously, on the native module's persistent ``std::thread`` worker
-    (issue #248), rather than synchronously on the calling thread. Because
-    ``ctypes`` releases the GIL for the duration of this call, the (cheap --
-    just claiming a job slot and handing off a struct) act of submitting does
-    not itself contend with whatever the caller does next; call
-    :meth:`CpuMoeJob.result` on the returned job once that other work is done
-    to block for this job's result.
+    Same argument contract as :func:`cpu_moe_forward` -- identical layout and
+    expert-major-then-top-k-column accumulation order (see that function's
+    docstring) -- except ``gate_up``/``down``: issue #257 keeps those in
+    their native ``bfloat16`` storage the whole way to the native call, never
+    materializing a float32 copy of a full expert weight bank (the O(bank
+    size) conversion pass #251's live B70 testing found costs *more* than
+    the compute it feeds). Pass ``gate_up``/``down`` as ``bfloat16`` tensors
+    (any other dtype is cast to ``bfloat16`` here, which is itself the only
+    conversion this function performs on them -- no float32 stop along the
+    way). ``x``/``expert_ids``/``expert_weights`` are unaffected -- the
+    activation conversion was never the bottleneck (#257's own scope note).
+
+    The only other difference from :func:`cpu_moe_forward` is *where* the
+    compute runs: asynchronously, on the native module's persistent
+    ``std::thread`` worker (issue #248), rather than synchronously on the
+    calling thread. Because ``ctypes`` releases the GIL for the duration of
+    this call, the (cheap -- just claiming a job slot and handing off a
+    struct) act of submitting does not itself contend with whatever the
+    caller does next; call :meth:`CpuMoeJob.result` on the returned job once
+    that other work is done to block for this job's result.
+
+    Args:
+        force_scalar: forces the scalar bf16 row-compute even when AVX-512
+            is available -- a deterministic test hook for the fallback
+            branch (mirrors :func:`cpu_moe_forward_fast`'s own
+            ``force_scalar``), also settable via the
+            ``FREETOKEN_CPU_MOE_FORCE_SCALAR`` environment variable when
+            left at its default ``False``.
     """
     import torch  # lazy: torch is an optional extra, see the top-of-file note
 
@@ -590,8 +628,11 @@ def cpu_moe_submit(
     x_c = x.to("cpu", dtype=torch.float32).contiguous()
     ids_c = expert_ids.to("cpu", dtype=torch.int32).contiguous()
     w_c = expert_weights.to("cpu", dtype=torch.float32).contiguous()
-    gu_c = gate_up.to("cpu", dtype=torch.float32).contiguous()
-    dn_c = down.to("cpu", dtype=torch.float32).contiguous()
+    # bf16-preserving -- NOT `.to("cpu", dtype=torch.float32)`. This is the
+    # crux of issue #257: gate_up/down cross into the native call still in
+    # their native bf16 storage, dequantized only inside the kernel's FMA.
+    gu_c = gate_up.to(device="cpu", dtype=torch.bfloat16).contiguous()
+    dn_c = down.to(device="cpu", dtype=torch.bfloat16).contiguous()
 
     num_tokens, hidden = int(x_c.shape[0]), int(x_c.shape[1])
     topk = int(ids_c.shape[1]) if ids_c.dim() == 2 else int(expert_weights.shape[-1])
@@ -607,6 +648,11 @@ def cpu_moe_submit(
         mask_arr = (ctypes.c_uint8 * num_experts).from_buffer(mask_buf)
         mask_ptr = ctypes.cast(mask_arr, ctypes.POINTER(ctypes.c_uint8))
 
+    force_scalar_effective = force_scalar or os.environ.get("FREETOKEN_CPU_MOE_FORCE_SCALAR", "") not in (
+        "",
+        "0",
+    )
+
     handle = fn(
         _as_c_float_ptr(x_c),
         num_tokens,
@@ -614,11 +660,12 @@ def cpu_moe_submit(
         ids_c.numpy().ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
         _as_c_float_ptr(w_c),
         topk,
-        _as_c_float_ptr(gu_c),
-        _as_c_float_ptr(dn_c),
+        _as_c_bf16_bits_ptr(gu_c),
+        _as_c_bf16_bits_ptr(dn_c),
         int(num_experts),
         int(intermediate),
         mask_ptr,
+        1 if force_scalar_effective else 0,
         out.numpy().ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
     )
     if handle < 0:
@@ -651,13 +698,20 @@ def hybrid_subset_submit(
 
     A plain ``cpu_moe_submit(..., expert_mask=candidate_experts)`` call would
     still have to copy *every* expert's ``gate_up``/``down`` rows to a
-    contiguous float32 buffer first (the native call's pointer arithmetic
-    needs the full ``[num_experts, ...]`` stride, even for the masked-out
-    rows it never reads). On a many-expert model -- the real target here is
+    contiguous buffer first (the native call's pointer arithmetic needs the
+    full ``[num_experts, ...]`` stride, even for the masked-out rows it never
+    reads). On a many-expert model -- the real target here is
     Qwen3.6-35B-A3B, 256 experts/layer -- that is tens of megabytes of wasted
-    bf16->float32 conversion per layer per decode step even when the hybrid
-    split names only half of them, which would quietly recreate a version of
-    the exact per-layer tax this issue exists to eliminate (#247).
+    copying per layer per decode step even when the hybrid split names only
+    half of them.
+
+    Since issue #257, ``gate_up``/``down`` stay in their native ``bfloat16``
+    storage the whole way through this gather (``index_select`` on bf16 --
+    half the bytes moved compared to a float32 copy) and into the native
+    call (:func:`cpu_moe_submit` casts to ``bfloat16``, not ``float32``, if
+    they arrive in some other dtype) -- no float32-materialized copy of a
+    full expert weight bank is ever created anywhere on this path, matching
+    upstream FreeToken's zero-materialization design (see #257).
 
     Instead: gather just the ``candidate_experts`` bank rows into a compact
     ``[len(candidate_experts), ...]`` buffer and remap ``top_idx`` to that
