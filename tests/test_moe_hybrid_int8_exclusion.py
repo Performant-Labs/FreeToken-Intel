@@ -33,12 +33,27 @@ def _fake_model(*, cache_quant_format: str, fetch_fraction: float):
     return model
 
 
+def _stub_bank_lookup(self_, model) -> None:
+    """issue #248: the bf16-split path now resolves this layer's host bank
+    (model.moe_layer_id[self.layer_id] -> bank_sources[...][moe_idx]) eagerly
+    before calling the (fully mocked) native dispatch pool, so self.layer_id
+    and these model attributes must resolve even though the actual submit()
+    call is stubbed and never reads them for real."""
+    self_.layer_id = 0
+    model.moe_layer_id = {0: 0}
+    model.moe_cache.bank_sources = {
+        "gate_up": {0: torch.zeros(1, 4, 3)},
+        "down": {0: torch.zeros(1, 3, 2)},
+    }
+
+
 def _fake_self_qwen3moe(*, cache_quant_format: str, fetch_fraction: float = 0.5):
     """(self, model) -- qwen3_moe's _forward_hybrid takes model directly."""
     self_ = MagicMock(spec=_Qwen3MoE)
     self_._is_cpu_layer.return_value = False
     self_._forward_offload.return_value = torch.zeros(1)
     model = _fake_model(cache_quant_format=cache_quant_format, fetch_fraction=fetch_fraction)
+    _stub_bank_lookup(self_, model)
     return self_, model
 
 
@@ -50,6 +65,7 @@ def _fake_self_qwen35moe(*, cache_quant_format: str, fetch_fraction: float = 0.5
     self_._is_cpu_layer.return_value = False
     self_._forward_offload.return_value = torch.zeros(1)
     model = _fake_model(cache_quant_format=cache_quant_format, fetch_fraction=fetch_fraction)
+    _stub_bank_lookup(self_, model)
     ctx = MagicMock()
     ctx.model = model
     return self_, ctx, model
