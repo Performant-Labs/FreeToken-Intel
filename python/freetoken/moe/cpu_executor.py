@@ -35,6 +35,17 @@ class CpuMoeExecutor:
         # relies on torch's own BLAS threading, so the knob is accepted but a no-op
         # until the AVX-512/AMX kernel (issue ``moe-cpu`` accept: "Thread-pool
         # expert GEMM using AVX-512 (AMX when present)") replaces it.
+        #
+        # Issue #252 built that native, runtime-dispatched AVX-512 +
+        # thread-pooled kernel (``freetoken.kernel.cpu_moe.cpu_moe_forward_fast``,
+        # measured ~5-8x faster than the naive scalar port on this project's
+        # dev hardware) but does *not* wire it into this executor's
+        # ``forward`` below -- that GIL-free dispatch (submitting into the
+        # native worker instead of calling back into Python per layer) is
+        # issue #248's job, per the parent epic #249's explicit split
+        # ("independent of the dispatch-mechanism children, can proceed in
+        # parallel with #248/#253/#251"). This ``forward`` stays pure-PyTorch
+        # and ``threads`` remains a no-op here until #248 lands.
         self.threads = int(threads)
 
     def forward(
