@@ -69,6 +69,36 @@ def test_load_tokenizer_reads_local_vocab(tmp_path):
     assert tok.eos_token_id == 0
 
 
+_GGUF_HF_REPO = "ggml-org/models"
+_GGUF_F32_FIXTURE = "tinyllamas/stories260K.gguf"
+
+
+def _gguf_fixture_path() -> str:
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    try:
+        return huggingface_hub.hf_hub_download(_GGUF_HF_REPO, _GGUF_F32_FIXTURE)
+    except Exception as exc:  # pragma: no cover - network/offline environment
+        pytest.skip(f"could not download real GGUF fixture: {exc}")
+
+
+@pytest.mark.slow
+def test_load_tokenizer_routes_a_gguf_checkpoint_through_its_embedded_vocab():
+    """Issue #274 (real-checkpoint validation) regression: ``load_tokenizer``
+    must not try to resolve a GGUF file as an HF hub id / safetensors
+    directory (``download_hf_weight`` raises ``HFValidationError`` on a raw
+    file path) -- it must detect ``is_gguf_path`` and materialize the file's
+    own embedded tokenizer instead (``freetoken.models.gguf.tokenizer``,
+    issue #272). Found live: the server's ``TokenizeManager`` construction
+    (``server/launch.py``/``server/api_server.py``, both call
+    ``load_tokenizer`` directly) crashed on the real Qwen3.6-35B-A3B GGUF
+    checkpoint with exactly this bug before this fix.
+    """
+    path = _gguf_fixture_path()
+    tok = load_tokenizer(path)
+    ids = tok.encode("hello")
+    assert tok.decode(ids) == "hello"
+
+
 def test_load_eos_token_ids_unions_generation_config(tmp_path):
     _write_vocab(tmp_path, extra={"</s>": 3})
     (tmp_path / "generation_config.json").write_text(json.dumps({"eos_token_id": [3]}))
