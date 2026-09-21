@@ -185,6 +185,58 @@ def _dequantize_q4_k(raw_bytes: bytes) -> np.ndarray:
     return out.reshape(n_blocks, block_size)
 
 
+def _dequantize_q5_k(raw_bytes: bytes) -> np.ndarray:
+    # Super-block (256 values): 2B f16 `d` + 2B f16 `dmin` + 12B packed
+    # 6-bit (scale, min) pairs (same table Q4_K unpacks, reused via
+    # _unpack_q4_k_scale_min) + 32B `qh` high-bit-plane array (8 bit-planes
+    # of 32 bytes each -- bit i of qh byte b is sub-block i's 5th
+    # (high) bit for value b) + 128B of 256 packed 4-bit low nibbles, laid
+    # out as 4 byte-groups of 32 bytes each -- byte-group g's low nibbles
+    # are sub-block 2g's low 4 bits, its high nibbles are sub-block 2g+1's
+    # low 4 bits (same nibble layout as Q4_K's `qs`).
+    # value = d*sc[j]*q - dmin*m[j] for sub-block j, q = lo_nibble | (hi_bit << 4).
+    block_size, type_size = _QK_K, 176
+    blocks = _as_block_bytes(raw_bytes, type_size, "Q5_K")
+    n_blocks = blocks.shape[0]
+
+    d = blocks[:, 0:2].view("<f2").astype(np.float32)  # (n_blocks, 1)
+    dmin = blocks[:, 2:4].view("<f2").astype(np.float32)  # (n_blocks, 1)
+    scales = blocks[:, 4:16]  # (n_blocks, 12)
+    qh = blocks[:, 16:48]  # (n_blocks, 32)
+    qs = blocks[:, 48:176].reshape(n_blocks, 4, 32)  # 4 byte-groups of 32
+
+    sc, m = _unpack_q4_k_scale_min(scales)  # each (n_blocks, 8)
+    dl = (d * sc.astype(np.float32)).reshape(n_blocks, 8, 1)
+    ml = (dmin * m.astype(np.float32)).reshape(n_blocks, 8, 1)
+
+    lo = qs & 0x0F  # (n_blocks, 4, 32): sub-blocks 0,2,4,6 low nibbles
+    hi = (qs >> 4) & 0x0F  # sub-blocks 1,3,5,7 low nibbles
+    ql = np.stack([lo, hi], axis=2).reshape(n_blocks, 8, 32)  # (n_blocks, 8, 32)
+
+    qh_bits = (qh.reshape(n_blocks, 1, 32) >> np.arange(8, dtype=np.uint8).reshape(1, 8, 1)) & 0x01
+    qh_bits = qh_bits.reshape(n_blocks, 8, 32)  # bit-plane i -> sub-block i's high bit
+
+    q = (ql | (qh_bits << 4)).astype(np.float32)  # (n_blocks, 8, 32), 5-bit values 0..31
+
+    out = dl * q - ml  # (n_blocks, 8, 32)
+    return out.reshape(n_blocks, block_size)
+
+
+def _dequantize_bf16(raw_bytes: bytes) -> np.ndarray:
+    # BF16 is the top 16 bits of an IEEE754 float32 (truncated mantissa),
+    # stored raw (no scale/block structure) -- numpy has no native bf16
+    # dtype, so widen each stored int16 to int32 with 16 zero low bits,
+    # then reinterpret those bits as float32. This is an exact (lossless)
+    # expansion, matching the reference `gguf` pip package's own
+    # `BF16.dequantize_blocks` (`(blocks.view(np.int16).astype(np.int32) <<
+    # 16).view(np.float32)`): converting this float32 back to bf16 in this
+    # module's `dequantize()` wrapper (`.to(torch.bfloat16)`) recovers the
+    # exact original bf16 bit pattern (round-to-nearest-even on a zero
+    # remainder is a no-op).
+    bits = np.frombuffer(raw_bytes, dtype="<i2").astype(np.int32) << 16
+    return bits.view(np.float32).astype(np.float32)
+
+
 def _dequantize_q6_k(raw_bytes: bytes) -> np.ndarray:
     # Super-block (256 values): 128B `ql` (low 4 bits, 2 vals/byte) + 64B
     # `qh` (high 2 bits, 4 vals/byte) + 16B int8 per-16-value scales + 2B
@@ -219,7 +271,9 @@ _DEQUANTIZERS = {
     "Q4_0": _dequantize_q4_0,
     "Q8_0": _dequantize_q8_0,
     "Q4_K": _dequantize_q4_k,
+    "Q5_K": _dequantize_q5_k,
     "Q6_K": _dequantize_q6_k,
+    "BF16": _dequantize_bf16,
 }
 
 
