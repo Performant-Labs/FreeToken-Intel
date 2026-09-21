@@ -36,6 +36,11 @@ from freetoken.models.config import ModelConfig
 from freetoken.models.weight import iter_safetensors
 from freetoken.utils import cached_load_hf_config
 
+# issue #247: per-layer hybrid-split timing trace, populated only when
+# FT_HYBRID_TRACE is set (see _Qwen3MoE._forward_hybrid). A plain module list
+# rather than a logger so a live-serve script can read it back directly.
+_HYBRID_TRACE: list[dict] = []
+
 # --------------------------------------------------------------------------- #
 # Checkpoint side (loader contract, from `#17`)
 # --------------------------------------------------------------------------- #
@@ -673,10 +678,11 @@ class _Qwen3MoE(nn.Module):
         cleanly to the offload path there. The split applies to the routed-expert
         decode step, where the q* balance lives.
         """
-        # Issue moe-quant-banks-compute (#137): the CPU half's math
-        # (_cpu_subset_math) reads model.moe_cache.bank_sources["gate_up"] /
-        # ["down"] directly -- the "bf16" schema's bank names -- and runs
-        # plain-float matmuls on them. A "gptq_int4" cache's bank_sources use
+        # Issue moe-quant-banks-compute (#137): the CPU half's math (the
+        # native dispatch's ``gate_up``/``down`` lookup below, issue #248)
+        # reads model.moe_cache.bank_sources["gate_up"] / ["down"] directly
+        # -- the "bf16" schema's bank names -- and runs plain-float matmuls
+        # on them. A "gptq_int4" cache's bank_sources use
         # different names entirely (qweight_gate_up, ...), so that lookup
         # would KeyError. Rather than teach the CPU half to dequantize too
         # (real, separable follow-up work -- the CPU path has none of the
@@ -733,17 +739,26 @@ class _Qwen3MoE(nn.Module):
         seen_sorted = sorted(seen)
         cpu_experts = set(seen_sorted[: n - n_fetch])  # (1 - f) share -> CPU
         # The two halves run CONCURRENTLY (issue moe-hybrid-overlap): the
-        # host-CPU half's pure-CPU matmuls (no XPU tensor touched) run on a
-        # persistent single-worker background thread while the XPU half's
-        # PCIe fetch + gather runs on *this* (main) thread -- the same
-        # regime benchbw._bench_overlap measures. A decode step then costs
-        # max(cpu_half, pcie_half), not their sum, matching the q* fetch
-        # fraction's bandwidth-matched assumption. The pool is reused across
+        # host-CPU half runs on a persistent NATIVE worker thread (issue
+        # #248 -- a real std::thread owned entirely by cpu_moe.cpp, reached
+        # via ctypes submit()/wait(); see freetoken.kernel.cpu_moe's module
+        # docstring) while the XPU half's PCIe fetch + gather runs on *this*
+        # (main) thread -- the same regime benchbw._bench_overlap measures.
+        # A decode step then costs max(cpu_half, pcie_half), not their sum,
+        # matching the q* fetch fraction's bandwidth-matched assumption.
+        #
+        # This replaces the previous Python `ThreadPoolExecutor.submit()` /
+        # `future.result()` handoff, measured (issue #247) at 40-50ms/layer
+        # of pure Python-level GIL-contention/synchronization overhead --
+        # dwarfing the actual sub-millisecond expert GEMM. ctypes releases
+        # the GIL for the duration of a foreign call, and the worker thread
+        # this dispatches to is a C++ std::thread (never a Python thread), so
+        # unlike the old handoff it never needs to re-acquire the GIL to pick
+        # up work or hand back a result. The pool (really: the compiled
+        # native module + its persistent worker thread) is reused across
         # every layer / every step (cached on the model) rather than
-        # spawning a fresh thread per call: this model has ~28 MoE layers per
-        # decode step, and thread-creation overhead alone was large enough
-        # relative to this tiny model's per-expert matmul cost to erase most
-        # of the overlap's benefit when measured with a fresh Thread each time.
+        # recompiled/reloaded per call, for the same reason the old
+        # ThreadPoolExecutor was cached: ~28 MoE layers per decode step.
         #
         # The device<->host transfers (flat -> CPU in, the CPU result -> device
         # out) must stay on this thread: the XPU runtime faults that sync when
@@ -751,15 +766,44 @@ class _Qwen3MoE(nn.Module):
         # test_serve_live_engine_xpu.py's docstring for the same constraint).
         # So the CPU half's *input* is prepared here before the submit, and
         # its *output* is moved back to the device here after the result is
-        # collected -- the background worker itself never touches an XPU
-        # tensor.
-        x_cpu = flat.to("cpu", non_blocking=True).float()
+        # collected -- the native worker itself never touches an XPU tensor
+        # (it never touches a Python object at all -- only raw pointers).
+        # issue #247: env-gated per-layer timing trace, zero overhead unless
+        # FT_HYBRID_TRACE is set (a plain time.perf_counter() call is ~40ns,
+        # negligible next to the ms-scale work being measured; kept here
+        # (rather than instrumenting-then-reverting) so the same probe can be
+        # reused for #251's later live validation).
+        trace = os.environ.get("FT_HYBRID_TRACE")
+        if trace:
+            import time
+
+            t0 = time.perf_counter()
+
+        x_cpu = flat.to("cpu", non_blocking=True)
         top_idx_cpu = top_idx.to("cpu")
         top_w_cpu = top_w.to("cpu")
 
-        future = self._hybrid_cpu_pool(model).submit(
-            self._cpu_subset_math, x_cpu, top_idx_cpu, top_w_cpu, model, cpu_experts
+        if trace:
+            t1 = time.perf_counter()
+
+        # Host banks for this MoE layer (the pinned loader-built banks; the
+        # same source the XPU slot pool streams from -- ADR 0002). No PCIe
+        # round-trip: the source of truth is already on the host. The native
+        # submit only gathers the ``cpu_experts`` rows (see
+        # ``hybrid_subset_submit``'s docstring), so handing it the full
+        # per-layer bank here does not mean the whole bank gets touched.
+        moe_idx = model.moe_layer_id[self.layer_id]
+        sources = model.moe_cache.bank_sources
+        gate_up = sources["gate_up"][moe_idx]
+        down = sources["down"][moe_idx]
+        intermediate = gate_up.shape[1] // 2
+
+        job = self._hybrid_cpu_pool(model).submit(
+            x_cpu, top_idx_cpu, top_w_cpu, gate_up, down, cpu_experts, intermediate
         )
+
+        if trace:
+            t2 = time.perf_counter()
 
         # The XPU half fetches and computes every routed expert except the CPU
         # set; its per-(expert, column) accumulation is expert-major, matching the
@@ -767,73 +811,47 @@ class _Qwen3MoE(nn.Module):
         # byte-identical to what offload would produce.
         out = self._forward_offload(flat, top_idx, top_w, model, batch, exclude=cpu_experts)
 
-        cpu_out = future.result()
+        if trace:
+            t3 = time.perf_counter()
+
+        cpu_out = job.result()
+
+        if trace:
+            t4 = time.perf_counter()
+
         # The host-CPU half's (disjoint) share, also in expert-major order, so
         # the per-row sum matches offload exactly regardless of which half
         # happened to finish first.
         out += cpu_out.to(flat.device, non_blocking=True).to(flat.dtype)
+
+        if trace:
+            _HYBRID_TRACE.append({
+                "layer": self.layer_id,
+                "n_experts": n,
+                "n_fetch": n_fetch,
+                "n_cpu": len(cpu_experts),
+                "prep_ms": 1000 * (t1 - t0),
+                "submit_ms": 1000 * (t2 - t1),
+                "xpu_half_ms": 1000 * (t3 - t2),
+                "job_wait_ms": 1000 * (t4 - t3),
+                "combine_ms": 1000 * (time.perf_counter() - t4),
+            })
         return out
 
     @staticmethod
-    def _hybrid_cpu_pool(model) -> "ThreadPoolExecutor":
-        """A single-worker thread pool for the hybrid CPU half, cached on the
-        model so it survives across decode steps / layers instead of paying
-        thread-creation cost on every call (see ``_forward_hybrid``)."""
+    def _hybrid_cpu_pool(model) -> "HybridCpuPool":
+        """The native async dispatch pool for the hybrid CPU half (issue
+        #248), cached on the model so the compiled module and its persistent
+        worker thread survive across decode steps / layers instead of being
+        rebuilt on every call (see ``_forward_hybrid``). Replaces the
+        previous ``ThreadPoolExecutor`` cache of the same shape."""
         pool = getattr(model, "_moe_hybrid_cpu_pool", None)
         if pool is None:
-            from concurrent.futures import ThreadPoolExecutor
+            from freetoken.kernel.cpu_moe import HybridCpuPool
 
-            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="moe-hybrid-cpu")
+            pool = HybridCpuPool()
             model._moe_hybrid_cpu_pool = pool
         return pool
-
-    def _cpu_subset_math(self, x_cpu, top_idx_cpu, top_w_cpu, model, cpu_experts) -> torch.Tensor:
-        """Pure-CPU math for the hybrid split's host-CPU half.
-
-        Computes *only* the routed experts in ``cpu_experts`` (from the pinned
-        host banks) and returns their per-row contribution, on the CPU, in
-        ``x_cpu``'s dtype/device -- so this is safe to run on a background
-        thread (no XPU tensor is read or written anywhere in this method; the
-        device<->host transfers around it are the caller's job, on the main
-        thread). A row that routes to an expert not in ``cpu_experts``
-        contributes nothing (that row is served by the XPU half).
-
-        Accumulation is expert-major then top-k-column (matching
-        ``_forward_cpu`` / the in-VRAM reference), so the per-row result the
-        hybrid path sums is numerically identical to what the pure CPU backend
-        would produce for that subset.
-        """
-        if not cpu_experts:
-            return torch.zeros_like(x_cpu)
-        # Host banks for this MoE layer (the pinned loader-built banks; the same
-        # source the XPU slot pool streams from -- ADR 0002). No PCIe round-trip:
-        # the source of truth is already on the host.
-        moe_idx = model.moe_layer_id[self.layer_id]
-        sources = model.moe_cache.bank_sources
-        gate_up = sources["gate_up"][moe_idx]
-        down = sources["down"][moe_idx]
-        out = torch.zeros(x_cpu.shape, dtype=x_cpu.dtype, device="cpu")
-        for e in range(int(model.config.num_experts)):
-            if e not in cpu_experts:
-                continue
-            for j in range(int(self.top_k)):
-                sel = top_idx_cpu[:, j] == e
-                if not bool(sel.any()):
-                    continue
-                rows = sel.nonzero(as_tuple=True)[0]
-                w_sel = top_w_cpu[sel, j]
-                x_sel = x_cpu.index_select(0, rows)
-                I = gate_up.shape[1] // 2
-                # The host banks carry the model's dtype (bf16 for the hero); the
-                # CPU math runs in float32 (the pure-CPU executor's convention), so
-                # upcast the expert slices here -- otherwise a bf16 bank meets the
-                # float32 x_sel and the matmul raises a dtype mismatch.
-                gu_e = gate_up[e, 0:2 * I].float()
-                gate = x_sel @ gu_e[:I].t()
-                up = x_sel @ gu_e[I : 2 * I].t()
-                y = (F.silu(gate) * up) @ down[e].float().t()
-                out.index_add_(0, rows, y * w_sel[:, None])
-        return out
 
     def _forward_cpu(self, flat, top_idx, top_w, model, batch) -> torch.Tensor:
         """Run the routed experts on the host (issue #8, ADR 0002).
