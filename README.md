@@ -7,9 +7,14 @@ This repository is an Intel-stack equivalent of
 original maps computation across GPU, CPU, host memory, and PCIe. This port
 keeps that design and swaps CUDA for **SYCL / Level Zero / PyTorch XPU**.
 
-Status: **pre-alpha scaffolding**. The package layout, CLI, registries, and
-tests are in place. Kernels, engine, and server raise `NotYetImplemented`
-until the matching GitHub issues land.
+Status: the end-to-end path runs. `ft serve <model>` loads weights (HF
+safetensors or GGUF), builds the engine, and streams tokens from an
+OpenAI/Anthropic-compatible HTTP server on the XPU. Offload and CPU MoE
+backends, the paged KV cache, and the scheduler are live; some model
+architectures and CUDA-only kernel tiers are still stubs. See
+[docs/models.md](docs/models.md) for which architectures have a real
+`forward` and [docs/architecture.md](docs/architecture.md) for the
+issue-by-issue status.
 
 Backlog: [Epic #1](https://github.com/Performant-Labs/FreeToken-Intel/issues/1)
 (31 child tasks). Slug → issue map: [docs/architecture.md](docs/architecture.md).
@@ -68,7 +73,8 @@ See [docs/ci.md](docs/ci.md) for what each check guards and why.
 ft serve | shell | ctl | daemon | launch | checkpoint | bench | device
 ```
 
-Default API port (planned): `127.0.0.1:1919`, OpenAI + Anthropic routes.
+Default API port: `127.0.0.1:1919`, OpenAI + Anthropic routes
+(`ft serve --help` is the source of truth for every flag).
 
 ## License
 
