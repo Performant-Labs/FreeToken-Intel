@@ -268,6 +268,162 @@ RowComputeFn select_row_compute(bool force_scalar) {
     return row_compute_scalar;
 }
 
+// ---------------------------------------------------------------------------
+// Issue #257: bf16-native dot-product primitives.
+//
+// The kernel above (both the naive core and #252's fast path) requires
+// `gate_up`/`down` to already be `const float*` -- every caller must
+// therefore materialize a full float32 copy of the touched expert weight
+// bank before calling in. Live B70 testing (#251) found that conversion
+// costs *more* than the compute it feeds on a realistic bank size, because
+// it is a separate O(bank size) pass with no fusion into the GEMM that reads
+// the bytes right after.
+//
+// Upstream FlashML-org/FreeToken's actual CPU kernel never pays this cost:
+// weight banks stay in native bf16 forever and are dequantized *inside* the
+// SIMD dot-product loop, fused into the same instruction that reads the
+// weight byte -- so the "conversion" is free, riding along on the same
+// bandwidth-bound memory read the GEMV already pays for. This section adds
+// that primitive to this file: a dot product of an already-float32 vector
+// (`x_row`, or `act` -- activations are cheap to keep float32, see this
+// issue's own scope note) against a *raw bf16-byte* vector (an expert
+// weight row), widening each bf16 lane to float32 right in the FMA, never
+// writing a materialized float32 copy of the weight row anywhere.
+//
+// bf16 -> float32 widening is exact and lossless (bf16 *is* a truncated
+// float32: 1 sign bit, 8 exponent bits, 7 mantissa bits -- exactly the top
+// 16 bits of a float32), so `bits << 16` reinterpreted as float32 recovers
+// precisely the value bf16 already rounded to when the tensor was cast down
+// from float32/float16 -- no additional precision is lost by this widen
+// step itself.
+inline float bf16_to_f32(uint16_t bits) {
+    uint32_t v = static_cast<uint32_t>(bits) << 16;
+    float f;
+    std::memcpy(&f, &v, sizeof(f));
+    return f;
+}
+
+// Scalar widen-and-multiply fallback: correct on any host, no ISA requirement.
+inline float dot_scalar_bf16w(const float* a, const uint16_t* w, size_t n) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        sum += a[i] * bf16_to_f32(w[i]);
+    }
+    return sum;
+}
+
+inline void row_compute_scalar_bf16(
+    const float* x_row, const uint16_t* gate_w, const uint16_t* up_w, const uint16_t* down_e,
+    size_t H, size_t I, float w, float* out_row, RowBuffers& buf) {
+    for (size_t i = 0; i < I; ++i) buf.gate[i] = dot_scalar_bf16w(x_row, gate_w + i * H, H);
+    for (size_t i = 0; i < I; ++i) buf.up[i] = dot_scalar_bf16w(x_row, up_w + i * H, H);
+    for (size_t i = 0; i < I; ++i) buf.act[i] = silu(buf.gate[i]) * buf.up[i];
+    for (size_t o = 0; o < H; ++o) out_row[o] += w * dot_scalar_bf16w(buf.act.data(), down_e + o * I, I);
+}
+
+#if defined(FREETOKEN_CPU_MOE_X86)
+
+// AVX-512F widen-in-register path (this issue's actual requirement -- native
+// AVX-512-BF16 dot-product support, `_mm512_dpbf16_ps`, is a further
+// optional fast path on hardware that has it, not required, since it also
+// needs the *other* operand in bf16 lanes, which `x_row`/`act` are not here
+// since activations deliberately stay float32; the widen-in-register trick
+// below fits the "one operand is bf16 bytes, the other is already float32"
+// shape this kernel actually has):
+//
+//   __m256i wi16 = load 16 raw bf16 lanes (256 bits = 16 x uint16)
+//   __m512i wi32 = _mm512_cvtepu16_epi32(wi16)      -- zero-extend each lane to 32 bits
+//   __m512i wi32 <<= 16 (_mm512_slli_epi32)         -- shift the bf16 bits into float32's high half
+//   __m512  wf   = _mm512_castsi512_ps(wi32)        -- reinterpret those bits as float32 (no rounding)
+//   acc = _mm512_fmadd_ps(wf, va, acc)              -- fused into the same instruction, no materialized copy
+__attribute__((target("avx512f,fma")))
+inline float dot_avx512_bf16w(const float* a, const uint16_t* w, size_t n) {
+    __m512 acc = _mm512_setzero_ps();
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256i wi16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i));
+        __m512i wi32 = _mm512_cvtepu16_epi32(wi16);
+        __m512i wi32_shifted = _mm512_slli_epi32(wi32, 16);
+        __m512 wf = _mm512_castsi512_ps(wi32_shifted);
+        __m512 va = _mm512_loadu_ps(a + i);
+        acc = _mm512_fmadd_ps(wf, va, acc);
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; i < n; ++i) sum += a[i] * bf16_to_f32(w[i]);
+    return sum;
+}
+
+__attribute__((target("avx512f,fma")))
+void row_compute_avx512_bf16(
+    const float* x_row, const uint16_t* gate_w, const uint16_t* up_w, const uint16_t* down_e,
+    size_t H, size_t I, float w, float* out_row, RowBuffers& buf) {
+    for (size_t i = 0; i < I; ++i) buf.gate[i] = dot_avx512_bf16w(x_row, gate_w + i * H, H);
+    for (size_t i = 0; i < I; ++i) buf.up[i] = dot_avx512_bf16w(x_row, up_w + i * H, H);
+    for (size_t i = 0; i < I; ++i) buf.act[i] = silu(buf.gate[i]) * buf.up[i];
+    for (size_t o = 0; o < H; ++o) out_row[o] += w * dot_avx512_bf16w(buf.act.data(), down_e + o * I, I);
+}
+
+#endif  // FREETOKEN_CPU_MOE_X86
+
+using RowComputeFnBf16 = void (*)(const float*, const uint16_t*, const uint16_t*, const uint16_t*,
+                                    size_t, size_t, float, float*, RowBuffers&);
+
+RowComputeFnBf16 select_row_compute_bf16(bool force_scalar) {
+#if defined(FREETOKEN_CPU_MOE_X86)
+    if (!force_scalar && avx512_available()) return row_compute_avx512_bf16;
+#else
+    (void)force_scalar;
+#endif
+    return row_compute_scalar_bf16;
+}
+
+// Single-threaded expert-major/top-k-column bf16-weight core -- the bf16
+// analogue of moe_forward_core above, used by the async submit/wait dispatch
+// (issue #248) so the hybrid CPU-half path never materializes a float32
+// weight bank copy. Same accumulation order/contract as moe_forward_core;
+// only the weight *storage format* differs (raw bf16 bytes, widened inside
+// the row-compute's dot product instead of pre-converted to float32).
+void moe_forward_core_bf16(
+    const float* x, int num_tokens, int hidden,
+    const int32_t* expert_ids, const float* expert_weights, int topk,
+    const uint16_t* gate_up, const uint16_t* down,
+    int num_experts, int intermediate,
+    const uint8_t* expert_mask,
+    bool force_scalar,
+    float* out) {
+    const size_t H = static_cast<size_t>(hidden);
+    const size_t I = static_cast<size_t>(intermediate);
+    const size_t gate_up_expert_stride = 2 * I * H;
+    const size_t down_expert_stride = H * I;
+
+    std::memset(out, 0, sizeof(float) * static_cast<size_t>(num_tokens) * H);
+
+    RowComputeFnBf16 row_fn = select_row_compute_bf16(force_scalar);
+    RowBuffers buf(I);
+
+    for (int e = 0; e < num_experts; ++e) {
+        if (expert_mask != nullptr && expert_mask[e] == 0) {
+            continue;
+        }
+        const uint16_t* gu_e = gate_up + static_cast<size_t>(e) * gate_up_expert_stride;
+        const uint16_t* gate_w = gu_e;               // [intermediate, hidden]
+        const uint16_t* up_w = gu_e + I * H;          // [intermediate, hidden]
+        const uint16_t* down_e = down + static_cast<size_t>(e) * down_expert_stride; // [hidden, intermediate]
+
+        for (int j = 0; j < topk; ++j) {
+            for (int t = 0; t < num_tokens; ++t) {
+                if (expert_ids[static_cast<size_t>(t) * topk + j] != e) {
+                    continue;
+                }
+                const float* x_row = x + static_cast<size_t>(t) * H;
+                const float w = expert_weights[static_cast<size_t>(t) * topk + j];
+                float* out_row = out + static_cast<size_t>(t) * H;
+                row_fn(x_row, gate_w, up_w, down_e, H, I, w, out_row, buf);
+            }
+        }
+    }
+}
+
 // Runs the expert-major/top-k-column loop for experts in [expert_begin, expert_end)
 // against `out` (which must already be zeroed / privately owned by the caller
 // when running multi-threaded -- see moe_forward_core_fast below).
@@ -395,18 +551,25 @@ void moe_forward_core_fast(
 // it has (the same backpressure a max_workers=1 executor would apply), so
 // the slot can never be silently double-booked or a result dropped.
 //
-// This dispatches to moe_forward_core (the naive scalar path from #250), not
-// #252's vectorized moe_forward_core_fast above -- switching the async
-// worker onto the fast path is a natural follow-up (both are additive and
-// compatible; AsyncJob's fields already line up with moe_forward_core_fast's
-// argument list minus num_threads/force_scalar), left for a later issue
-// rather than folded into this one.
+// Issue #257: this dispatches to moe_forward_core_bf16 (the bf16-native
+// core above), not moe_forward_core (the float32-input naive path from
+// #250) or #252's vectorized moe_forward_core_fast -- the whole point of
+// this issue is that the hybrid CPU-half path (the one this async
+// submit/wait dispatch serves) never materializes a float32 copy of a full
+// expert weight bank, so `gate_up`/`down` here are raw bf16 bytes read
+// straight from the caller's pinned bank, widened to float32 only inside
+// the row-compute's dot product (auto-selecting the AVX-512 widen-in-
+// register path when the host CPU supports it, same runtime-dispatch
+// mechanism `avx512_available()` already established for the float32 fast
+// path). `force_scalar` mirrors #252's own test hook (deterministic
+// coverage of the scalar fallback on a host that does have AVX-512).
 struct AsyncJob {
     const float* x = nullptr; int num_tokens = 0; int hidden = 0;
     const int32_t* expert_ids = nullptr; const float* expert_weights = nullptr; int topk = 0;
-    const float* gate_up = nullptr; const float* down = nullptr;
+    const uint16_t* gate_up = nullptr; const uint16_t* down = nullptr;
     int num_experts = 0; int intermediate = 0;
     const uint8_t* expert_mask = nullptr;
+    int force_scalar = 0;
     float* out = nullptr;
     int rc = 0;
 };
@@ -424,9 +587,9 @@ int run_job(const AsyncJob& job) {
         std::memset(job.out, 0, sizeof(float) * static_cast<size_t>(job.num_tokens) * static_cast<size_t>(job.hidden));
         return 0;
     }
-    moe_forward_core(job.x, job.num_tokens, job.hidden, job.expert_ids, job.expert_weights,
-                      job.topk, job.gate_up, job.down, job.num_experts, job.intermediate,
-                      job.expert_mask, job.out);
+    moe_forward_core_bf16(job.x, job.num_tokens, job.hidden, job.expert_ids, job.expert_weights,
+                           job.topk, job.gate_up, job.down, job.num_experts, job.intermediate,
+                           job.expert_mask, job.force_scalar != 0, job.out);
     return 0;
 }
 
@@ -636,18 +799,31 @@ int freetoken_cpu_moe_avx512_available() {
 // and writes them by raw pointer, off the calling thread, for the whole
 // submit-to-wait window.
 //
-//   Same buffer contract as freetoken_cpu_moe_forward (see above), plus:
-//   returns a job handle >= 1 on success. This call never itself validates
-//   the buffers/dimensions (that check runs on the worker thread and its
-//   result surfaces through freetoken_cpu_moe_wait()'s return code) --
-//   submit() is meant to return in the time it takes to claim the single job
-//   slot and hand off a struct, not to do any real work.
+//   x               [num_tokens, hidden] row-major float32 (activations --
+//                       never the bottleneck, see this issue's own scope
+//                       note, so this stays float32)
+//   gate_up         [num_experts, 2*intermediate, hidden] row-major RAW BF16
+//                       BYTES (uint16_t bit patterns, not float32 -- issue
+//                       #257: the caller passes the model's native bf16
+//                       storage directly, no float32 conversion pass)
+//   down            [num_experts, hidden, intermediate] row-major raw bf16 bytes
+//   Otherwise the same buffer contract as freetoken_cpu_moe_forward (see
+//   above), plus: returns a job handle >= 1 on success. This call never
+//   itself validates the buffers/dimensions (that check runs on the worker
+//   thread and its result surfaces through freetoken_cpu_moe_wait()'s return
+//   code) -- submit() is meant to return in the time it takes to claim the
+//   single job slot and hand off a struct, not to do any real work.
+//
+//   force_scalar  nonzero forces the scalar bf16 row-compute even when
+//                     AVX-512 is available (mirrors #252's own test hook;
+//                     see moe_forward_core_bf16's design note).
 int64_t freetoken_cpu_moe_submit(
     const float* x, int num_tokens, int hidden,
     const int32_t* expert_ids, const float* expert_weights, int topk,
-    const float* gate_up, const float* down,
+    const uint16_t* gate_up, const uint16_t* down,
     int num_experts, int intermediate,
     const uint8_t* expert_mask,
+    int force_scalar,
     float* out) {
     AsyncJob job;
     job.x = x;
@@ -661,6 +837,7 @@ int64_t freetoken_cpu_moe_submit(
     job.num_experts = num_experts;
     job.intermediate = intermediate;
     job.expert_mask = expert_mask;
+    job.force_scalar = force_scalar;
     job.out = out;
     return worker().submit(job);
 }
