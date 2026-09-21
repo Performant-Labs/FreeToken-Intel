@@ -5,14 +5,24 @@ Parent epic: `models-gguf` (#199, see docs/architecture.md).
 
 ``reader.py`` (issue `models-gguf-reader`, #270) is implemented: GGUF binary
 format parsing (header, typed KV-metadata, tensor-info) is re-exported below.
-``parse_config`` (issue `models-gguf-config-tokenizer`, #272) is implemented
-below: it maps a GGUF file's raw KV-metadata store (as
+``dequant.py`` (issue `models-gguf-dequant`, #271) is also implemented: GGML
+quant-type dequantization (``Q4_0``/``Q8_0``/``Q4_K``/``Q6_K``). Unlike
+``reader.py``, ``dequant.py`` requires torch, so it is *not* imported here at
+package-import time (that would break this package's own torch-free
+CPU-CLI-smoke import path -- see ``reader.py``'s docstring); instead
+``dequantize``/``DequantError``/``GGML_NAME_TO_TYPE`` are re-exported lazily
+below via module ``__getattr__`` (PEP 562), so ``import freetoken.models.gguf``
+stays torch-free but ``freetoken.models.gguf.dequantize(...)`` still works,
+importing torch only at that first access.
+``parse_config`` (issue `models-gguf-config-tokenizer`, #272) is also
+implemented below: it maps a GGUF file's raw KV-metadata store (as
 :func:`load_gguf_metadata` parses it) into this port's own
 :class:`freetoken.models.config.ModelConfig`, the same job every other
 architecture's own ``parse_config`` (e.g. ``freetoken.models.qwen3_moe.
 parse_config``) does for a HF ``config.json``. GGUF's embedded tokenizer is
 ``tokenizer.py`` (also #272)'s job -- see that module. ``iter_weights`` /
-``GgufModel`` remain stubs -- `models-gguf-iter-and-loader-wiring` (#273)'s job.
+``GgufModel`` remain stubs -- `models-gguf-iter-and-loader-wiring` (#273)'s
+job, which builds directly on all of the above.
 """
 from __future__ import annotations
 
@@ -38,10 +48,13 @@ from .reader import (
 __all__ = [
     "GGUF_MAGIC",
     "GGML_TYPE_NAMES",
+    "GGML_NAME_TO_TYPE",
     "GGUFFile",
     "GGUFFormatError",
     "GGUFTensorInfo",
     "GGUFValueType",
+    "DequantError",
+    "dequantize",
     "gguf_tensor_info",
     "gguf_tensor_names",
     "is_gguf_path",
@@ -51,6 +64,24 @@ __all__ = [
     "iter_weights",
     "GgufModel",
 ]
+
+# --------------------------------------------------------------------------- #
+# Lazy torch-requiring re-exports (issue #271)
+# --------------------------------------------------------------------------- #
+
+_DEQUANT_LAZY_NAMES = {"dequantize", "DequantError", "GGML_NAME_TO_TYPE"}
+
+
+def __getattr__(name: str):
+    # PEP 562 lazy attribute access: defers importing `dequant.py` (and
+    # thus torch) until a caller actually touches one of its names, so
+    # `import freetoken.models.gguf` alone stays torch-free.
+    if name in _DEQUANT_LAZY_NAMES:
+        from . import dequant
+
+        return getattr(dequant, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # --------------------------------------------------------------------------- #
 # KV-metadata -> ModelConfig (issue #272)
