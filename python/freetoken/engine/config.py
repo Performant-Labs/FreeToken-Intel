@@ -17,6 +17,9 @@ class EngineConfig:
     dtype: object  # torch.dtype once the XPU runtime is wired
     device: object = None  # torch.device | str; None -> XPU if available else CPU
     max_running_req: int = 4
+    # Issue #293: on this port "auto" resolves to `torch` (pure-PyTorch GQA),
+    # not upstream's SM-generation hardware ladder (trtllm / fa,fi / sparse
+    # backends) -- see docs/stack.md. `triton` and `sycl` are opt-in.
     attention_backend: str = "auto"
     moe_backend: str = "auto"
     # Xe2 XMX GEMM path for MXFP4 / INT8 experts (replaces --nvfp4-backend).

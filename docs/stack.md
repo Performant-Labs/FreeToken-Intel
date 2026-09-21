@@ -83,6 +83,17 @@ and sglang-kernel. Intel cannot use the last two.
 AOT artifacts live in `freetoken-kernel-cache/` (SPIR-V / Triton-Intel
 cache), keyed by oneAPI + driver + Xe ISA — same idea as upstream cubins.
 
+**`--attention-backend auto` is pure-PyTorch GQA, not `triton`** (issue
+[#293](https://github.com/Performant-Labs/FreeToken-Intel/issues/293)).
+Upstream's `auto` walks a CUDA hardware ladder (SM100 → `trtllm`, SM90 +
+sglang-kernel → `fa,fi`, FlashInfer → `fi`, otherwise `triton`). This port
+registers only `torch` (the reference GQA backend, dependency-free), `triton`
+(Triton-Intel) and `sycl`; `auto` resolves to `torch` regardless of what is
+importable, because CPU CI has no Triton-Intel and the XPU indexing bugs on
+the MoE path make the pure-PyTorch backend the one the engine loop can
+trust. `triton` and `sycl` are opt-in via `ft serve --attention-backend`.
+This is a deliberate default, not a placeholder for a future ladder.
+
 **Rejected:** Shipping CUDA cubins. Depending on vLLM’s XPU kernels as
 the only MoE path (version skew with transformers, and it does not
 implement FreeToken offload).
