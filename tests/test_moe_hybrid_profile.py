@@ -175,7 +175,7 @@ def test_fetch_fraction_none_when_no_profile(tmp_path):
     with monkeypatch.context() as m:
         m.setenv("XDG_CACHE_HOME", str(tmp_path))
         (tmp_path / "freetoken").mkdir()
-    assert load_hybrid_fetch_fraction("bf16") is None
+        assert load_hybrid_fetch_fraction("bf16") is None
 
 
 def test_fetch_fraction_clamped_to_unit(tmp_path):
