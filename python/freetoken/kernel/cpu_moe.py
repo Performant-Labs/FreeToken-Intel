@@ -196,7 +196,20 @@ def cpu_moe(name: str = "cpu_moe") -> KernelModule:
         return KernelModule(path=so_path, loaded=_load(so_path), from_cache=True)
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    _compile(str(CPU_MOE_SRC), str(so_path))
+    key_dir = so_path.parent
+    key_dir.mkdir(parents=True, exist_ok=True)
+    # Compile to a per-process temp file in the same directory, then atomically
+    # rename into place. so_path is content-addressed by _build_key (compiler +
+    # host arch + source hash), so any process racing us to the same key is
+    # compiling byte-identical output -- os.replace is atomic on the same
+    # filesystem, so a concurrent reader either sees the old (absent) path or
+    # the fully-written file, never a partially-written one.
+    tmp_so = key_dir / f".{name}.{os.getpid()}.tmp.so"
+    try:
+        _compile(str(CPU_MOE_SRC), str(tmp_so))
+        os.replace(tmp_so, so_path)
+    finally:
+        tmp_so.unlink(missing_ok=True)
     return KernelModule(path=so_path, loaded=_load(so_path), from_cache=False)
 
 
