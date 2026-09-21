@@ -26,6 +26,7 @@ from freetoken.engine.cache_budget import (
     MoeCachePlan,  # noqa: F401  (exported; the loader-facing plan is thin)
     _bytes_per_expert_slot,
     _bytes_per_kv_token,
+    check_pinned_kv_fit,
     plan_cache_budget,
     resolve_served_context_len,
 )
@@ -230,3 +231,131 @@ def test_resolve_cap_matches_a_real_plan_shape():
     )
     assert effective == c.kv_num_pages
     assert reason is not None
+
+
+# --- check_pinned_kv_fit (issue #260) ----------------------------------------
+#
+# The pinned (non-auto) path never ran the auto planner and its
+# `max_running_req * max_seq_len` pool was asserted "always >= the demand"
+# with no VRAM measurement at all -- unlike plan_cache_budget's own fit
+# assert. This is the pinned-mode equivalent: cap the conventional page count
+# to what the pinned MoE cache actually leaves for KV, loudly, instead of
+# letting create_kv_pool OOM.
+
+
+def test_pinned_fit_uncapped_when_no_live_device():
+    # total_vram_bytes=None (a CPU box, or no XPU): nothing to check, the
+    # conventional formula's result passes through unchanged.
+    assert check_pinned_kv_fit(
+        total_vram_bytes=None,
+        memory_ratio=0.9,
+        moe_cache_size=0,
+        num_layers=48,
+        num_kv_heads=8,
+        head_dim=128,
+        dtype_bytes=2,
+        requested_num_pages=40960 * 4,
+    ) == (40960 * 4, None)
+
+
+def test_pinned_fit_uncapped_when_pool_actually_fits():
+    # A big card, a small pinned MoE cache, and a modest requested page count:
+    # the conventional pool fits, so no cap and no reason.
+    effective, reason = check_pinned_kv_fit(
+        total_vram_bytes=32 * GB,
+        memory_ratio=0.9,
+        moe_cache_size=BASE["num_experts"],
+        num_layers=BASE["num_layers"],
+        num_kv_heads=BASE["num_kv_heads"],
+        head_dim=BASE["head_dim"],
+        dtype_bytes=BASE["dtype_bytes"],
+        requested_num_pages=8192,
+        moe_intermediate_size=BASE["moe_intermediate_size"],
+        hidden_size=BASE["hidden_size"],
+    )
+    assert effective == 8192
+    assert reason is None
+
+
+def test_pinned_fit_caps_when_demand_exceeds_vram():
+    # The #260 repro: a large max_running_req * max_seq_len (the conventional
+    # formula) together with a sizeable pinned MoE cache does NOT actually fit
+    # in VRAM -- must cap, not silently proceed toward an allocator OOM.
+    requested = 4 * 40960  # max_running_req=4, max_seq_len=40960
+    effective, reason = check_pinned_kv_fit(
+        total_vram_bytes=32 * GB,
+        memory_ratio=0.9,
+        moe_cache_size=BASE["num_experts"],
+        num_layers=BASE["num_layers"],
+        num_kv_heads=BASE["num_kv_heads"],
+        head_dim=BASE["head_dim"],
+        dtype_bytes=BASE["dtype_bytes"],
+        requested_num_pages=requested,
+        moe_intermediate_size=BASE["moe_intermediate_size"],
+        hidden_size=BASE["hidden_size"],
+    )
+    assert effective < requested
+    assert reason is not None
+    assert str(requested) in reason and str(effective) in reason
+    for knob in ("--max-running-req", "--max-model-len", "--moe-cache-size", "--moe-cache-auto"):
+        assert knob in reason
+
+
+def test_pinned_fit_raises_when_even_one_page_cannot_fit():
+    # The pinned MoE cache alone eats the whole budget: nothing sane to cap
+    # to, so raise rather than build a degenerate (near-)zero-page pool.
+    with pytest.raises(ValueError, match="cannot fit even one KV page"):
+        check_pinned_kv_fit(
+            total_vram_bytes=2 * GB,
+            memory_ratio=0.9,
+            moe_cache_size=BASE["num_experts"] * 10_000,
+            num_layers=BASE["num_layers"],
+            num_kv_heads=BASE["num_kv_heads"],
+            head_dim=BASE["head_dim"],
+            dtype_bytes=BASE["dtype_bytes"],
+            requested_num_pages=100,
+            moe_intermediate_size=BASE["moe_intermediate_size"],
+            hidden_size=BASE["hidden_size"],
+        )
+
+
+def test_pinned_fit_dense_model_skips_moe_bytes():
+    # moe_cache_size=0 (a dense / non-MoE model): the check still runs (KV
+    # bytes alone against the budget) but never touches the expert-slot math.
+    effective, reason = check_pinned_kv_fit(
+        total_vram_bytes=1 * GB,
+        memory_ratio=0.9,
+        moe_cache_size=0,
+        num_layers=BASE["num_layers"],
+        num_kv_heads=BASE["num_kv_heads"],
+        head_dim=BASE["head_dim"],
+        dtype_bytes=BASE["dtype_bytes"],
+        requested_num_pages=1_000_000,
+    )
+    assert effective < 1_000_000
+    assert reason is not None
+
+
+def test_pinned_fit_bad_inputs_raise():
+    with pytest.raises(ValueError, match="memory_ratio"):
+        check_pinned_kv_fit(
+            total_vram_bytes=32 * GB,
+            memory_ratio=0.0,
+            moe_cache_size=0,
+            num_layers=48,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_bytes=2,
+            requested_num_pages=100,
+        )
+    with pytest.raises(ValueError, match="requested_num_pages"):
+        check_pinned_kv_fit(
+            total_vram_bytes=32 * GB,
+            memory_ratio=0.9,
+            moe_cache_size=0,
+            num_layers=48,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_bytes=2,
+            requested_num_pages=0,
+        )
