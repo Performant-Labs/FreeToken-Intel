@@ -256,7 +256,7 @@ def load_model(
                     model_path=model_path,
                 )
             else:
-                _place_expert_weights_any(model, gate_up_banks, down_banks, device)
+                _place_expert_weights_any(model, gate_up_banks, down_banks, device, model_path=model_path)
             expert_sources = (gate_up_banks, down_banks)
         else:
             expert_sources = ([], [])
@@ -293,7 +293,7 @@ def load_model(
                     model_path=model_path,
                 )
             else:
-                _place_expert_weights_any(model, gate_up_banks, down_banks, device)
+                _place_expert_weights_any(model, gate_up_banks, down_banks, device, model_path=model_path)
             expert_sources = (gate_up_banks, down_banks)
         else:
             expert_sources = ([], [])
@@ -501,16 +501,63 @@ def _place_int8_expert_weights(model, gate_up_banks, down_banks, device) -> None
         )
 
 
-def _place_expert_weights_any(model, gate_up_banks, down_banks, device) -> None:
+def _place_gptq_expert_weights(model, gate_up_banks, down_banks, device, group_size: int) -> None:
+    """Build fully XPU-resident GPTQ-Int4 expert modules from packed banks
+    (issue `moe-fused-gptq`, #258, part of the `quant-xpu` epic, #10). The
+    GPTQ sibling of :func:`_place_mxfp4_expert_weights` /
+    :func:`_place_fp8_expert_weights` / :func:`_place_int8_expert_weights` --
+    see their docstrings for the shared rationale.
+
+    ``group_size`` (the checkpoint's GPTQ quantization group size, shared by
+    every expert and every layer -- an architecture/checkpoint constant, not
+    a per-bank field) is resolved by the caller (:func:`_place_expert_weights
+    _any`, from :func:`~freetoken.models.weight.checkpoint_gptq_group_size`)
+    since only it has the checkpoint path.
+    """
+    import torch.nn as nn
+
+    from freetoken.models.qwen3_5_moe import _Qwen35GptqExpert
+
+    intermediate = int(getattr(model.config, "moe_intermediate_size", 0))
+    for i, layer_id in enumerate(_moe_layers(model.config)):
+        moe = getattr(getattr(model, "layers", [None] * (layer_id + 1))[layer_id], "mlp", None)
+        if getattr(moe, "experts", None) is None:
+            continue
+        # MoE-layer-order-compacted (see _place_expert_weights' own comment).
+        gu_bank = gate_up_banks[i]
+        dn_bank = down_banks[i]
+        num_experts = gu_bank.qweight.shape[0]
+        moe.experts = nn.ModuleList(
+            _Qwen35GptqExpert(
+                gu_bank.qweight[e].to(device),
+                gu_bank.qzeros[e].to(device),
+                gu_bank.scales[e].to(device),
+                dn_bank.qweight[e].to(device),
+                dn_bank.qzeros[e].to(device),
+                dn_bank.scales[e].to(device),
+                intermediate=intermediate,
+                group_size=group_size,
+            )
+            for e in range(num_experts)
+        )
+
+
+def _place_expert_weights_any(model, gate_up_banks, down_banks, device, model_path: str | None = None) -> None:
     """Dispatch the in-VRAM (``moe_backend="fused"``) expert placement by
     bank type: a plain bf16 stacked tensor goes through
     :func:`_place_expert_weights` unchanged (every existing bf16 test);
     a packed :class:`~freetoken.models.weight.MxfpExpertBank` (issue #180),
-    :class:`~freetoken.models.weight.Fp8BlockExpertBank` (issue #181), or
-    :class:`~freetoken.models.weight.Int8ExpertBank` (issue #182) goes
+    :class:`~freetoken.models.weight.Fp8BlockExpertBank` (issue #181),
+    :class:`~freetoken.models.weight.Int8ExpertBank` (issue #182), or
+    :class:`~freetoken.models.weight.GptqExpertBank` (issue #258) goes
     through its own placement function instead.
+
+    ``model_path`` is only required for the GPTQ branch (it needs the
+    checkpoint's ``quantization_config.group_size``, which is not a bank
+    field -- see :func:`~freetoken.models.weight.checkpoint_gptq_group_size`);
+    every other branch ignores it, and callers on those paths may omit it.
     """
-    from freetoken.models.weight import Fp8BlockExpertBank, Int8ExpertBank, MxfpExpertBank
+    from freetoken.models.weight import Fp8BlockExpertBank, GptqExpertBank, Int8ExpertBank, MxfpExpertBank
 
     first = next((b for b in gate_up_banks if b is not None), None)
     if isinstance(first, MxfpExpertBank):
@@ -519,6 +566,13 @@ def _place_expert_weights_any(model, gate_up_banks, down_banks, device) -> None:
         _place_fp8_expert_weights(model, gate_up_banks, down_banks, device)
     elif isinstance(first, Int8ExpertBank):
         _place_int8_expert_weights(model, gate_up_banks, down_banks, device)
+    elif isinstance(first, GptqExpertBank):
+        if model_path is None:
+            raise ValueError("_place_expert_weights_any needs model_path to read a GPTQ checkpoint's group_size")
+        from freetoken.models.weight import checkpoint_gptq_group_size
+
+        group_size = checkpoint_gptq_group_size(model_path)
+        _place_gptq_expert_weights(model, gate_up_banks, down_banks, device, group_size)
     else:
         _place_expert_weights(model, gate_up_banks, down_banks)
 
