@@ -38,9 +38,48 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cmath>
 
 namespace {
+
+// Issue #259 (attn-sycl-bf16-abi): the KV pool's runtime storage dtype is
+// bfloat16 by default on a real model (see engine.py's KV-pool construction),
+// but this kernel used to declare `const float* k_cache, const float*
+// v_cache` unconditionally and do 4-byte-stride pointer arithmetic against
+// them -- a real, silent ABI mismatch when the pool is actually bf16 (2-byte
+// elements): wrong element size, wrong strides, corrupted output.
+//
+// Fix (matches #257's `dot_avx512_bf16w` / `bf16_to_f32` pattern in
+// kernel/csrc/cpu_moe/cpu_moe.cpp): the K/V dot-product loops below are
+// templated on the KV storage element type (`float` for a float32 pool,
+// `uint16_t` -- the raw bf16 bit pattern -- for a bf16 pool) and widen each
+// KV element to float32 *in-register*, right at the point of use, via the
+// `widen(...)` overloads immediately below. No pass ever materializes a
+// float32 copy of the pool. `q` and `out` are unaffected by this template
+// parameter: the Python side (`attention/sycl.py`) always hands this kernel
+// a float32 `q`/`out` buffer (a small, freshly-built per-request tensor, not
+// the KV pool itself, so casting it is cheap -- the same "activations stay
+// float32, weight/storage banks widen in-register" split #257 uses).
+//
+// bf16 -> float32 widening is exact and lossless (bf16 is a truncated
+// float32: top 16 bits, no mantissa is dropped that bf16 itself hadn't
+// already rounded away), so `bits << 16` reinterpreted as float32 recovers
+// precisely the value the pool already holds -- see bf16_to_f32 in
+// cpu_moe.cpp for the identical reasoning.
+inline float bf16_to_f32(std::uint16_t bits) {
+  std::uint32_t v = static_cast<std::uint32_t>(bits) << 16;
+  return sycl::bit_cast<float>(v);
+}
+
+// `widen(KVT)` is the one point every K/V read in the templated kernels below
+// goes through: a `float` pool widens as a no-op, a `uint16_t` (raw bf16
+// bits) pool widens via bf16_to_f32. Overload resolution on the pointer's
+// deduced element type picks the right one at compile time -- no runtime
+// branch inside the per-key hot loop (the B70 miscompile note above already
+// forbids adding branches there for a different reason; this adds none).
+inline float widen(float v) { return v; }
+inline float widen(std::uint16_t v) { return bf16_to_f32(v); }
 
 // Fail fast if any passed pointer is not a USM (device) pointer (e.g. a host
 // pointer, which the B70 cannot read or write -- see the memory-model note
@@ -114,7 +153,12 @@ void probe_usm_inputs(const sycl::queue& q_dev, Ptrs... ptrs) {
 // verified with a logit-dump harness). The mask is instead applied to the logit
 // itself (masked key -> s = -INF) so the loop stays branch-free, which the B70
 // compiles correctly. See the `s = ...` line in the loop below.
-void decode_attention_impl(const float* q, const float* k_cache, const float* v_cache,
+// Templated on `KVT` (`float` for a float32 KV pool, `uint16_t` -- raw bf16
+// bits -- for a bf16 pool, issue #259). `q`/`out` stay `float*` regardless:
+// the Python caller always hands this kernel a float32 q/out buffer (see the
+// `widen` note above this file's namespace-scope helpers).
+template <typename KVT>
+void decode_attention_impl(const float* q, const KVT* k_cache, const KVT* v_cache,
                             const int* table, int bs, int K, int qh, int kv, int d, float sm_scale,
                             int sliding_window, float* out, sycl::queue& q_dev) {
   if (bs == 0) {
@@ -164,15 +208,15 @@ void decode_attention_impl(const float* q, const float* k_cache, const float* v_
           for (int p = 0; p < kv_len; ++p) {
             const int keypos = newest - (kv_len - 1 - p);  // abs position of kv row p
             const int slot = table[tbase + static_cast<size_t>(p) * stride + 0];
-            const float* krow =
+            const KVT* krow =
                 k_cache + static_cast<size_t>(slot) * kv * d + static_cast<size_t>(hkv) * d;
-            const float* vrow =
+            const KVT* vrow =
                 v_cache + static_cast<size_t>(slot) * kv * d + static_cast<size_t>(hkv) * d;
             for (int i = 0; i < g; ++i) {
               const float* qrow = q + static_cast<size_t>(base_q + head0 + i) * d;
               float acc = 0.0f;
               for (int t = 0; t < d; ++t) {
-                acc += qrow[t] * krow[t];
+                acc += qrow[t] * widen(krow[t]);
               }
                // NOTE: a `continue`/`if (masked) skip` here would be a B70
                // miscompile (it corrupts the q/k USM reads for the other keys).
@@ -189,7 +233,7 @@ void decode_attention_impl(const float* q, const float* k_cache, const float* v_
                 // exp(m_old - s), then fold in this key with exp(s - s) = 1.
                 const float scale = std::exp(m[i] - s);
                 for (int t = 0; t < d; ++t) {
-                  oacc[i * d + t] = oacc[i * d + t] * scale + vrow[t];
+                  oacc[i * d + t] = oacc[i * d + t] * scale + widen(vrow[t]);
                 }
                 l[i] = l[i] * scale + 1.0f;
                 m[i] = s;
@@ -200,7 +244,7 @@ void decode_attention_impl(const float* q, const float* k_cache, const float* v_
                 // contribute zero weight.
                 const float w = (s > -1e30f) ? std::exp(s - m[i]) : 0.0f;
                 for (int t = 0; t < d; ++t) {
-                  oacc[i * d + t] += vrow[t] * w;
+                  oacc[i * d + t] += widen(vrow[t]) * w;
                 }
                 l[i] += w;
               }
@@ -235,7 +279,9 @@ void decode_attention_impl(const float* q, const float* k_cache, const float* v_
 // k_cache [nslots, kv, d]  USM; v_cache likewise
 // table   [bs, K, 5] int32 row 0 = [slot, kv_len, qpos0, ext, cum_ext]; row p slot
 // out     [num_qo, qh, d]  USM (written in place)
-void prefill_attention_impl(const float* q, const float* k_cache, const float* v_cache,
+// Templated on `KVT` -- see decode_attention_impl above (same #259 fix).
+template <typename KVT>
+void prefill_attention_impl(const float* q, const KVT* k_cache, const KVT* v_cache,
                             const int* table, int bs, int K, int qh, int kv, int d, float sm_scale,
                             int sliding_window, float* out, sycl::queue& q_dev) {
   if (bs == 0) {
@@ -277,9 +323,9 @@ void prefill_attention_impl(const float* q, const float* k_cache, const float* v
             for (int p = 0; p < kv_len; ++p) {
               const int keypos = newest - (kv_len - 1 - p);
               const int slot = table[off + static_cast<size_t>(p) * stride + 0];
-              const float* krow =
+              const KVT* krow =
                   k_cache + static_cast<size_t>(slot) * kv * d + static_cast<size_t>(hkv) * d;
-              const float* vrow =
+              const KVT* vrow =
                   v_cache + static_cast<size_t>(slot) * kv * d + static_cast<size_t>(hkv) * d;
               const int qrow_base = (base_q + t) * qh + head0;
               // Branch-free mask (a `continue` here miscompiles on the B70 and
@@ -291,13 +337,13 @@ void prefill_attention_impl(const float* q, const float* k_cache, const float* v
                 const float* qrow = q + static_cast<size_t>(qrow_base + i) * d;
                 float acc = 0.0f;
                 for (int tt = 0; tt < d; ++tt) {
-                  acc += qrow[tt] * krow[tt];
+                  acc += qrow[tt] * widen(krow[tt]);
                 }
                 float s = visible ? (acc * sm_scale) : (-1e30f);
                 if (s > m[i]) {
                   const float scale = std::exp(m[i] - s);
                   for (int tt = 0; tt < d; ++tt) {
-                    oacc[i * d + tt] = oacc[i * d + tt] * scale + vrow[tt];
+                    oacc[i * d + tt] = oacc[i * d + tt] * scale + widen(vrow[tt]);
                   }
                   l[i] = l[i] * scale + 1.0f;
                   m[i] = s;
@@ -307,7 +353,7 @@ void prefill_attention_impl(const float* q, const float* k_cache, const float* v
                   // and wrongly count. Such keys must contribute zero weight.
                   const float w = (s > -1e30f) ? std::exp(s - m[i]) : 0.0f;
                   for (int tt = 0; tt < d; ++tt) {
-                    oacc[i * d + tt] += vrow[tt] * w;
+                    oacc[i * d + tt] += widen(vrow[tt]) * w;
                   }
                   l[i] += w;
                 }
@@ -340,28 +386,71 @@ extern "C" {
 // function created itself, as it used to, is invisible to it regardless of
 // shape. NULL falls back to a freshly constructed default-device queue (the
 // old behavior, for any caller that does not have a stream handle to pass).
-void decode_attention(const float* q, const float* k_cache, const float* v_cache, const int* table,
+//
+// `k_cache`/`v_cache` are `const void*` (issue #259, attn-sycl-bf16-abi): the
+// KV pool's actual storage dtype is decided at runtime by the Python caller
+// (torch XPU tensor dtype), not fixed at compile time, so the ABI boundary
+// takes an untyped pointer plus `kv_is_bf16` and dispatches to the matching
+// template instantiation of `decode_attention_impl` (`KVT = float` or `KVT =
+// std::uint16_t`, the latter reading the pool's raw bf16 bit pattern and
+// widening in-register -- see the `widen`/`bf16_to_f32` helpers above). `q`
+// and `out` stay `float*`: the Python side always hands this kernel a
+// float32 q/out buffer regardless of the model's own dtype (a cheap cast on
+// a small per-request buffer, never the KV pool itself).
+void decode_attention(const float* q, const void* k_cache, const void* v_cache, const int* table,
                        int bs, int K, int qh, int kv, int d, float sm_scale, int sliding_window,
-                       float* out, void* queue_handle) {
+                       float* out, int kv_is_bf16, void* queue_handle) {
   if (queue_handle != nullptr) {
     sycl::queue& q_dev = *reinterpret_cast<sycl::queue*>(queue_handle);
-    decode_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out, q_dev);
+    if (kv_is_bf16) {
+      decode_attention_impl(q, reinterpret_cast<const std::uint16_t*>(k_cache),
+                             reinterpret_cast<const std::uint16_t*>(v_cache), table, bs, K, qh, kv,
+                             d, sm_scale, sliding_window, out, q_dev);
+    } else {
+      decode_attention_impl(q, reinterpret_cast<const float*>(k_cache),
+                             reinterpret_cast<const float*>(v_cache), table, bs, K, qh, kv, d,
+                             sm_scale, sliding_window, out, q_dev);
+    }
   } else {
     sycl::queue q_dev;  // default device: the B70 when present, else a CPU device
-    decode_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out, q_dev);
+    if (kv_is_bf16) {
+      decode_attention_impl(q, reinterpret_cast<const std::uint16_t*>(k_cache),
+                             reinterpret_cast<const std::uint16_t*>(v_cache), table, bs, K, qh, kv,
+                             d, sm_scale, sliding_window, out, q_dev);
+    } else {
+      decode_attention_impl(q, reinterpret_cast<const float*>(k_cache),
+                             reinterpret_cast<const float*>(v_cache), table, bs, K, qh, kv, d,
+                             sm_scale, sliding_window, out, q_dev);
+    }
     q_dev.wait();  // no caller stream to order against -- block here instead
   }
 }
 
-void prefill_attention(const float* q, const float* k_cache, const float* v_cache, const int* table,
+void prefill_attention(const float* q, const void* k_cache, const void* v_cache, const int* table,
                         int bs, int K, int qh, int kv, int d, float sm_scale, int sliding_window,
-                        float* out, void* queue_handle) {
+                        float* out, int kv_is_bf16, void* queue_handle) {
   if (queue_handle != nullptr) {
     sycl::queue& q_dev = *reinterpret_cast<sycl::queue*>(queue_handle);
-    prefill_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out, q_dev);
+    if (kv_is_bf16) {
+      prefill_attention_impl(q, reinterpret_cast<const std::uint16_t*>(k_cache),
+                              reinterpret_cast<const std::uint16_t*>(v_cache), table, bs, K, qh,
+                              kv, d, sm_scale, sliding_window, out, q_dev);
+    } else {
+      prefill_attention_impl(q, reinterpret_cast<const float*>(k_cache),
+                              reinterpret_cast<const float*>(v_cache), table, bs, K, qh, kv, d,
+                              sm_scale, sliding_window, out, q_dev);
+    }
   } else {
     sycl::queue q_dev;
-    prefill_attention_impl(q, k_cache, v_cache, table, bs, K, qh, kv, d, sm_scale, sliding_window, out, q_dev);
+    if (kv_is_bf16) {
+      prefill_attention_impl(q, reinterpret_cast<const std::uint16_t*>(k_cache),
+                              reinterpret_cast<const std::uint16_t*>(v_cache), table, bs, K, qh,
+                              kv, d, sm_scale, sliding_window, out, q_dev);
+    } else {
+      prefill_attention_impl(q, reinterpret_cast<const float*>(k_cache),
+                              reinterpret_cast<const float*>(v_cache), table, bs, K, qh, kv, d,
+                              sm_scale, sliding_window, out, q_dev);
+    }
     q_dev.wait();
   }
 }

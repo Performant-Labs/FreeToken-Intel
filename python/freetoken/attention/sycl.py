@@ -36,12 +36,17 @@ from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 _KERNEL_NAME = "attention"
 _KERNEL_SRC = pathlib.Path(__file__).parent.parent / "kernel" / "csrc" / "sycl" / "attention.cpp"
 
-# (const float* q, const float* kc, const float* vc, const int* table,
+# (const float* q, const void* kc, const void* vc, const int* table,
 #  int bs, int K, int qh, int kv, int d, float sm_scale, int sliding_window,
-#  float* out, void* queue_handle)
+#  float* out, int kv_is_bf16, void* queue_handle)
 # queue_handle (issue attn-sycl-graph-capture, #119): the caller's active SYCL
 # queue (torch.xpu.Stream.sycl_queue), or NULL to fall back to a fresh
 # default-device queue -- see attention.cpp's decode_attention docstring.
+# kv_is_bf16 (issue #259, attn-sycl-bf16-abi): nonzero when k_cache/v_cache
+# are the KV pool's raw bf16 storage (torch.bfloat16), zero when they are
+# float32 -- see attention.cpp's decode_attention docstring for how this
+# selects the KVT=uint16_t vs. KVT=float template instantiation. q/out are
+# always float32 (cast on the Python side below), regardless of this flag.
 _FN_TYPES = [
     ctypes.c_void_p,
     ctypes.c_void_p,
@@ -55,8 +60,39 @@ _FN_TYPES = [
     ctypes.c_float,
     ctypes.c_int,
     ctypes.c_void_p,
+    ctypes.c_int,
     ctypes.c_void_p,
 ]
+
+# The kernel's KV storage dtypes it knows how to widen in-register (issue
+# #259): a float32 pool needs no widening, a bf16 pool widens via the
+# kernel's bf16_to_f32. Any other pool dtype (e.g. float16) is rejected
+# loudly in _kv_is_bf16 below rather than silently misread -- this backend
+# has no widen path for it (matching direction (b)'s "loud assertion" for the
+# one case (a)'s dtype-templating doesn't itself cover).
+_SUPPORTED_KV_DTYPES = (torch.float32, torch.bfloat16)
+
+
+def _kv_is_bf16(dtype) -> int:
+    """Whether KV pool storage ``dtype`` is the raw-bf16-bits path the kernel
+    widens in-register, vs. the untouched float32 path -- the value forward()
+    passes as the kernel's ``kv_is_bf16`` argument (see attention.cpp).
+
+    Raises ``AssertionError`` for any *other* pool dtype (e.g. ``float16``,
+    issue #259): the SYCL kernel's dtype-templated dot product only has a
+    widen path for float32 and raw bf16 bits, so an unsupported dtype must be
+    a loud, explicit rejection here -- not the silent pointer-arithmetic
+    misread the pre-fix const-float*-only ABI was for bf16. This is a plain,
+    torch-only function (no XPU/kernel dependency) so it is unit-testable
+    without the oneAPI toolchain or an XPU device.
+    """
+    if dtype not in _SUPPORTED_KV_DTYPES:
+        raise AssertionError(
+            f"SyclAttentionBackend: KV pool dtype {dtype} is not one the SYCL "
+            f"attention kernel can read (supported: {_SUPPORTED_KV_DTYPES}); "
+            "refusing to reinterpret its storage rather than silently misreading it"
+        )
+    return 1 if dtype == torch.bfloat16 else 0
 
 
 class SyclMetadata(BaseAttnMetadata):
@@ -397,6 +433,14 @@ class SyclAttentionBackend(BaseAttnBackend):
         k_cache, v_cache = pool.k_buffer, pool.v_buffer
         table_dim = self._kv_num_slots  # the pool's slot count -- the kernel's slot bound
 
+        # Issue #259 (attn-sycl-bf16-abi): raises loudly for an unsupported
+        # pool dtype instead of silently misreading it -- see _kv_is_bf16.
+        kv_is_bf16 = _kv_is_bf16(pool.dtype)
+        assert k_cache.dtype == v_cache.dtype == pool.dtype, (
+            f"SyclAttentionBackend: k_buffer dtype {k_cache.dtype} / v_buffer dtype "
+            f"{v_cache.dtype} disagree with pool.dtype {pool.dtype}"
+        )
+
         # The kernel's table ABI indexes request ``i`` at table row ``i`` and
         # reads rows [i, i+K). A ``bs=1`` launch of *this* request must therefore
         # sit at table row 0. The stored table has one row per request in batch
@@ -424,7 +468,15 @@ class SyclAttentionBackend(BaseAttnBackend):
         phase_idx = b
         one_row = table[phase_idx : phase_idx + 1]
         # q is head-major [qh, ext, d]; the kernel wants token-major [ext, qh, d].
+        # The kernel's q pointer is always float* (issue #259): q's real
+        # dtype follows the model's own dtype (bf16 by default on a real
+        # model, same as k_cache/v_cache), so it must be cast to float32
+        # here -- a small, freshly-built per-request tensor, not the KV pool
+        # itself, so this cast is cheap (unlike widening the whole pool).
+        q_dtype = q.dtype
         q_tok = q.transpose(0, 1).contiguous()
+        if q_tok.dtype != torch.float32:
+            q_tok = q_tok.to(torch.float32)
         out = torch.zeros((ext, qh, d), device=q.device, dtype=torch.float32)
 
         # The caller's active SYCL queue (torch's current XPU stream), passed
@@ -453,6 +505,7 @@ class SyclAttentionBackend(BaseAttnBackend):
                 ctypes.c_float(sm_scale),
                 window,
                 self._ptr(out),
+                kv_is_bf16,
                 queue_handle,
             )
         else:
@@ -469,13 +522,29 @@ class SyclAttentionBackend(BaseAttnBackend):
                 ctypes.c_float(sm_scale),
                 window,
                 self._ptr(out),
+                kv_is_bf16,
                 queue_handle,
             )
         if not self._capturing:
             torch.xpu.synchronize()
         # The kernel wrote token-major [ext, qh, d]; the model wants head-major
         # [qh, ext, d] (it does o_proj on out.transpose(1, 2)).
-        return out.transpose(0, 1).contiguous()
+        #
+        # The kernel's out buffer is always float32 (issue #259: q/out stay
+        # float32 regardless of the KV pool's storage dtype -- only k/v widen
+        # in-register). But the caller's o_proj expects this attention
+        # output in the *model's* dtype (bf16 by default on a real model),
+        # matching every other attention backend's contract (e.g.
+        # triton.py's `out = torch.empty_like(q)`) -- this cast-back was
+        # missing before this fix, a pre-existing gap on `main` that #259's
+        # own new bf16 test coverage is what actually caught it (the
+        # float32-only fixtures every prior test used made q_dtype ==
+        # torch.float32 always, so this cast was a no-op and the bug never
+        # surfaced until a real bf16 model went through this path).
+        result = out.transpose(0, 1).contiguous()
+        if result.dtype != q_dtype:
+            result = result.to(q_dtype)
+        return result
 
 
 __all__ = ["SyclAttentionBackend", "SyclMetadata"]
