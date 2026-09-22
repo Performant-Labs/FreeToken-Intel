@@ -15,7 +15,7 @@ Qwen3.5/3.6 row.
 
 | Model | Registered as (`models/register.py`) | Status | Issue |
 | --- | --- | --- | --- |
-| Qwen3.5 / Qwen3.6 hybrid-attention MoE | `Qwen3_5MoeForConditionalGeneration`, `Qwen3_5ForConditionalGeneration` | running — config + weights + forward (linear attention + full attention + MoE, offload/cpu/hybrid). **Real GGUF checkpoint output is currently incoherent** (wrong logits, not a crash); do not treat this row as validated until [#287](https://github.com/Performant-Labs/FreeToken-Intel/issues/287) closes. | `models-qwen35` (#18) |
+| Qwen3.5 / Qwen3.6 hybrid-attention MoE | `Qwen3_5MoeForConditionalGeneration`, `Qwen3_5ForConditionalGeneration` | running — config + weights + forward (linear attention + full attention + MoE, offload/cpu/hybrid). **Validated on a real GGUF checkpoint** (`Qwen3.6-35B-A3B` `q4_k_m`, live on B70, coherent generation, [#274](https://github.com/Performant-Labs/FreeToken-Intel/issues/274) closed) via `offload`/`cpu`. Known real gaps: `hybrid` is not yet available for GGUF ([#290](https://github.com/Performant-Labs/FreeToken-Intel/issues/290), [#302](https://github.com/Performant-Labs/FreeToken-Intel/issues/302)); real-checkpoint decode is slow and unprofiled at 0.68 tok/s ([#303](https://github.com/Performant-Labs/FreeToken-Intel/issues/303)); context is capped well below the checkpoint's native 262K tokens to avoid a VRAM OOM ([#304](https://github.com/Performant-Labs/FreeToken-Intel/issues/304)); no concurrent-request testing yet ([#305](https://github.com/Performant-Labs/FreeToken-Intel/issues/305)). | `models-qwen35` (#18) |
 | Qwen3-MoE | `Qwen3MoeForCausalLM` | running | `models-qwen3-moe` (#19) |
 | Qwen1.5-MoE-A2.7B | `Qwen2MoeForCausalLM` | running | `models-qwen2moe-attn` (#221) |
 | Qwen3.8-Flash-Next (hyper-connections + PLE + QSA) | `Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration` | running | epic #198 (`models-qwen4-e2e` #209) |
@@ -40,14 +40,16 @@ stub, so no served model resolves to it today.
 
 * **offload** — experts in host RAM, LRU expert slots on XPU; misses stream
   over PCIe. The default `auto` outcome for a MoE.
-* **cpu** — misses computed on the CPU. `CpuMoeExecutor`'s pure-PyTorch loop
-  today; `--moe-cpu-threads` does not yet reach a native thread-pool GEMM
-  (tracked under [#291](https://github.com/Performant-Labs/FreeToken-Intel/issues/291)).
+* **cpu** — misses computed on the CPU via the native thread-pool GEMM;
+  `--moe-cpu-threads` reaches it
+  ([#291](https://github.com/Performant-Labs/FreeToken-Intel/issues/291), merged).
 * **hybrid** — per step, fetch some misses over PCIe and compute the rest on
   CPU, overlapped (native GIL-free pool, bf16 only). Calibrate with
   `ft bench bw`. On GPTQ/FP8/MXFP4/INT8/GGUF checkpoints `hybrid` currently
   silently runs as `offload` instead of erroring
-  ([#290](https://github.com/Performant-Labs/FreeToken-Intel/issues/290)).
+  ([#290](https://github.com/Performant-Labs/FreeToken-Intel/issues/290));
+  making it actually work for GGUF (not just fail loudly) is
+  [#302](https://github.com/Performant-Labs/FreeToken-Intel/issues/302).
 * **auto** — dense → fused (moot while dense models are stubs); MoE →
   offload, upgraded to hybrid when a cached `ft bench bw` profile
   recommends it.
