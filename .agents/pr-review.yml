@@ -13,7 +13,6 @@ project:
   # for the CI score banner anyway.
 
 pr_agent:
-  model: "deepseek/deepseek-v4-pro"
   max_tokens: 131072
   output_tokens: 64000
   high_stakes_label: "high-stakes"
