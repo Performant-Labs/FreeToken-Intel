@@ -2,13 +2,15 @@
 #
 # Post-centralization (#120), all review LOGIC lives in the reusable workflow:
 #   Performant-Labs/playbook/.github/workflows/pr-review-reusable.yml
-# This caller only owns the two things a caller MUST own: the event triggers and
-# the concurrency group. All behaviour is driven by .agents/pr-review.yml in the
-# calling repo. Do not inline the reusable's logic here.
+# This caller only owns the things a caller MUST own: the event triggers and
+# the concurrency group, with the job `if` that guards it. All behaviour is
+# driven by .agents/pr-review.yml in the calling repo. Do not inline the
+# reusable's logic here.
 #
-# NOTE: `cancel-in-progress` is event-scoped on purpose — see the concurrency
-# block below and the pr-reviewer README §"Issue comment trigger fires on all
-# slash commands". A comment must never cancel a running review.
+# NOTE: `concurrency` sits on the JOB, behind an `if`, and `cancel-in-progress` is
+# event-scoped, both on purpose — see the job below and the pr-reviewer README
+# §"Issue comment trigger fires on all slash commands". A comment must never cancel
+# a running review, nor replace a queued one.
 
 name: PR-Agent Spec Review
 
@@ -18,21 +20,36 @@ on:
   issue_comment:
     types: [created]
 
-concurrency:
-  group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
-  # Event-scoped cancellation. A push (`synchronize`) SHOULD cancel a superseded
-  # in-flight review — the new commit makes it stale. But a PR comment must NEVER
-  # cancel a running review: GitHub evaluates workflow-level `concurrency` at run
-  # CREATION, before any job-level `if`, so a comment-triggered run (ordinary reply,
-  # Tugboat "preview ready", or a `/review` buried mid-body) would abort an active
-  # review if this were an unconditional `true`, freezing the PR-Agent score.
-  cancel-in-progress: ${{ github.event_name != 'issue_comment' }}
-
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   pr-review:
+    # Mirrors the reusable's own job `if` (pr-review-reusable.yml, job `pr-agent`); keep the two
+    # identical. It is repeated here so that the job-level `concurrency` below is taken only by a
+    # run that will actually review: bot events and comments that are not PR-Agent commands are
+    # skipped before they can join the group.
+    if: |
+      github.event.sender.type != 'Bot' &&
+      (github.event_name != 'issue_comment' ||
+       startsWith(github.event.comment.body, '/review') ||
+       startsWith(github.event.comment.body, '/describe') ||
+       startsWith(github.event.comment.body, '/improve') ||
+       startsWith(github.event.comment.body, '/ask'))
+    # On the job, not the workflow. Workflow-level `concurrency` is taken when the run is
+    # CREATED, before any job `if`: every PR comment (an ordinary reply, a Tugboat "preview
+    # ready") then joined the group and, as the newest pending run, replaced a queued `/review`
+    # or push review, and was itself skipped, so that review never ran. On the job, only a run
+    # that passes the `if` above takes a slot.
+    # Event-scoped cancellation: a push (`synchronize`) cancels a superseded in-flight review,
+    # because the new commit makes it stale; a command comment never cancels a running review.
+    # Known limit: the group still holds ONE pending run, so a `/describe`, `/improve` or `/ask`
+    # posted while a push review is queued displaces that review (its commit status stays
+    # missing, not green); post `/review` afterwards. A `/review` that displaces it is harmless:
+    # it reviews the current head and posts that commit's status.
+    concurrency:
+      group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: ${{ github.event_name != 'issue_comment' }}
     # Local vendored copy of playbook's pr-review-reusable.yml. A PUBLIC repo
     # cannot call a reusable workflow in a PRIVATE one ("workflow was not
     # found" at run time, even with playbook's reusable-workflow access set to
