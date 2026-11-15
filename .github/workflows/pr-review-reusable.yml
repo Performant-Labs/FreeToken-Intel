@@ -39,14 +39,33 @@ jobs:
     # Filter bots and non-slash-command issue comments here — these are fixed
     # and not configurable. Draft filtering and skip_paths are handled inside
     # the gate step so they can read project config first.
+    #
+    # Trust: the review spends API money, so it runs only for a pull request
+    # from a branch of this repo (a fork's gets no secrets anyway), or for a
+    # slash command from a commenter who is OWNER/MEMBER/COLLABORATOR or listed
+    # in the org variable TRUSTED_CI_AUTHORS (a JSON list of logins). Anyone
+    # else's comment starts no review.
     if: |
       github.event.sender.type != 'Bot' &&
-      (github.event_name != 'issue_comment' ||
-       startsWith(github.event.comment.body, '/review') ||
-       startsWith(github.event.comment.body, '/describe') ||
-       startsWith(github.event.comment.body, '/improve') ||
-       startsWith(github.event.comment.body, '/ask'))
-    runs-on: ${{ vars.CI_RUNNER }}
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+       (github.event_name == 'issue_comment' &&
+        (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) ||
+         contains(fromJSON(vars.TRUSTED_CI_AUTHORS || '[]'), github.event.comment.user.login)) &&
+        (startsWith(github.event.comment.body, '/review') ||
+         startsWith(github.event.comment.body, '/describe') ||
+         startsWith(github.event.comment.body, '/improve') ||
+         startsWith(github.event.comment.body, '/ask'))))
+    # Runner: the self-hosted fleet (org variable CI_RUNNER) for a trusted
+    # comment (the only kind that gets past the `if`) and for a pull request
+    # whose author is in TRUSTED_CI_AUTHORS; another author's pull request is
+    # reviewed on GitHub-hosted ubuntu-latest (free for this public repo), as
+    # is every pull request while TRUSTED_CI_AUTHORS is unset.
+    # Still NO `|| 'ubuntu-latest'` fallback for CI_RUNNER itself (see xpu.yml):
+    # toJSON keeps an unset CI_RUNNER as "" through the `&&`/`||` choice, so a
+    # trusted run gets an empty runs-on and fails loudly instead of silently
+    # moving to GitHub-hosted.
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON(vars.TRUSTED_CI_AUTHORS || '[]'), github.event.pull_request.user.login))) && toJSON(vars.CI_RUNNER) || '"ubuntu-latest"') }}
     timeout-minutes: 30
 
     steps:
