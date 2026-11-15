@@ -35,7 +35,7 @@ flowchart TD
 | **conformance** | hosted | The port's invariants: SYCL uses `sycl::ext::oneapi`, no CUDA backdoors, one version source. |
 | **build-wheel** | hosted | Builds the CPU sdist+wheel and proves the packaging contract: the wheel is torch-free (core deps) and imports without torch; the oneAPI stack rides the optional `[xpu]` extra. Artifacts uploaded, never published. |
 | **xpu-nightly** | B70 fleet | The XPU half of the contract: torch present, `torch.xpu` alive, xpu-marked tests pass. |
-| **PR-Agent review** | fleet | Advisory bot score + label. Not a gate. |
+| **PR-Agent review** | fleet if trusted, else hosted | Advisory bot score + label. Not a gate. Fleet only for a same-repo PR whose author is in the org variable `TRUSTED_CI_AUTHORS`, or a slash command from OWNER/MEMBER/COLLABORATOR or a listed login; other same-repo PRs review on `ubuntu-latest`; fork PRs and untrusted commenters start no review. |
 
 `pre-flight` has no `needs:` and runs first: a broken workflow file
 fails fast and cheap instead of being discovered three jobs deep.
