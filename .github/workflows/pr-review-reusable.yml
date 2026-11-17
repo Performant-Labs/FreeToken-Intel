@@ -15,7 +15,6 @@ name: PR-Agent Spec Review (reusable)
 #   uses: ./.github/workflows/pr-review-reusable.yml
 #   secrets:
 #     ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-#     DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
 #     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 # GITHUB_TOKEN is automatically available — do not pass it via secrets.
 #
@@ -26,8 +25,6 @@ on:
   workflow_call:
     secrets:
       ZAI_API_KEY:
-        required: false
-      DEEPSEEK_API_KEY:
         required: false
       ANTHROPIC_API_KEY:
         required: false
@@ -595,7 +592,6 @@ jobs:
           # glm-5.3 on the z.ai GLM Coding Plan via the OpenAI-compatible coding endpoint (playbook#978).
           OPENAI.KEY: ${{ secrets.ZAI_API_KEY }}
           OPENAI.API_BASE: https://api.z.ai/api/coding/paas/v4
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CONFIG.MODEL: ${{ steps.cfg.outputs.model }}
           CONFIG.CUSTOM_MODEL_MAX_TOKENS: ${{ steps.cfg.outputs.max_tokens }}
@@ -629,7 +625,6 @@ jobs:
           # glm-5.3 on the z.ai GLM Coding Plan via the OpenAI-compatible coding endpoint (playbook#978).
           OPENAI.KEY: ${{ secrets.ZAI_API_KEY }}
           OPENAI.API_BASE: https://api.z.ai/api/coding/paas/v4
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CONFIG.MODEL: ${{ steps.cfg.outputs.hs_model }}

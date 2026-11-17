@@ -46,5 +46,4 @@ jobs:
       statuses: write
     secrets:
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
