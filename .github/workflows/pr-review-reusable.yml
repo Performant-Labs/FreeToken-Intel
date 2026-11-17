@@ -6,11 +6,15 @@ name: PR-Agent Spec Review (reusable)
 # extend to public callers). Same fix as performantlabs.com. Keep this file in
 # sync with playbook/.github/workflows/pr-review-reusable.yml by hand; it is
 # not auto-synced.
+# LOCAL PATCH (2026-11, playbook#978): the PR-Agent steps were moved to v0.50.0 and glm-5.3 on the
+# z.ai GLM Coding Plan (ZAI_API_KEY), with a glm-5.3-flash fallback, ai_timeout 600, findings cap 6
+# and run details on, by a targeted edit rather than a full re-sync, to keep this copy's
+# public-repo runner/trust handling. A future re-sync from upstream keeps these settings.
 #
 # Called by this repo's .github/workflows/pr-review.yml via:
 #   uses: ./.github/workflows/pr-review-reusable.yml
 #   secrets:
-#     DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+#     ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 #     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 # GITHUB_TOKEN is automatically available — do not pass it via secrets.
 #
@@ -20,7 +24,7 @@ name: PR-Agent Spec Review (reusable)
 on:
   workflow_call:
     secrets:
-      DEEPSEEK_API_KEY:
+      ZAI_API_KEY:
         required: false
       ANTHROPIC_API_KEY:
         required: false
@@ -66,7 +70,9 @@ jobs:
     # trusted run gets an empty runs-on and fails loudly instead of silently
     # moving to GitHub-hosted.
     runs-on: ${{ fromJSON((github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON(vars.TRUSTED_CI_AUTHORS || '[]'), github.event.pull_request.user.login))) && toJSON(vars.CI_RUNNER) || '"ubuntu-latest"') }}
-    timeout-minutes: 30
+    # 75, not 30: describe, review and improve each make model calls of up to CONFIG.AI_TIMEOUT (600 s), and
+    # PR-Agent v0.50.0 retries a timed-out call once on the same model before the fallback (playbook#976).
+    timeout-minutes: 75
 
     steps:
       # SHA-pinned, not a floating tag: a floating `@v7` is the exact failure
@@ -273,9 +279,11 @@ jobs:
           if isinstance(proj, dict):
               warn('project key(s)', proj.keys(), KNOWN_PROJECT)
 
-          model    = pa.get('model', 'deepseek/deepseek-v4-pro')
+          model    = pa.get('model', 'openai/glm-5.3')
           hs_model = pa.get('high_stakes_model', model)
-          fb       = pa.get('fallback_model', '')
+          # Fallback: glm-5.3-flash on the same z.ai GLM Coding Plan endpoint and key, so a glm-5.3 timeout or
+          # HTTP 429 never spends DeepSeek money (playbook#978). It was '' (no fallback) here.
+          fb       = pa.get('fallback_model', 'openai/glm-5.3-flash')
           # Only emit a fallback if it's set and differs from the primary.
           fallback_models = json.dumps([fb]) if fb and fb != model else json.dumps([model])
 
@@ -570,7 +578,8 @@ jobs:
       # `uses:` line is right.
       #
       # ⛔ D3 (#421) — the MODEL pin is a separate decision and is NOT Dependabot's
-      # to move: stay on deepseek-v4-pro. Rolling the action forward must not roll
+      # to move: stay on glm-5.3 (z.ai coding endpoint, owner decision 2026-11, playbook#977/#978;
+      # glm-5.3-flash on the same endpoint is the fallback). Rolling the action forward must not roll
       # the model forward with it.
       - name: PR-Agent review (default)
         id: review-default
@@ -578,13 +587,23 @@ jobs:
           steps.gate.outputs.should_skip != 'true' &&
           steps.labels.outputs.high_stakes != 'true'
         continue-on-error: true
-        uses: qodo-ai/pr-agent@743f52d80f3513193dfc7626f778c73478df6d0a  # v0.41.1
+        uses: qodo-ai/pr-agent@e673a02076ce09a4726c3d0c3cc85780e59ca52b  # v0.50.0
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # glm-5.3 on the z.ai GLM Coding Plan via the OpenAI-compatible coding endpoint (playbook#978).
+          OPENAI.KEY: ${{ secrets.ZAI_API_KEY }}
+          OPENAI.API_BASE: https://api.z.ai/api/coding/paas/v4
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CONFIG.MODEL: ${{ steps.cfg.outputs.model }}
           CONFIG.CUSTOM_MODEL_MAX_TOKENS: ${{ steps.cfg.outputs.max_tokens }}
-          CONFIG.MAX_MODEL_TOKENS: ${{ steps.cfg.outputs.output_tokens }}
+          # max_tokens is the context window (CUSTOM_MODEL_MAX_TOKENS + MAX_MODEL_TOKENS), output_tokens the completion
+          # cap (MAX_OUTPUT_TOKENS), as in playbook#920; v0.50.0 reads MAX_MODEL_TOKENS as a context clamp.
+          CONFIG.MAX_MODEL_TOKENS: ${{ steps.cfg.outputs.max_tokens }}
+          CONFIG.MAX_OUTPUT_TOKENS: ${{ steps.cfg.outputs.output_tokens }}
+          # Per model call; PR-Agent's default 120 s times glm-5.3 out.
+          CONFIG.AI_TIMEOUT: "600"
+          # Appends "Agent run details" (the model that answered, "(fallback)" when the fallback did) to each comment.
+          CONFIG.OUTPUT_RUN_DETAILS: "true"
+          PR_REVIEWER.NUM_MAX_FINDINGS: "6"
           CONFIG.FALLBACK_MODELS: ${{ steps.cfg.outputs.fallback_models }}
           GITHUB_ACTION_CONFIG.PR_ACTIONS: '["opened","reopened","ready_for_review","review_requested","synchronize"]'
           GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
@@ -601,14 +620,25 @@ jobs:
           steps.gate.outputs.should_skip != 'true' &&
           steps.labels.outputs.high_stakes == 'true'
         continue-on-error: true
-        uses: qodo-ai/pr-agent@743f52d80f3513193dfc7626f778c73478df6d0a  # v0.41.1
+        uses: qodo-ai/pr-agent@e673a02076ce09a4726c3d0c3cc85780e59ca52b  # v0.50.0
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # glm-5.3 on the z.ai GLM Coding Plan via the OpenAI-compatible coding endpoint (playbook#978).
+          OPENAI.KEY: ${{ secrets.ZAI_API_KEY }}
+          OPENAI.API_BASE: https://api.z.ai/api/coding/paas/v4
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CONFIG.MODEL: ${{ steps.cfg.outputs.hs_model }}
           CONFIG.CUSTOM_MODEL_MAX_TOKENS: ${{ steps.cfg.outputs.max_tokens }}
-          CONFIG.MAX_MODEL_TOKENS: ${{ steps.cfg.outputs.output_tokens }}
+          # max_tokens is the context window (CUSTOM_MODEL_MAX_TOKENS + MAX_MODEL_TOKENS), output_tokens the completion
+          # cap (MAX_OUTPUT_TOKENS), as in playbook#920; v0.50.0 reads MAX_MODEL_TOKENS as a context clamp.
+          CONFIG.MAX_MODEL_TOKENS: ${{ steps.cfg.outputs.max_tokens }}
+          CONFIG.MAX_OUTPUT_TOKENS: ${{ steps.cfg.outputs.output_tokens }}
+          # Per model call; PR-Agent's default 120 s times glm-5.3 out.
+          CONFIG.AI_TIMEOUT: "600"
+          # Appends "Agent run details" (the model that answered, "(fallback)" when the fallback did) to each comment.
+          CONFIG.OUTPUT_RUN_DETAILS: "true"
+          PR_REVIEWER.NUM_MAX_FINDINGS: "6"
+          CONFIG.FALLBACK_MODELS: ${{ steps.cfg.outputs.fallback_models }}
           GITHUB_ACTION_CONFIG.PR_ACTIONS: '["opened","reopened","ready_for_review","review_requested","synchronize"]'
           GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG.AUTO_IMPROVE: ${{ steps.cfg.outputs.auto_improve }}

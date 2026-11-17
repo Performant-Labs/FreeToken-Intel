@@ -4,8 +4,8 @@
 # Docs: https://qodo-merge-docs.qodo.ai/usage-guide/configuration_options/
 
 [config]
-model = "deepseek/deepseek-v4-pro"
-fallback_models = ["deepseek/deepseek-v4-pro"]
+model = "openai/glm-5.3"
+fallback_models = ["openai/glm-5.3-flash"]
 verbosity_level = 1
 max_description_tokens = 1500
 max_commits_tokens = 1500
